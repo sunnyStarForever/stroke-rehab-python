@@ -18,6 +18,9 @@ from qfluentwidgets import (
     NavigationItemPosition,
     InfoBar,
     InfoBarPosition,
+    Theme,
+    setTheme,
+    setThemeColor,
 )
 
 from rehab_engine.config_loader import load_pipeline_config
@@ -31,9 +34,12 @@ from .pages.settings_page import SettingsPage
 
 class StrokeRehabWindow(FluentWindow):
     def __init__(self, diagnostics: Optional[Diagnostics] = None, parent=None):
+        setTheme(Theme.LIGHT)
+        setThemeColor("#2563EB")
         super().__init__(parent)
         self.setWindowTitle("Stroke Rehab 康复训练系统")
         self.resize(1400, 880)
+        self.setMinimumSize(1180, 760)
 
         # Store diagnostics for display
         self._diag = diagnostics
@@ -119,6 +125,8 @@ class StrokeRehabWindow(FluentWindow):
             FIF.SETTING, "设置",
             position=NavigationItemPosition.BOTTOM,
         )
+
+        training.report_requested.connect(self.navigate_to_reports)
 
     def navigate_to_reports(self, session_dir: str, csv_path: str):
         reports = self.findChild(ReportsPage)

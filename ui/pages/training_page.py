@@ -55,6 +55,7 @@ import rehab_engine  # for rehab_engine._STUB_MODE
 from ..widgets.preview_widget import PreviewWidget
 from ..widgets.score_panel import ScorePanel
 from ..widgets.emg_panel import EmgPanel
+from ..theme import COLORS, PAGE_STYLE, pill_style, state_badge_style
 
 
 class TrainingState(Enum):
@@ -191,28 +192,54 @@ class TrainingPage(QWidget):
     # ---- UI Construction ----
 
     def _init_ui(self):
+        self.setStyleSheet(PAGE_STYLE)
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 12, 18, 12)
+        root.setSpacing(10)
 
-        # --- Top bar ---
+        # --- Training summary / hero ---
         top_card = CardWidget(self)
         top_layout = QHBoxLayout(top_card)
-        top_layout.setContentsMargins(16, 10, 16, 10)
+        top_layout.setContentsMargins(20, 10, 20, 10)
+        top_layout.setSpacing(20)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(2)
+        eyebrow = QLabel("ACTIVE REHABILITATION")
+        eyebrow.setObjectName("pageEyebrow")
+        title_box.addWidget(eyebrow)
 
         self._course_label = TitleLabel(
             self._current_course.course_name if self._current_course
             else "未选择课程")
+        self._course_label.setStyleSheet(
+            f"color:{COLORS['ink']}; font-size:21px; font-weight:700;")
         self._action_label = BodyLabel("当前动作：—")
+        self._action_label.setStyleSheet(
+            f"color:{COLORS['muted']}; font-size:12px;")
+        title_box.addWidget(self._course_label)
+        title_box.addWidget(self._action_label)
+
         self._state_badge = CaptionLabel("待开始")
         self._state_badge.setObjectName("stateBadge")
-        self._timer_label = SubtitleLabel("00:00")
-        self._timer_label.setStyleSheet("color: #2F80ED; font-size: 28px; font-weight: 700;")
+        self._state_badge.setAlignment(Qt.AlignCenter)
+        self._state_badge.setStyleSheet(state_badge_style("IDLE"))
 
-        top_layout.addWidget(self._course_label, 1)
-        top_layout.addWidget(self._action_label)
+        timer_box = QVBoxLayout()
+        timer_box.setSpacing(0)
+        timer_caption = CaptionLabel("本次训练时长")
+        timer_caption.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        timer_caption.setStyleSheet(f"color:{COLORS['muted']};")
+        self._timer_label = SubtitleLabel("00:00")
+        self._timer_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._timer_label.setStyleSheet(
+            f"color:{COLORS['primary']}; font-size:30px; font-weight:700;")
+        timer_box.addWidget(timer_caption)
+        timer_box.addWidget(self._timer_label)
+
+        top_layout.addLayout(title_box, 1)
         top_layout.addWidget(self._state_badge)
-        top_layout.addWidget(self._timer_label)
+        top_layout.addLayout(timer_box)
         root.addWidget(top_card)
 
         # --- Main row: preview + side panel ---
@@ -222,42 +249,71 @@ class TrainingPage(QWidget):
         # -- Preview area --
         preview_card = CardWidget(self)
         preview_layout = QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(12, 8, 12, 12)
+        preview_layout.setContentsMargins(14, 12, 14, 14)
+        preview_layout.setSpacing(10)
 
         tag_row = QHBoxLayout()
-        for tag in ["RGB", "Depth", "Skeleton"]:
-            lbl = CaptionLabel(tag)
-            lbl.setStyleSheet("background:#EAF3FF; color:#2F80ED; border-radius:6px; padding:2px 10px;")
-            tag_row.addWidget(lbl)
+        preview_titles = QVBoxLayout()
+        preview_titles.setSpacing(1)
+        preview_title = QLabel("实时动作捕捉")
+        preview_title.setObjectName("sectionTitle")
+        preview_hint = QLabel("保持全身位于画面中央，系统将同步追踪骨骼与训练质量")
+        preview_hint.setObjectName("sectionHint")
+        preview_titles.addWidget(preview_title)
+        preview_titles.addWidget(preview_hint)
+        tag_row.addLayout(preview_titles)
         tag_row.addStretch()
+
+        for tag, kind in [("RGB", "primary"), ("深度", "neutral"), ("骨骼", "success")]:
+            lbl = CaptionLabel(tag)
+            lbl.setStyleSheet(pill_style(kind))
+            tag_row.addWidget(lbl)
         preview_layout.addLayout(tag_row)
 
         self._preview = PreviewWidget(self)
-        self._preview.setMinimumSize(720, 480)
+        self._preview.setMinimumSize(680, 360)
         self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         preview_layout.addWidget(self._preview, 1)
 
         # -- Side panel --
         side = QWidget(self)
-        side.setFixedWidth(320)
+        side.setFixedWidth(336)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(0, 0, 0, 0)
-        side_layout.setSpacing(10)
+        side_layout.setSpacing(12)
 
         # Course info card
         info_card = SimpleCardWidget(side)
         info_layout = QVBoxLayout(info_card)
-        info_layout.setContentsMargins(16, 14, 16, 14)
-        info_layout.setSpacing(8)
-        info_layout.addWidget(StrongBodyLabel("课程信息"))
-        self._info_action = BodyLabel("动作：—")
-        self._info_target = BodyLabel("目标次数：—")
-        self._info_progress = BodyLabel("进度：— / —")
+        info_layout.setContentsMargins(16, 12, 16, 12)
+        info_layout.setSpacing(6)
+        info_title = QLabel("训练进程")
+        info_title.setObjectName("sectionTitle")
+        info_layout.addWidget(info_title)
+        self._info_action = BodyLabel("等待开始训练")
+        self._info_action.setWordWrap(True)
+        self._info_action.setStyleSheet(
+            f"color:{COLORS['ink']}; font-size:17px; font-weight:700;")
+
+        metric_row = QHBoxLayout()
+        metric_row.setSpacing(8)
+        target_box = QVBoxLayout()
+        target_box.addWidget(QLabel("本动作目标", objectName="metricLabel"))
+        self._info_target = QLabel("— 次")
+        self._info_target.setObjectName("metricValue")
+        target_box.addWidget(self._info_target)
+        progress_box = QVBoxLayout()
+        progress_box.addWidget(QLabel("课程进度", objectName="metricLabel"))
+        self._info_progress = QLabel("— / —")
+        self._info_progress.setObjectName("metricValue")
+        progress_box.addWidget(self._info_progress)
+        metric_row.addLayout(target_box, 1)
+        metric_row.addLayout(progress_box, 1)
+
         self._rest_label = BodyLabel("休息：—")
-        self._rest_label.setStyleSheet("color: #B45309;")
+        self._rest_label.setStyleSheet(pill_style("warning"))
         info_layout.addWidget(self._info_action)
-        info_layout.addWidget(self._info_target)
-        info_layout.addWidget(self._info_progress)
+        info_layout.addLayout(metric_row)
         info_layout.addWidget(self._rest_label)
         side_layout.addWidget(info_card)
 
@@ -275,17 +331,33 @@ class TrainingPage(QWidget):
         main_row.addWidget(side)
         root.addLayout(main_row, 1)
 
-        # --- Feedback log ---
+        # --- Feedback card ---
+        feedback_card = SimpleCardWidget(self)
+        feedback_layout = QVBoxLayout(feedback_card)
+        feedback_layout.setContentsMargins(12, 8, 12, 9)
+        feedback_layout.setSpacing(4)
+        feedback_header = QHBoxLayout()
+        feedback_title = QLabel("训练反馈")
+        feedback_title.setObjectName("sectionTitle")
+        feedback_hint = QLabel("实时状态与动作建议")
+        feedback_hint.setObjectName("sectionHint")
+        feedback_header.addWidget(feedback_title)
+        feedback_header.addSpacing(8)
+        feedback_header.addWidget(feedback_hint)
+        feedback_header.addStretch()
+        feedback_layout.addLayout(feedback_header)
         self._feedback = TextEdit(self)
+        self._feedback.setObjectName("feedbackLog")
         self._feedback.setReadOnly(True)
         self._feedback.setPlaceholderText("训练反馈将显示在这里…")
-        self._feedback.setMaximumHeight(110)
-        root.addWidget(self._feedback)
+        self._feedback.setMaximumHeight(68)
+        feedback_layout.addWidget(self._feedback)
+        root.addWidget(feedback_card)
 
         # --- Control bar ---
         ctrl_card = CardWidget(self)
         ctrl = QHBoxLayout(ctrl_card)
-        ctrl.setContentsMargins(16, 10, 16, 10)
+        ctrl.setContentsMargins(16, 8, 16, 8)
         ctrl.setSpacing(10)
 
         self._btn_start = PrimaryPushButton("开始训练")
@@ -298,6 +370,14 @@ class TrainingPage(QWidget):
         self._btn_report = PrimaryPushButton("结束并生成报告")
         self._btn_open_report = PushButton("查看报告")
 
+        for button in [self._btn_start, self._btn_pause, self._btn_stop,
+                       self._btn_report, self._btn_open_report]:
+            button.setMinimumHeight(36)
+        self._btn_start.setMinimumWidth(112)
+        self._btn_report.setMinimumWidth(146)
+        self._btn_stop.setStyleSheet(
+            f"PushButton{{color:{COLORS['danger']};}}")
+
         self._btn_start.clicked.connect(self._on_start)
         self._btn_pause.clicked.connect(self._on_pause)
         self._btn_stop.clicked.connect(self._on_stop)
@@ -307,7 +387,7 @@ class TrainingPage(QWidget):
         ctrl.addWidget(self._btn_start)
         ctrl.addWidget(self._btn_pause)
         ctrl.addWidget(self._btn_stop)
-        ctrl.addSpacing(16)
+        ctrl.addSpacing(10)
         ctrl.addWidget(self._chk_rgb)
         ctrl.addWidget(self._lbl_skeleton)
         ctrl.addStretch()
@@ -330,6 +410,7 @@ class TrainingPage(QWidget):
     def _update_state(self, state: TrainingState):
         self._state = state
         self._state_badge.setText(state.value)
+        self._state_badge.setStyleSheet(state_badge_style(state.name))
         self._update_buttons()
 
     def _update_buttons(self):
@@ -361,6 +442,7 @@ class TrainingPage(QWidget):
         self._pipeline.start()
         self._session_dir = self._pipeline.start_recording(
             str(Path(self._config.record_path) / "sessions"))
+        self._preview.set_recording(True)
 
         # Log pipeline status after start
         if rehab_engine._STUB_MODE:
@@ -384,6 +466,7 @@ class TrainingPage(QWidget):
         self._pipeline.stop_recording()
         self._pipeline.stop()
         self._score_bridge = None
+        self._preview.set_recording(False)
         self._update_state(TrainingState.IDLE)
         self._append_feedback("训练已停止。")
         self._log_stop_stats()
@@ -394,6 +477,7 @@ class TrainingPage(QWidget):
         self._pipeline.stop_recording()
         self._pipeline.stop()
         self._score_bridge = None
+        self._preview.set_recording(False)
         self._append_feedback("训练完成，正在生成报告…")
         csv_path = str(Path(self._session_dir) / "skeleton_3d.csv")
         self.report_requested.emit(self._session_dir, csv_path)
@@ -417,9 +501,11 @@ class TrainingPage(QWidget):
 
     def _on_action_changed(self, action):
         self._action_label.setText(f"当前动作：{action.name_cn} ({action.action_id})")
-        self._info_action.setText(f"动作：{action.name_cn} ({action.action_id})")
-        self._info_target.setText(f"目标次数：{action.target_reps} 次")
-        self._info_progress.setText(f"进度：{self._course_runner.current_action_index + 1} / {self._course_runner.total_actions}")
+        self._info_action.setText(f"{action.name_cn}\n{action.action_id}")
+        self._info_target.setText(f"{action.target_reps} 次")
+        self._info_progress.setText(
+            f"{self._course_runner.current_action_index + 1} / {self._course_runner.total_actions}")
+        self._score_panel.set_target(action.target_reps)
         self._rest_label.setText("休息：—")
 
         # Start scoring for this action

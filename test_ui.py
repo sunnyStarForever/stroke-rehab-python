@@ -2,11 +2,19 @@
 Headless UI import test — verifies all modules load without errors.
 Run: /d/miniforge3/envs/stroke-rehab/python.exe test_ui.py
 """
+import os
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+
+if os.name != "nt" and not os.environ.get("DISPLAY"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt5.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication(sys.argv)
 
 print("=" * 50)
 print("Stage 3 UI Import Test")
@@ -48,8 +56,6 @@ print("  StrokeRehabWindow import: OK")
 
 # 4. Full QApplication test
 print("\n[4] QApplication launch test")
-from PyQt5.QtWidgets import QApplication
-app = QApplication(sys.argv)
 
 # Test pages instantiate
 cfg = PipelineConfig()
@@ -59,16 +65,21 @@ print("  TrainingPage instantiated: OK")
 rp = ReportsPage()
 print("  ReportsPage instantiated: OK")
 
-sp = SettingsPage(cfg)
+settings_page = SettingsPage(cfg)
 print("  SettingsPage instantiated: OK")
 
 # Test main window instantiation (without show)
 mw = StrokeRehabWindow()
 print("  StrokeRehabWindow instantiated: OK")
-print(f"  Navigation items: {len(mw.navigationInterface.items)}")
+assert mw.findChild(TrainingPage) is not None
+assert mw.findChild(ReportsPage) is not None
+assert mw.findChild(SettingsPage) is not None
+print("  Navigation pages: 3")
 
 print()
 print("=" * 50)
 print("Stage 3: ALL IMPORT TESTS PASSED")
 print("=" * 50)
+tp.shutdown()
+mw.close()
 app.quit()

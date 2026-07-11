@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QProgress
 from qfluentwidgets import SimpleCardWidget, StrongBodyLabel, BodyLabel, CaptionLabel
 
 from rehab_engine.preview import PreviewFrame
+from ..theme import COLORS, pill_style
 
 
 class EmgPanel(SimpleCardWidget):
@@ -20,12 +21,21 @@ class EmgPanel(SimpleCardWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(7)
 
-        layout.addWidget(StrongBodyLabel("肌电状态"))
+        header = QHBoxLayout()
+        title = QLabel("肌电监测")
+        title.setObjectName("sectionTitle")
+        header.addWidget(title)
+        header.addStretch()
+        self._status_dot = QLabel("未连接")
+        self._status_dot.setStyleSheet(pill_style("neutral"))
+        header.addWidget(self._status_dot)
+        layout.addLayout(header)
 
         self._status_label = CaptionLabel("未接入肌电数据")
+        self._status_label.setStyleSheet(f"color:{COLORS['muted']};")
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
 
@@ -37,9 +47,7 @@ class EmgPanel(SimpleCardWidget):
             bar = QProgressBar()
             bar.setRange(0, 3000)
             bar.setValue(0)
-            bar.setTextVisible(True)
-            bar.setFormat("%v")
-            bar.setMaximumHeight(18)
+            bar.setTextVisible(False)
             row.addWidget(bar, 1)
             val = CaptionLabel("—")
             val.setFixedWidth(50)
@@ -56,12 +64,18 @@ class EmgPanel(SimpleCardWidget):
         if "mock" in status.lower():
             self._status_label.setText("肌电：模拟模式（演示数据）")
             self._status_label.setStyleSheet("color: #B45309;")
+            self._status_dot.setText("模拟")
+            self._status_dot.setStyleSheet(pill_style("warning"))
         elif "real" in status.lower():
             self._status_label.setText("肌电：真实链路正常")
             self._status_label.setStyleSheet("color: #27AE60;")
+            self._status_dot.setText("已连接")
+            self._status_dot.setStyleSheet(pill_style("success"))
         elif "disabled" in status.lower() or not status.strip():
             self._status_label.setText("肌电：未启用")
             self._status_label.setStyleSheet("color: #9AA8B4;")
+            self._status_dot.setText("未启用")
+            self._status_dot.setStyleSheet(pill_style("neutral"))
         else:
             self._status_label.setText(status[:80])
             self._status_label.setStyleSheet("color: #1F2933;")
