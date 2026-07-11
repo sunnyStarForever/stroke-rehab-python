@@ -1,0 +1,25 @@
+/*
+ * 模块作用：
+ * 本文件声明时间戳归一化器。采集层把不同设备来源的时间信息统一写入
+ * FrameEnvelope，后续同步层只需要读取 hostTsNs/deviceTsUs。
+ */
+#pragma once
+
+#include <cstdint>
+
+#include "engine/common/FrameEnvelope.h"
+
+namespace rehab {
+
+/*
+ * TimestampNormalizer
+ * 职责：
+ * 将采集线程测得的 host_ts_ns 和设备原始 device_ts_us 写入 FrameEnvelope。
+ * host_ts_ns 用于软件同步，device_ts_us 用于调试设备侧抖动。
+ */
+class TimestampNormalizer {
+ public:
+  void stamp(FrameEnvelope& frame, uint64_t hostTsNs, uint64_t deviceTsUs = 0) const;
+};
+
+}  // namespace rehab
