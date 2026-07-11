@@ -58,9 +58,14 @@ class CourseRepository:
         path = config_path or self._config_path
         if not path:
             # Search default locations
-            for candidate in ["configs/courses.json", "../configs/courses.json"]:
+            package_root = Path(__file__).resolve().parent.parent
+            for candidate in [
+                package_root / "configs/courses.json",
+                Path("configs/courses.json"),
+                Path("../configs/courses.json"),
+            ]:
                 if Path(candidate).exists():
-                    path = candidate
+                    path = str(candidate)
                     break
         if not path or not Path(path).exists():
             self._last_error = f"Course config not found: {path}"
@@ -124,9 +129,11 @@ class CourseRepository:
 
     @staticmethod
     def default_config_path() -> str:
-        for p in ["configs/courses.json", "../configs/courses.json"]:
+        package_root = Path(__file__).resolve().parent.parent
+        for p in [package_root / "configs/courses.json",
+                  Path("configs/courses.json"), Path("../configs/courses.json")]:
             if Path(p).exists():
-                return p
+                return str(p)
         return "configs/courses.json"
 
 
@@ -138,6 +145,7 @@ class RunnerState(Enum):
     IDLE = "idle"
     TRAINING = "training"
     RESTING = "resting"
+    PAUSED = "paused"
     FINISHED = "finished"
 
 
@@ -159,6 +167,7 @@ class CourseRunner:
         # Rest timer
         self._rest_remaining: int = 0
         self._rest_timer: Optional[Timer] = None
+        self._state_before_pause: RunnerState = RunnerState.IDLE
 
         # Callbacks (set by the caller, replaces Qt signals)
         self.on_action_changed: Optional[Callable[[CourseAction], None]] = None
@@ -208,6 +217,27 @@ class CourseRunner:
     def stop_course(self) -> None:
         self._cancel_rest_timer()
         self._set_state(RunnerState.FINISHED)
+
+    def pause_course(self) -> bool:
+        """Pause scoring progression and preserve an active rest countdown."""
+        if self._state not in (RunnerState.TRAINING, RunnerState.RESTING):
+            return False
+        self._state_before_pause = self._state
+        self._cancel_rest_timer()
+        self._set_state(RunnerState.PAUSED)
+        return True
+
+    def resume_course(self) -> bool:
+        """Resume the state that was active before pause."""
+        if self._state != RunnerState.PAUSED:
+            return False
+        resume_state = self._state_before_pause
+        if resume_state not in (RunnerState.TRAINING, RunnerState.RESTING):
+            resume_state = RunnerState.TRAINING
+        self._set_state(resume_state)
+        if resume_state == RunnerState.RESTING:
+            self._start_rest_timer()
+        return True
 
     def on_score_updated(self, score: "ScoreResult") -> None:
         """

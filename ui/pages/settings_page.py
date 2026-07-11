@@ -6,7 +6,7 @@ Replaces app/dialogs/DeviceSettingsDialog.cpp + RecordingSettingsDialog.cpp.
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 
 from qfluentwidgets import (
     CardWidget, SimpleCardWidget, ScrollArea,
@@ -17,8 +17,9 @@ from qfluentwidgets import (
 )
 
 from rehab_engine._stub import PipelineConfig
-from rehab_engine.config_loader import load_pipeline_config
+from rehab_engine.config_loader import save_pipeline_config
 from rehab_engine.course import CourseRepository
+from rehab_engine.diagnostics import run_diagnostics
 from ..theme import COLORS, PAGE_STYLE, pill_style
 
 
@@ -32,6 +33,10 @@ _EMG_MODES = ["disabled", "mock", "real"]
 
 class SettingsPage(ScrollArea):
     """Device and system settings."""
+
+    course_changed = pyqtSignal(str)
+    debug_changed = pyqtSignal(bool)
+    settings_applied = pyqtSignal(str)
 
     def __init__(self, config: PipelineConfig, parent=None):
         super().__init__(parent)
@@ -135,10 +140,24 @@ class SettingsPage(ScrollArea):
         course_layout.addWidget(course_title)
 
         self._course_combo = ComboBox()
+        self._course_ids = []
         for course in self._course_repo.courses:
+            self._course_ids.append(course.course_id)
             self._course_combo.addItem(
                 f"{course.course_name} ({course.estimated_minutes}分钟)")
-        course_layout.addWidget(self._course_combo)
+
+        course_grid = QGridLayout()
+        course_grid.setHorizontalSpacing(14)
+        self._patient_name = LineEdit()
+        self._patient_name.setPlaceholderText("可选，用于区分训练报告")
+        self._debug_switch = SwitchButton("显示性能调试信息")
+        course_grid.addWidget(BodyLabel("训练对象"), 0, 0)
+        course_grid.addWidget(self._patient_name, 0, 1)
+        course_grid.addWidget(BodyLabel("训练课程"), 1, 0)
+        course_grid.addWidget(self._course_combo, 1, 1)
+        course_grid.addWidget(self._debug_switch, 2, 1)
+        course_grid.setColumnStretch(1, 1)
+        course_layout.addLayout(course_grid)
 
         course_info = CaptionLabel(
             "训练课程定义了动作序列、目标次数和休息时间。"
@@ -174,10 +193,12 @@ class SettingsPage(ScrollArea):
         emg_row1.addWidget(self._emg_serial, 1)
         emg_layout.addLayout(emg_row1)
 
-        advanced_label = QLabel("高级链路参数")
-        advanced_label.setObjectName("metricLabel")
-        emg_layout.addWidget(advanced_label)
-        emg_row2 = QHBoxLayout()
+        self._advanced_toggle = SwitchButton("显示高级链路参数")
+        self._advanced_toggle.setChecked(False)
+        emg_layout.addWidget(self._advanced_toggle)
+        self._advanced_widget = QWidget()
+        emg_row2 = QHBoxLayout(self._advanced_widget)
+        emg_row2.setContentsMargins(0, 0, 0, 0)
         self._emg_rpmsg_ctrl = LineEdit()
         self._emg_rpmsg_ctrl.setText("/dev/rpmsg_ctrl0")
         self._emg_rpmsg_ctrl.setPlaceholderText("RPMsg control device")
@@ -192,7 +213,9 @@ class SettingsPage(ScrollArea):
         emg_row2.addWidget(self._emg_rpmsg_data, 1)
         emg_row2.addWidget(BodyLabel("Endpoint"))
         emg_row2.addWidget(self._emg_endpoint)
-        emg_layout.addLayout(emg_row2)
+        emg_layout.addWidget(self._advanced_widget)
+        self._advanced_widget.setVisible(False)
+        self._advanced_toggle.checkedChanged.connect(self._advanced_widget.setVisible)
 
         root.addWidget(emg_card)
 
@@ -202,6 +225,10 @@ class SettingsPage(ScrollArea):
         apply_hint.setObjectName("sectionHint")
         btn_row.addWidget(apply_hint)
         btn_row.addStretch()
+        self._btn_test = PushButton("测试设备")
+        self._btn_test.setMinimumSize(110, 38)
+        self._btn_test.clicked.connect(self._test_devices)
+        btn_row.addWidget(self._btn_test)
         self._btn_apply = PrimaryPushButton("应用设置")
         self._btn_apply.setMinimumSize(128, 38)
         self._btn_apply.clicked.connect(self._apply)
@@ -230,6 +257,11 @@ class SettingsPage(ScrollArea):
         self._emg_rpmsg_ctrl.setText(c.emg.rpmsg_ctrl_device)
         self._emg_rpmsg_data.setText(c.emg.rpmsg_data_device)
         self._emg_endpoint.setText(c.emg.rpmsg_endpoint_name)
+        self._patient_name.setText(c.patient_name)
+        self._debug_switch.setChecked(c.ui_debug_enabled)
+        if c.selected_course_id in self._course_ids:
+            self._course_combo.setCurrentIndex(
+                self._course_ids.index(c.selected_course_id))
 
     def _apply(self):
         c = self._config
@@ -257,5 +289,46 @@ class SettingsPage(ScrollArea):
         c.emg.rpmsg_data_device = self._emg_rpmsg_data.text().strip()
         c.emg.rpmsg_endpoint_name = self._emg_endpoint.text().strip()
 
-        InfoBar.success("设置已应用", "设备配置已更新，下次训练生效。",
+        c.patient_name = self._patient_name.text().strip()
+        c.ui_debug_enabled = self._debug_switch.isChecked()
+        index = self._course_combo.currentIndex()
+        if 0 <= index < len(self._course_ids):
+            c.selected_course_id = self._course_ids[index]
+
+        try:
+            config_path = save_pipeline_config(c)
+        except OSError as exc:
+            InfoBar.error("保存失败", str(exc),
+                          position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
+            return
+
+        self.course_changed.emit(c.selected_course_id)
+        self.debug_changed.emit(c.ui_debug_enabled)
+        self.settings_applied.emit(str(config_path))
+        parent = self.window()
+        if hasattr(parent, "refresh_diagnostics"):
+            parent.refresh_diagnostics()
+
+        InfoBar.success("设置已保存", f"配置已写入 {config_path.name}，下次训练生效。",
                         position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
+
+    def _test_devices(self):
+        """Run the same diagnostics used at startup and summarize the result."""
+        self._btn_test.setEnabled(False)
+        try:
+            diagnostics = run_diagnostics(self._config)
+            errors = diagnostics.errors()
+            warnings = diagnostics.warnings()
+            if errors:
+                detail = "；".join(item.name for item in errors[:4])
+                InfoBar.error("设备检查未通过", detail, duration=6000,
+                              position=InfoBarPosition.TOP_RIGHT, parent=self)
+            elif warnings:
+                detail = "；".join(item.name for item in warnings[:4])
+                InfoBar.warning("设备可用但存在警告", detail, duration=5000,
+                                position=InfoBarPosition.TOP_RIGHT, parent=self)
+            else:
+                InfoBar.success("设备检查通过", "相机、引擎与保存路径状态正常。",
+                                position=InfoBarPosition.TOP_RIGHT, parent=self)
+        finally:
+            self._btn_test.setEnabled(True)

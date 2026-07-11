@@ -22,6 +22,7 @@ from qfluentwidgets import (
     TextBrowser, ListWidget, ScrollArea, InfoBar, InfoBarPosition,
 )
 from ..theme import COLORS, PAGE_STYLE, pill_style
+from rehab_engine.reporting import generate_session_report
 
 
 class ReportsPage(QWidget):
@@ -134,14 +135,24 @@ class ReportsPage(QWidget):
         self._btn_save.setEnabled(True)
         self._btn_folder.setEnabled(Path(session_dir).exists())
 
-        # Try to find report HTML files
+        # Prefer the stable session summary. Generate it when only CSV exists.
         sd = Path(session_dir)
         html_content = self._default_html()
+        report_path = sd / "session_report.html"
+        if not report_path.exists() and csv_path and Path(csv_path).exists():
+            try:
+                report_path = Path(generate_session_report(session_dir, csv_path))
+                InfoBar.success("报告已生成", "训练摘要已生成并载入。",
+                                position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
+            except (OSError, ValueError) as exc:
+                InfoBar.error("报告生成失败", str(exc), duration=6000,
+                              position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
 
-        # Look for offline_action_report.html in actions subdir
-        for html_file in list(sd.rglob("*.html")):
+        candidates = [report_path] if report_path.exists() else list(sd.rglob("*.html"))
+        for html_file in candidates:
             if html_file.is_file():
                 html_content = html_file.read_text(encoding="utf-8", errors="ignore")
+                self._report_subtitle.setText(f"报告文件：{html_file.name}")
                 break
 
         self._browser.setHtml(html_content)
@@ -168,31 +179,37 @@ class ReportsPage(QWidget):
                 continue
             session_dirs = {p.parent for p in records_dir.rglob("skeleton_3d.csv")}
             session_dirs.update(p.parent for p in records_dir.rglob("meta.json"))
+            session_dirs.update(p.parent for p in records_dir.rglob("session_ui_meta.json"))
             for session in session_dirs:
                 session = session.resolve()
                 if session in seen:
                     continue
                 seen.add(session)
-                meta_file = session / "meta.json"
+                meta_file = session / "session_ui_meta.json"
+                if not meta_file.exists():
+                    meta_file = session / "meta.json"
                 start_time = ""
+                session_label = ""
                 if meta_file.exists():
                     try:
                         meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                        start_time = meta.get("start_time", "")
+                        start_time = meta.get("start_time", meta.get("end_time", ""))
+                        session_label = " · ".join(filter(None, [
+                            meta.get("patient_name", ""), meta.get("course_name", "")]))
                     except Exception:
                         pass
                 if not start_time:
                     start_time = datetime.fromtimestamp(
                         session.stat().st_mtime).isoformat(timespec="minutes")
-                entries.append((str(session), start_time))
+                entries.append((str(session), start_time, session_label))
         entries.sort(key=lambda entry: entry[1] or entry[0], reverse=True)
         entries = entries[:50]  # Keep last 50
         self._history_entries = entries
 
-        for path, start_time in entries:
-            name = f"{Path(path).name}"
+        for path, start_time, session_label in entries:
+            name = session_label or Path(path).name
             if start_time:
-                name = f"{start_time[:16].replace('T', ' ')}\n{Path(path).name}"
+                name = f"{start_time[:16].replace('T', ' ')}\n{name}"
             self._history_list.addItem(name)
         self._history_count.setText(f"{len(entries)} 次")
 

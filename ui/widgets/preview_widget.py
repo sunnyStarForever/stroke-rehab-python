@@ -57,6 +57,9 @@ class PreviewWidget(QWidget):
         self._show_debug = True
         self._mirror = False
         self._recording = False
+        self._progress_count = 0
+        self._progress_target = 0
+        self._quality_text = "等待评分"
 
         self._score_threshold = 0.35
 
@@ -105,6 +108,12 @@ class PreviewWidget(QWidget):
         self._recording = v
         self.update()
 
+    def set_training_progress(self, count: int, target: int, quality: str = ""):
+        self._progress_count = max(0, int(count))
+        self._progress_target = max(0, int(target))
+        self._quality_text = quality or "等待评分"
+        self.update()
+
     # ---- Paint ----
 
     def paintEvent(self, event):
@@ -149,6 +158,9 @@ class PreviewWidget(QWidget):
         # --- Engine mode badge ---
         self._draw_engine_badge(painter, draw_rect)
 
+        # --- Patient-facing progress overlay ---
+        self._draw_training_progress(painter, draw_rect)
+
         # --- Recording indicator ---
         if self._recording:
             painter.setPen(Qt.NoPen)
@@ -160,6 +172,35 @@ class PreviewWidget(QWidget):
             font = QFont("Segoe UI", 11, QFont.Bold)
             painter.setFont(font)
             painter.drawText(cx - 70, cy + 5, "● REC")
+
+    def _draw_training_progress(self, painter: QPainter, img_rect: QRect):
+        if self._progress_target <= 0:
+            return
+        width, height = 250, 66
+        panel = QRect(
+            img_rect.center().x() - width // 2,
+            img_rect.bottom() - height - 18,
+            width, height,
+        )
+        painter.setPen(QPen(QColor(255, 255, 255, 35), 1))
+        painter.setBrush(QColor(8, 15, 28, 210))
+        painter.drawRoundedRect(panel, 14, 14)
+
+        count_font = QFont("Segoe UI", 22, QFont.Bold)
+        painter.setFont(count_font)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(
+            QRect(panel.left() + 14, panel.top() + 5, panel.width() - 28, 34),
+            Qt.AlignCenter,
+            f"{self._progress_count} / {self._progress_target} 次",
+        )
+        quality_font = QFont("Segoe UI", 10)
+        painter.setFont(quality_font)
+        painter.setPen(QColor(125, 211, 252))
+        painter.drawText(
+            QRect(panel.left() + 14, panel.top() + 38, panel.width() - 28, 20),
+            Qt.AlignCenter, self._quality_text,
+        )
 
     # ================================================================
     # Status overlay (shown when no frame data)

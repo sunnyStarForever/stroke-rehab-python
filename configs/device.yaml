@@ -1,0 +1,44 @@
+depth_capture:
+  device_uri: ""
+  enable_hardware_d2c: true
+  enable_openni_color_stream_for_debug: false
+  enable_depth_color_sync: false
+  width: 640
+  height: 480
+  fps: 30
+
+depth_sampler:
+  min_depth_mm: 300
+  max_depth_mm: 5000
+  body_depth_band_mm: 700
+  edge_body_depth_band_mm: 900
+  background_reject_margin_mm: 500
+  background_match_band_mm: 300
+  foreground_percentile: 0.20
+  min_foreground_pixels: 3
+  hip_radius: 2
+  knee_radius: 3
+  ankle_radius: 4
+  toe_radius: 5
+  wrist_radius: 4
+  default_radius: 2
+  limb_inward_search_enabled: true
+  limb_inward_steps: 10
+  limb_inward_step_px: 3
+  limb_inward_radius: 3
+
+skeleton_filter:
+  mode: "ema"
+  alpha_good: 0.65
+  alpha_low_confidence: 0.35
+  alpha_recovered: 0.45
+  alpha_invalid: 0.0
+  max_z_jump_m: 0.45
+  max_joint_speed_mps: 2.5
+  hold_last_when_invalid: true
+  max_hold_frames: 5
+
+debug:
+  save_depth_sampling_overlay: false
+  save_skeleton_raw_csv: true
+  save_skeleton_ema_csv: true

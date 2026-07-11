@@ -61,7 +61,12 @@ class EmgPanel(SimpleCardWidget):
         status = frame.emg_status or "肌电未接入"
 
         # Parse EMG status text
-        if "mock" in status.lower():
+        if "waiting" in status.lower() or "error" in status.lower():
+            self._status_label.setText("肌电：等待真实设备数据")
+            self._status_label.setStyleSheet("color: #B45309;")
+            self._status_dot.setText("等待中")
+            self._status_dot.setStyleSheet(pill_style("warning"))
+        elif "mock" in status.lower():
             self._status_label.setText("肌电：模拟模式（演示数据）")
             self._status_label.setStyleSheet("color: #B45309;")
             self._status_dot.setText("模拟")

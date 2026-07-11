@@ -83,6 +83,12 @@ class Skeleton3DRecorder:
             self._csv = open(csv_path, "w", newline="", encoding="utf-8")
             self._debug_csv = open(debug_path, "w", newline="", encoding="utf-8")
         except OSError:
+            if self._csv:
+                self._csv.close()
+                self._csv = None
+            if self._debug_csv:
+                self._debug_csv.close()
+                self._debug_csv = None
             return False
 
         # Build CSV header: timestamp_ns,frame_id,..., plus 22 joints × (x,y,z,score,valid)

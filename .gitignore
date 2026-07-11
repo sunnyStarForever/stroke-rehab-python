@@ -41,4 +41,4 @@ Thumbs.db
 .env.*
 !.env.example
 *.local
-
+config.user.json

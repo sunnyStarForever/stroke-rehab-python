@@ -13,11 +13,13 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "engine/common/Config.h"
 #include "engine/util/Logger.h"
 
 #ifndef STROKE_ENGINE_STUB
+#include <opencv2/imgcodecs.hpp>
 #include "engine/capture/DepthCaptureOpenNI.h"
 #include "engine/capture/RgbCaptureV4L2.h"
 #include "engine/common/FrameEnvelope.h"
@@ -218,14 +220,40 @@ static void registerLoggerBindings(py::module_& m) {
 // ============================================================================
 #ifndef STROKE_ENGINE_STUB
 
+// C++ capture threads call back into Python with JPEG-encoded RGB frames.
+// This avoids binding cv::Mat / FrameEnvelope — no OpenCV Python needed on the C++ side.
+// Python callback signature: callback(
+//     jpeg_bytes: bytes, width: int, height: int,
+//     ts_ns: int, frame_id: int, source: str
+// )
+using JpegFrameCallback = std::function<void(py::bytes, int, int, uint64_t, uint64_t, std::string)>;
+
+static JpegFrameCallback wrapJpegCallback(py::object obj) {
+  if (obj.is_none()) return nullptr;
+  auto fn = obj.cast<py::function>();
+  return [fn](py::bytes jpeg, int w, int h, uint64_t ts, uint64_t fid, std::string src) {
+    py::gil_scoped_acquire gil;
+    try { fn(jpeg, w, h, ts, fid, src); } catch (py::error_already_set&) {}
+  };
+}
+
 static void registerCaptureBindings(py::module_& m) {
   py::class_<RgbCaptureV4L2>(m, "RgbCaptureV4L2")
       .def(py::init<>())
       .def("start",
            [](RgbCaptureV4L2& self, const DeviceConfig& config,
               py::object callback) {
+             auto pyCb = wrapJpegCallback(callback);
              return self.start(config,
-                 wrapCallback<RgbCaptureV4L2::FrameCallback>(callback));
+                 [pyCb](FrameEnvelope env) {
+                   if (!pyCb || env.image.empty()) return;
+                   // JPEG encode: quality 85 balances bandwidth and CPU
+                   std::vector<uchar> buf;
+                   std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
+                   cv::imencode(".jpg", env.image, buf, params);
+                   py::bytes jpeg(reinterpret_cast<const char*>(buf.data()), buf.size());
+                   pyCb(jpeg, env.width, env.height, env.hostTsNs, env.frameId, "rgb");
+                 });
            },
            py::arg("config"), py::arg("frame_callback"))
       .def("stop", &RgbCaptureV4L2::stop)
@@ -242,8 +270,17 @@ static void registerCaptureBindings(py::module_& m) {
       .def("start",
            [](DepthCaptureOpenNI& self, const DeviceConfig& config,
               py::object callback) {
+             auto pyCb = wrapJpegCallback(callback);
              return self.start(config,
-                 wrapCallback<DepthCaptureOpenNI::FrameCallback>(callback));
+                 [pyCb](FrameEnvelope env) {
+                   if (!pyCb || env.image.empty()) return;
+                   // Depth is 16-bit mm — encode as 16-bit PNG to avoid loss
+                   std::vector<uchar> buf;
+                   std::vector<int> params = {cv::IMWRITE_PNG_COMPRESSION, 1};
+                   cv::imencode(".png", env.image, buf, params);
+                   py::bytes png(reinterpret_cast<const char*>(buf.data()), buf.size());
+                   pyCb(png, env.width, env.height, env.hostTsNs, env.frameId, "depth");
+                 });
            },
            py::arg("config"), py::arg("frame_callback"))
       .def("stop", &DepthCaptureOpenNI::stop)

@@ -9,7 +9,7 @@ import sys
 from datetime import datetime
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QApplication
 
 from qfluentwidgets import (
@@ -33,6 +33,8 @@ from .pages.settings_page import SettingsPage
 
 
 class StrokeRehabWindow(FluentWindow):
+    engine_log_received = pyqtSignal(str, str)
+
     def __init__(self, diagnostics: Optional[Diagnostics] = None, parent=None):
         setTheme(Theme.LIGHT)
         setThemeColor("#2563EB")
@@ -45,7 +47,8 @@ class StrokeRehabWindow(FluentWindow):
         self._diag = diagnostics
 
         self._config = load_pipeline_config()
-        logger.set_callback(self._on_engine_log)
+        self.engine_log_received.connect(self._on_engine_log)
+        logger.set_callback(self.engine_log_received.emit)
 
         self._init_navigation()
 
@@ -127,6 +130,9 @@ class StrokeRehabWindow(FluentWindow):
         )
 
         training.report_requested.connect(self.navigate_to_reports)
+        settings.course_changed.connect(training.set_course)
+        settings.debug_changed.connect(training.set_debug_enabled)
+        training.set_debug_enabled(self._config.ui_debug_enabled)
 
     def navigate_to_reports(self, session_dir: str, csv_path: str):
         reports = self.findChild(ReportsPage)

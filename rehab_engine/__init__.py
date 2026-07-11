@@ -53,12 +53,13 @@ else:
 from .diagnostics import Diagnostics, DiagItem, run_diagnostics, print_diagnostics
 
 # Stage 2 application modules (pure Python)
-from .config_loader import load_pipeline_config
+from .config_loader import load_pipeline_config, save_pipeline_config
 from .course import CourseRepository, CourseRunner, Course, CourseAction
 from .scoring import ScoreBridge, OfflineReportRunner, ScoreResult
 from .recorder import Skeleton3DRecorder, EmgRecorder
 from .sensor_pipeline import SensorPipeline
 from .preview import PreviewComposer, PreviewFrame
+from .reporting import analyze_skeleton_csv, generate_session_report
 
 __all__ = [
     # Config
@@ -71,6 +72,7 @@ __all__ = [
     "DebugConfig",
     "EmgConfig",
     "load_pipeline_config",
+    "save_pipeline_config",
     "logger",
     # Diagnostics
     "Diagnostics",
@@ -93,4 +95,6 @@ __all__ = [
     # Recording
     "Skeleton3DRecorder",
     "EmgRecorder",
+    "analyze_skeleton_csv",
+    "generate_session_report",
 ]

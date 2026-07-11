@@ -187,3 +187,6 @@ class PipelineConfig:
     calibration_file: str = ""
     record_pairs: bool = False
     record_path: str = "recordings"
+    selected_course_id: str = ""
+    patient_name: str = ""
+    ui_debug_enabled: bool = False

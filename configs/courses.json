@@ -1,0 +1,33 @@
+{
+  "courses": [
+    {
+      "course_id": "upper_limb_shoulder_rom_basic",
+      "course_name": "上肢肩关节活动度基础训练",
+      "category": "upper_limb",
+      "difficulty": 2,
+      "estimated_minutes": 10,
+      "description": "用于提升肩关节外展、伸展、旋转和肩胛平面上举能力",
+      "actions": [
+        {"order": 1, "action_id": "M7", "movement_id": "m07", "name_cn": "站立肩外展", "target_reps": 8, "rest_sec_after": 20},
+        {"order": 2, "action_id": "M8", "movement_id": "m08", "name_cn": "站立肩伸展", "target_reps": 8, "rest_sec_after": 20},
+        {"order": 3, "action_id": "M9", "movement_id": "m09", "name_cn": "站立肩内外旋", "target_reps": 10, "rest_sec_after": 20},
+        {"order": 4, "action_id": "M10", "movement_id": "m10", "name_cn": "肩胛平面上举", "target_reps": 8, "rest_sec_after": 30}
+      ]
+    },
+    {
+      "course_id": "lower_limb_balance_transfer_basic",
+      "course_name": "下肢站立转移与平衡基础训练",
+      "category": "lower_limb",
+      "difficulty": 3,
+      "estimated_minutes": 15,
+      "description": "用于提升坐站转换、下肢力量、单腿支撑、重心转移和平衡能力",
+      "actions": [
+        {"order": 1, "action_id": "M5", "movement_id": "m05", "name_cn": "坐站转换", "target_reps": 8, "rest_sec_after": 30},
+        {"order": 2, "action_id": "M6", "movement_id": "m06", "name_cn": "站立主动直腿抬高", "target_reps": 6, "side_mode": "left_right", "rest_sec_after": 30},
+        {"order": 3, "action_id": "M2", "movement_id": "m02", "name_cn": "跨栏步", "target_reps": 6, "side_mode": "left_right", "rest_sec_after": 30},
+        {"order": 4, "action_id": "M4", "movement_id": "m04", "name_cn": "侧弓步", "target_reps": 6, "side_mode": "left_right", "rest_sec_after": 40},
+        {"order": 5, "action_id": "M3", "movement_id": "m03", "name_cn": "前后弓步", "target_reps": 6, "rest_sec_after": 40}
+      ]
+    }
+  ]
+}

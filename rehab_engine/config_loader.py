@@ -7,6 +7,7 @@ and the SensorPipeline constructor.
 import json
 import os
 import sys
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -69,36 +70,40 @@ def _load_yaml(path: Path) -> dict:
             pass
     # Fallback: very basic YAML-ish parser for simple key:value files
     result: dict = {}
-    indent = 0
-    stack = [(result, indent)]
+    stack = [(-1, result)]
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or stripped.startswith("%"):
             continue
         if ":" not in stripped:
             continue
-        key, _, value = stripped.partition(":")
+        indent = len(line) - len(line.lstrip())
+        key, _, raw_value = stripped.partition(":")
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if value == "":
+        raw_value = raw_value.strip()
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if raw_value == "":
             # nested dict
             sub = {}
-            result[key] = sub
-            stack.append((result, indent))
-            result = sub
-            indent = len(line) - len(line.lstrip())
+            parent[key] = sub
+            stack.append((indent, sub))
         else:
+            value = raw_value.strip('"').strip("'")
             # typed conversion
             if value.lower() in ("true", "yes"):
                 val = True
             elif value.lower() in ("false", "no"):
                 val = False
+            elif value.lower() in ("null", "none", "~"):
+                val = None
             elif value.replace(".", "", 1).replace("-", "", 1).isdigit():
                 val = float(value) if "." in value else int(value)
             else:
                 val = value
-            result[key] = val
-    return stack[0][0]
+            parent[key] = val
+    return result
 
 
 def load_pipeline_config(
@@ -155,10 +160,50 @@ def load_pipeline_config(
             if hasattr(config.emg, k):
                 setattr(config.emg, k, v)
 
+    # --- Load local user preferences written by the settings page ---
+    user_path = _user_config_path()
+    if user_path.exists():
+        try:
+            _apply_config_dict(config, json.loads(user_path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warn(f"Unable to load user config {user_path}: {exc}")
+
     # --- Environment variable overrides ---
     _env_override(config)
 
     return config
+
+
+def _user_config_path() -> Path:
+    override = os.environ.get("STROKE_USER_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parent.parent / "config.user.json"
+
+
+def _apply_config_dict(target, values: dict) -> None:
+    """Recursively apply known JSON keys to the config dataclasses."""
+    for key, value in values.items():
+        if not hasattr(target, key):
+            continue
+        current = getattr(target, key)
+        if is_dataclass(current) and isinstance(value, dict):
+            _apply_config_dict(current, value)
+        else:
+            setattr(target, key, value)
+
+
+def save_pipeline_config(config: PipelineConfig, path: Optional[Path] = None) -> Path:
+    """Persist user-editable preferences without modifying shipped YAML files."""
+    output = path or _user_config_path()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(asdict(config), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    return output
 
 
 def _env_override(config: PipelineConfig) -> None:
