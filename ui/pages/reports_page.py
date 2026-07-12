@@ -4,6 +4,7 @@ Replaces app/pages/ReportPage.cpp.
 """
 
 import json
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -28,13 +29,21 @@ from rehab_engine.reporting import generate_session_report
 class ReportsPage(QWidget):
     """Training reports and history browser."""
 
+    report_loaded = pyqtSignal(int, str, str, str)
+    history_loaded = pyqtSignal(int, object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._session_dir = ""
         self._csv_path = ""
         self._history_entries = []
+        self._report_generation = 0
+        self._history_generation = 0
+        self._closing = False
 
         self._init_ui()
+        self.report_loaded.connect(self._on_report_loaded)
+        self.history_loaded.connect(self._on_history_loaded)
         self._browser.setHtml(self._default_html())
         self._load_history()
 
@@ -125,44 +134,77 @@ class ReportsPage(QWidget):
         root.addWidget(content, 1)
 
     def load_session(self, session_dir: str, csv_path: str):
-        """Load a session report from disk."""
+        """Load a session report — heavy I/O runs in background thread."""
         self._session_dir = session_dir
         self._csv_path = csv_path
-        self._report_title.setText(
-            f"训练报告 — {Path(session_dir).name}")
-        self._report_subtitle.setText(
-            f"骨骼数据：{'已就绪' if csv_path and Path(csv_path).exists() else '未找到'}")
+        self._report_title.setText(f"训练报告 — {Path(session_dir).name}")
         self._btn_save.setEnabled(True)
         self._btn_folder.setEnabled(Path(session_dir).exists())
+        self._report_subtitle.setText("正在后台生成/载入报告…")
+        self._report_generation += 1
+        generation = self._report_generation
 
-        # Prefer the stable session summary. Generate it when only CSV exists.
+        # ── Report generation in background (avoids UI freeze) ──
         sd = Path(session_dir)
-        html_content = self._default_html()
-        report_path = sd / "session_report.html"
-        if not report_path.exists() and csv_path and Path(csv_path).exists():
+        rp = sd / "session_report.html"
+        need_gen = (not rp.exists() and csv_path and Path(csv_path).exists())
+
+        def _do_load():
+            subtitle = ""
+            error = ""
+            if need_gen:
+                try:
+                    path = Path(generate_session_report(session_dir, csv_path))
+                    subtitle = f"报告文件：{path.name}"
+                    html = path.read_text(encoding="utf-8", errors="ignore")
+                except Exception as exc:
+                    html = self._default_html()
+                    subtitle = "报告生成失败"
+                    error = str(exc)
+            else:
+                html = self._default_html()
+                for hf in ([rp] if rp.exists() else list(sd.rglob("*.html"))):
+                    if hf.is_file():
+                        html = hf.read_text(encoding="utf-8", errors="ignore")
+                        subtitle = f"报告文件：{hf.name}"
+                        break
+                else:
+                    subtitle = "骨骼数据：" + (
+                        "已就绪" if csv_path and Path(csv_path).exists() else "未找到")
             try:
-                report_path = Path(generate_session_report(session_dir, csv_path))
-                InfoBar.success("报告已生成", "训练摘要已生成并载入。",
-                                position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
-            except (OSError, ValueError) as exc:
-                InfoBar.error("报告生成失败", str(exc), duration=6000,
-                              position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
+                self.report_loaded.emit(generation, html, subtitle, error)
+            except RuntimeError:
+                pass
 
-        candidates = [report_path] if report_path.exists() else list(sd.rglob("*.html"))
-        for html_file in candidates:
-            if html_file.is_file():
-                html_content = html_file.read_text(encoding="utf-8", errors="ignore")
-                self._report_subtitle.setText(f"报告文件：{html_file.name}")
-                break
+        threading.Thread(target=_do_load, name="report-load", daemon=True).start()
 
-        self._browser.setHtml(html_content)
-
-        # Refresh history
+    def _on_report_loaded(self, generation: int, html: str,
+                          subtitle: str, error: str):
+        """Runs on the Qt thread through a queued signal."""
+        if self._closing or generation != self._report_generation:
+            return
+        self._report_subtitle.setText(subtitle)
+        self._browser.setHtml(html)
+        if error:
+            InfoBar.error("报告生成失败", error, duration=6000,
+                          position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
         self._load_history()
 
     def _load_history(self):
-        """Scan records directory for past sessions."""
-        self._history_list.clear()
+        """Scan session directories off the Qt thread."""
+        self._history_generation += 1
+        generation = self._history_generation
+
+        def _scan():
+            entries = self._scan_history_entries()
+            try:
+                self.history_loaded.emit(generation, entries)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=_scan, name="history-scan", daemon=True).start()
+
+    def _scan_history_entries(self):
         entries = []
         project_root = Path(__file__).resolve().parents[2]
         roots = [
@@ -204,7 +246,13 @@ class ReportsPage(QWidget):
                 entries.append((str(session), start_time, session_label))
         entries.sort(key=lambda entry: entry[1] or entry[0], reverse=True)
         entries = entries[:50]  # Keep last 50
+        return entries
+
+    def _on_history_loaded(self, generation: int, entries):
+        if self._closing or generation != self._history_generation:
+            return
         self._history_entries = entries
+        self._history_list.clear()
 
         for path, start_time, session_label in entries:
             name = session_label or Path(path).name
@@ -212,6 +260,12 @@ class ReportsPage(QWidget):
                 name = f"{start_time[:16].replace('T', ' ')}\n{name}"
             self._history_list.addItem(name)
         self._history_count.setText(f"{len(entries)} 次")
+
+    def shutdown(self):
+        """Invalidate outstanding worker results before the page is destroyed."""
+        self._closing = True
+        self._report_generation += 1
+        self._history_generation += 1
 
     def _on_history_selected(self, item):
         row = self._history_list.row(item) if item else -1

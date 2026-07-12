@@ -301,6 +301,159 @@ static void registerSyncBindings(py::module_& m) {
       .def("clear", &SyncManager::clear);
 }
 
+// ============================================================================
+// SyncedCapture — RGB-driven RGB+Depth pipeline
+// ============================================================================
+//
+// RGB frames pace the output at 30 fps.  Depth frames are cached and
+// attached to the next RGB frame.  No SyncManager pair-matching bottleneck:
+// every RGB frame is delivered immediately even when depth is warming up
+// or USB drops a frame, so the UI never flickers.
+//
+//   RgbCaptureV4L2 ──► every frame encoded + output immediately
+//                                          │
+//   DepthCaptureOpenNI ──► cached (mutex) ─┘  attached if available
+
+namespace {
+
+using SyncedPairCb = std::function<void(
+    py::bytes, py::bytes, int, int, int, int, uint64_t, uint64_t, int64_t)>;
+
+static SyncedPairCb makeSyncedPairCb(py::object obj) {
+  if (obj.is_none()) return nullptr;
+  auto fn = obj.cast<py::function>();
+  return [fn](py::bytes jpeg, py::bytes png,
+              int rw, int rh, int dw, int dh,
+              uint64_t rts, uint64_t dts, int64_t delta) {
+    py::gil_scoped_acquire gil;
+    try { fn(jpeg, png, rw, rh, dw, dh, rts, dts, delta); }
+    catch (py::error_already_set&) {}
+  };
+}
+
+static std::function<void(const std::string&)> makeStatusCb(py::object obj) {
+  if (obj.is_none()) return nullptr;
+  auto fn = obj.cast<py::function>();
+  return [fn](const std::string& msg) {
+    py::gil_scoped_acquire gil;
+    try { fn(msg); } catch (py::error_already_set&) {}
+  };
+}
+
+}  // anonymous namespace
+
+class SyncedCapture {
+ public:
+  SyncedCapture() = default;
+  ~SyncedCapture() { stop(); }
+
+  bool start(const DeviceConfig& config, py::object pair_callback) {
+    if (running_) return true;
+
+    auto pyCb = makeSyncedPairCb(pair_callback);
+    if (!pyCb) return false;
+
+    // ── RGB capture (pacing source) ──
+    rgbCapture_ = std::make_unique<RgbCaptureV4L2>();
+    if (statusCb_) rgbCapture_->setOnStatus(makeStatusCb(statusCb_));
+
+    if (!rgbCapture_->start(config, [this, pyCb](FrameEnvelope rgbEnv) {
+          if (!rgbEnv.valid()) return;
+
+          std::vector<uchar> jpegBuf;
+          cv::imencode(".jpg", rgbEnv.image, jpegBuf,
+                       {cv::IMWRITE_JPEG_QUALITY, 85});
+
+          // ── Attach latest depth frame (best-effort) ──
+          std::vector<uchar> pngBuf;
+          int dw = 0, dh = 0;
+          uint64_t dts = 0;
+          int64_t delta = 0;
+          {
+            std::lock_guard<std::mutex> lock(depthMutex_);
+            if (depthCached_ && depthCached_->valid()) {
+              cv::imencode(".png", depthCached_->image, pngBuf,
+                           {cv::IMWRITE_PNG_COMPRESSION, 1});
+              dw = depthCached_->width;
+              dh = depthCached_->height;
+              dts = depthCached_->hostTsNs;
+              delta = static_cast<int64_t>(rgbEnv.hostTsNs)
+                    - static_cast<int64_t>(depthCached_->hostTsNs);
+            }
+          }
+
+          pyCb(py::bytes(reinterpret_cast<const char*>(jpegBuf.data()), jpegBuf.size()),
+               py::bytes(reinterpret_cast<const char*>(pngBuf.data()), pngBuf.size()),
+               rgbEnv.width, rgbEnv.height,
+               dw, dh,
+               rgbEnv.hostTsNs, dts, delta);
+        })) {
+      Logger::warn("SyncedCapture: RGB camera start failed");
+    }
+
+    // ── Depth capture (cache only) ──
+    depthCapture_ = std::make_unique<DepthCaptureOpenNI>();
+    if (!depthCapture_->start(config, [this](FrameEnvelope depthEnv) {
+          if (!depthEnv.valid()) return;
+          std::lock_guard<std::mutex> lock(depthMutex_);
+          depthCached_ = std::make_unique<FrameEnvelope>(std::move(depthEnv));
+        })) {
+      Logger::warn("SyncedCapture: Depth camera start failed");
+    }
+
+    running_ = true;
+    return true;
+  }
+
+  void stop() {
+    if (!running_) return;
+    running_ = false;
+
+    if (rgbCapture_) rgbCapture_->stop();
+    if (depthCapture_) depthCapture_->stop();
+
+    rgbCapture_.reset();
+    depthCapture_.reset();
+    {
+      std::lock_guard<std::mutex> lock(depthMutex_);
+      depthCached_.reset();
+    }
+  }
+
+  bool is_running() const { return running_; }
+
+  bool hardware_d2c_active() const {
+    return depthCapture_ && depthCapture_->hardwareD2CActive();
+  }
+
+  void set_on_status(py::object callback) {
+    statusCb_ = callback;
+    if (rgbCapture_ && !callback.is_none())
+      rgbCapture_->setOnStatus(makeStatusCb(callback));
+  }
+
+ private:
+  std::unique_ptr<RgbCaptureV4L2> rgbCapture_;
+  std::unique_ptr<DepthCaptureOpenNI> depthCapture_;
+  std::mutex depthMutex_;
+  std::unique_ptr<FrameEnvelope> depthCached_;
+  py::object statusCb_;
+  bool running_{false};
+};
+
+static void registerSyncedCaptureBinding(py::module_& m) {
+  py::class_<SyncedCapture>(m, "SyncedCapture")
+      .def(py::init<>())
+      .def("start", &SyncedCapture::start,
+           py::arg("config"), py::arg("pair_callback"))
+      .def("stop", &SyncedCapture::stop)
+      .def("is_running", &SyncedCapture::is_running)
+      .def("hardware_d2c_active", &SyncedCapture::hardware_d2c_active)
+      .def("set_on_status",
+           [](SyncedCapture& self, py::object cb) { self.set_on_status(cb); },
+           py::arg("callback"));
+}
+
 static void registerPoseBindings(py::module_& m) {
   py::class_<PoseEstimatorConfig>(m, "PoseEstimatorConfig")
       .def(py::init<>())
@@ -350,18 +503,144 @@ static void registerPoseBindings(py::module_& m) {
            py::arg("model_path"), py::arg("input_size") = 320,
            py::arg("conf_threshold") = 0.35f,
            py::arg("nms_threshold") = 0.45f)
-      .def("is_initialized", &PersonDetectorOrt::isInitialized);
+      .def("is_initialized", &PersonDetectorOrt::isInitialized)
+      // ── P0: ONNX inference from JPEG bytes ──
+      .def("detect_jpeg",
+           [](PersonDetectorOrt& self, py::bytes jpeg) -> std::vector<BoundingBox2D> {
+             std::string buf = jpeg;
+             std::vector<uchar> vec(buf.begin(), buf.end());
+             cv::Mat bgr = cv::imdecode(vec, cv::IMREAD_COLOR);
+             if (bgr.empty()) return {};
+             return self.detect(bgr);
+           },
+           py::arg("jpeg_bytes"))
+      .def("detect_largest_person_jpeg",
+           [](PersonDetectorOrt& self, py::bytes jpeg) -> py::object {
+             std::string buf = jpeg;
+             std::vector<uchar> vec(buf.begin(), buf.end());
+             cv::Mat bgr = cv::imdecode(vec, cv::IMREAD_COLOR);
+             if (bgr.empty()) return py::none();
+             auto box = self.detectLargestPerson(bgr);
+             if (!box.valid) return py::none();
+             return py::cast(box);
+           },
+           py::arg("jpeg_bytes"),
+           "Detect the largest person in a JPEG frame. Returns BoundingBox2D or None.");
+
+  py::class_<PoseInferenceResult>(m, "PoseInferenceResult")
+      .def(py::init<>())
+      .def_readonly("keypoints", &PoseInferenceResult::keypoints)
+      .def_readonly("used_box", &PoseInferenceResult::usedBox)
+      .def_readonly("mean_score", &PoseInferenceResult::meanScore)
+      .def_readonly("valid_count", &PoseInferenceResult::validCount)
+      .def_readonly("bbox_ms", &PoseInferenceResult::bboxMs)
+      .def_readonly("pose_ms", &PoseInferenceResult::poseMs)
+      .def_readonly("model_loaded", &PoseInferenceResult::modelLoaded);
 
   py::class_<PoseEstimatorRTMPoseOrt>(m, "PoseEstimatorRTMPoseOrt")
       .def(py::init<>())
       .def("initialize", &PoseEstimatorRTMPoseOrt::initialize, py::arg("config"))
-      .def("is_initialized", &PoseEstimatorRTMPoseOrt::isInitialized);
+      .def("is_initialized", &PoseEstimatorRTMPoseOrt::isInitialized)
+      // ── P0: ONNX inference from JPEG bytes ──
+      // YOLO detector must be set via setBoundingBoxProvider BEFORE calling infer.
+      .def("infer_jpeg",
+           [](PoseEstimatorRTMPoseOrt& self, py::bytes jpeg) -> PoseInferenceResult {
+             std::string buf = jpeg;
+             std::vector<uchar> vec(buf.begin(), buf.end());
+             cv::Mat bgr = cv::imdecode(vec, cv::IMREAD_COLOR);
+             if (bgr.empty()) {
+               PoseInferenceResult empty;
+               return empty;
+             }
+             return self.infer(bgr);
+           },
+           py::arg("jpeg_bytes"),
+           "Run RTMPose inference on a JPEG frame. BoundingBoxProvider must be set first.")
+      .def("set_bounding_box_provider_fallback",
+           [](PoseEstimatorRTMPoseOrt& self, BoundingBox2D box) {
+             // Create a simple fallback provider from a fixed box
+             struct FixedBoxProvider : public BoundingBoxProvider {
+               BoundingBox2D box_;
+               FixedBoxProvider(BoundingBox2D b) : box_(b) {}
+               BoundingBox2D getPrimaryBox(const cv::Mat&) override {
+                 auto out = box_; out.valid = true; return out;
+               }
+               void updateFromPose(const BoundingBox2D&, const Halpe26Skeleton2D&) override {}
+               void reset() override {}
+               std::string debugState() const override { return "fixed"; }
+             };
+             self.setBoundingBoxProvider(std::make_shared<FixedBoxProvider>(box));
+           },
+           py::arg("box"),
+           "Set a fixed ROI box. Call BEFORE infer_jpeg().");
 
-  py::class_<Halpe26ToRehab22Mapper>(m, "Halpe26ToRehab22Mapper").def(py::init<>());
-  py::class_<JointProjector3D>(m, "JointProjector3D").def(py::init<>());
-  py::class_<EMASkeletonFilter>(m, "EMASkeletonFilter").def(py::init<>());
-  py::class_<SkeletonSmoother>(m, "SkeletonSmoother").def(py::init<>());
-  py::class_<DepthSampler>(m, "DepthSampler").def(py::init<>());
+  py::class_<Halpe26ToRehab22Mapper>(m, "Halpe26ToRehab22Mapper")
+      .def(py::init<>())
+      // ── P0: Halpe26 → Rehab22 mapping ──
+      .def("map", &Halpe26ToRehab22Mapper::map, py::arg("halpe26"),
+           "Map Halpe26 keypoints to Rehab22 joint set.");
+
+  py::class_<DepthSampler>(m, "DepthSampler")
+      .def(py::init<>())
+      // ── P0: PNG depth → 3D depth samples ──
+      .def("sample_png",
+           [](DepthSampler& self, py::bytes png,
+              const Rehab22Skeleton2D& joints2d,
+              float depthUnitToMeter, int windowSize) -> std::array<float, 22> {
+             std::string buf = png;
+             std::vector<uchar> vec(buf.begin(), buf.end());
+             cv::Mat depth = cv::imdecode(vec, cv::IMREAD_UNCHANGED);
+             if (depth.empty() || depth.type() != CV_16UC1) {
+               std::array<float, 22> zero{};
+               return zero;
+             }
+             return self.sample(depth, joints2d, depthUnitToMeter, windowSize);
+           },
+           py::arg("png_bytes"), py::arg("joints_2d"),
+           py::arg("depth_unit_to_meter") = 0.001f,
+           py::arg("window_size") = 7,
+           "Sample depth at Rehab22 joint positions from a 16-bit PNG. Returns 22 depth values in meters.");
+
+  py::class_<JointProjector3D>(m, "JointProjector3D")
+      .def(py::init<>())
+      .def("set_intrinsics",
+           [](JointProjector3D& self, float fx, float fy, float cx, float cy) {
+             CameraIntrinsics in;
+             in.fx = fx; in.fy = fy; in.cx = cx; in.cy = cy;
+             self.setIntrinsics(in);
+           },
+           py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"))
+      .def("intrinsics_valid", &JointProjector3D::intrinsicsValid)
+      .def("project",
+           [](JointProjector3D& self,
+              const Rehab22Skeleton2D& joints2d,
+              const std::array<float, 22>& depthsMeters) -> Rehab22Skeleton3D {
+             return self.project(joints2d, depthsMeters);
+           },
+           py::arg("joints_2d"), py::arg("depths_meters"),
+           "Project Rehab22 2D joints + depth → 3D skeleton (meters, camera frame).");
+
+  py::class_<EMASkeletonFilter>(m, "EMASkeletonFilter")
+      .def(py::init<>())
+      .def("reset", &EMASkeletonFilter::reset, py::arg("reason") = "")
+      .def("filter",
+           [](EMASkeletonFilter& self,
+              const Rehab22Skeleton3D& raw, double dt) -> Rehab22Skeleton3D {
+             return self.filter(raw, dt);
+           },
+           py::arg("raw"), py::arg("dt_seconds"),
+           "EMA filter one frame of Rehab22 3D keypoints.");
+
+  py::class_<SkeletonSmoother>(m, "SkeletonSmoother")
+      .def(py::init<>())
+      .def("reset", &SkeletonSmoother::reset)
+      .def("smooth",
+           [](SkeletonSmoother& self,
+              const Rehab22Skeleton3D& input) -> Rehab22Skeleton3D {
+             return self.smooth(input);
+           },
+           py::arg("input"),
+           "Smooth one frame of Rehab22 3D keypoints.");
 }
 
 static void registerEmgBindings(py::module_& m) {
@@ -412,7 +691,7 @@ static void registerEmgBindings(py::module_& m) {
 // Module entry
 // ============================================================================
 
-PYBIND11_MODULE(rehab_engine, m) {
+PYBIND11_MODULE(_core, m) {
   m.doc() = R"pbdoc(
     Stroke Rehab C++ Engine
     -----------------------
@@ -426,6 +705,7 @@ PYBIND11_MODULE(rehab_engine, m) {
 #ifndef STROKE_ENGINE_STUB
   registerCaptureBindings(m);
   registerSyncBindings(m);
+  registerSyncedCaptureBinding(m);
   registerPoseBindings(m);
   registerEmgBindings(m);
 #endif

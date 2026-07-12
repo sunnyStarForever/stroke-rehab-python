@@ -80,6 +80,12 @@ class PreviewFrame:
     # Mirror
     mirror: bool = False
 
+    # RGB image data (full mode: decoded JPEG frame for UI display)
+    rgb_image: Any = None
+
+    # Depth image data (full mode: decoded 16-bit PNG for overlay, mm scale)
+    depth_image: Any = None
+
     # Bone connections for skeleton drawing (index pairs into joints_2d)
     bones: List[Tuple[int, int]] = field(default_factory=list)
 
@@ -143,6 +149,10 @@ class PreviewComposer:
                emg_rms: Optional[List[float]] = None,
                emg_fatigue: Optional[List[float]] = None,
                mirror: bool = False,
+               # Real RGB image (numpy array, full mode)
+               rgb_image=None,
+               # Real depth image (numpy 16-bit array, full mode)
+               depth_image=None,
                ) -> None:
         """Submit new frame data. Called from the pipeline worker thread."""
         frame = PreviewFrame()
@@ -196,6 +206,8 @@ class PreviewComposer:
         frame.emg_fatigue_index = emg_fatigue or []
 
         frame.mirror = mirror
+        frame.rgb_image = rgb_image
+        frame.depth_image = depth_image
 
         with self._lock:
             self._latest = frame

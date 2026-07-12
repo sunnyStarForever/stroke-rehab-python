@@ -23,6 +23,7 @@ Layout:
 
 import os
 import json
+import threading
 import time
 from datetime import datetime
 from enum import Enum
@@ -50,7 +51,7 @@ from rehab_engine.scoring import ScoreBridge, ScoreResult
 from rehab_engine.recorder import Skeleton3DRecorder, EmgRecorder
 from rehab_engine.sensor_pipeline import SensorPipeline
 from rehab_engine.preview import PreviewComposer, PreviewFrame
-from rehab_engine._stub import PipelineConfig, logger
+from rehab_engine import PipelineConfig, logger
 import rehab_engine  # for rehab_engine._STUB_MODE
 
 
@@ -75,9 +76,11 @@ ACTION_TIPS = {
 
 class TrainingState(Enum):
     IDLE = "待开始"
+    STARTING = "正在连接设备"
     TRAINING = "训练中"
     RESTING = "休息中"
     PAUSED = "已暂停"
+    STOPPING = "正在停止"
     FINISHED = "已完成"
 
 
@@ -94,6 +97,10 @@ class TrainingPage(QWidget):
     rest_tick_received = pyqtSignal(int)
     course_finished_received = pyqtSignal()
     runner_state_received = pyqtSignal(object)
+    runtime_stopped = pyqtSignal(int, bool, str)
+    score_start_finished = pyqtSignal(int, object, bool)
+    shutdown_ready = pyqtSignal()
+    pipeline_started = pyqtSignal(int, bool, str)
 
     def __init__(self, config: PipelineConfig, parent=None):
         super().__init__(parent)
@@ -103,6 +110,12 @@ class TrainingPage(QWidget):
         self._session_dir = ""
         self._frame_index = 0
         self._ending = False
+        self._end_generation = 0
+        self._pending_end = None
+        self._shutdown_requested = False
+        self._score_generation = 0
+        self._start_generation = 0
+        self._fps_warning_active = False
         self._paused_from = TrainingState.IDLE
 
         # Camera detection
@@ -202,14 +215,19 @@ class TrainingPage(QWidget):
         if not self._camera_checked:
             self._check_cameras()
 
-        if rehab_engine._STUB_MODE:
-            return "📷 模拟画面 (STUB模式)"
-
-        if self._cameras_found:
-            running = "运行中" if self._pipeline.is_running else "待机"
-            return f"📷 {len(self._cameras_found)}个摄像头 ({running})"
-        else:
-            return "📷 无摄像头"
+        if self._pipeline.stub_mode:
+            return "📷 模拟画面（非真实相机数据）"
+        if self._pipeline.is_stopping:
+            return "📷 正在释放 RGB/Depth 设备"
+        if self._pipeline.is_running:
+            stats = self._pipeline.performance_stats()
+            marker = "✓" if (stats["rgb_30fps_ok"] and stats["depth_30fps_ok"]
+                               and stats["pair_30fps_ok"]) else "⚠"
+            return (f"{marker} 真实数据 RGB {stats['rgb_fps']:.1f}/30 | "
+                    f"Depth {stats['depth_fps']:.1f}/30 | "
+                    f"显示 {stats['pair_fps']:.1f}/30 fps")
+        status = self._pipeline.camera_status
+        return f"📷 真实相机 {status['status']}"
 
     # ---- Properties ----
 
@@ -257,6 +275,9 @@ class TrainingPage(QWidget):
             warnings.append("当前为 STUB 模拟模式")
         if self._config.emg.enabled and self._config.emg.mode == "disabled":
             warnings.append("EMG 已启用但模式为 disabled")
+        if (not rehab_engine._STUB_MODE and
+                (self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30)):
+            errors.append("真实 RGB 与 Depth 相机必须同时设置为 30 FPS")
         return errors, warnings
 
     # ---- UI Construction ----
@@ -490,6 +511,9 @@ class TrainingPage(QWidget):
         self.runner_state_received.connect(self._on_runner_state)
         self.score_received.connect(self._on_score)
         self.score_failed.connect(self._on_score_error)
+        self.runtime_stopped.connect(self._on_runtime_stopped)
+        self.score_start_finished.connect(self._on_score_start_finished)
+        self.pipeline_started.connect(self._on_pipeline_started)
         self._pipeline.set_on_frame(self._on_pipeline_frame)
 
     # ---- State machine ----
@@ -508,7 +532,8 @@ class TrainingPage(QWidget):
             s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
         self._btn_pause.setText("继续训练" if s == TrainingState.PAUSED else "暂停")
         self._btn_stop.setEnabled(s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
-        self._btn_report.setEnabled(s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED, TrainingState.FINISHED))
+        self._btn_report.setEnabled(
+            s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
         self._btn_open_report.setEnabled(bool(self._session_dir))
         self._chk_rgb.setEnabled(False)
 
@@ -536,21 +561,54 @@ class TrainingPage(QWidget):
         self._append_feedback(f"启动训练：{self._current_course.course_name}")
 
         self._ending = False
+        self._fps_warning_active = False
         self._frame_index = 0
         self._score_panel.reset()
-        if not self._pipeline.start():
-            self._append_feedback("Pipeline 启动失败或已经运行。")
-            InfoBar.error("启动失败", "传感器流水线未能启动。",
+        self._start_generation += 1
+        generation = self._start_generation
+        self._update_state(TrainingState.STARTING)
+        self._append_feedback("正在后台连接真实 RGB/Depth 设备并初始化模型…")
+
+        def _start_pipeline():
+            try:
+                ok = self._pipeline.start()
+                message = "" if ok else (
+                    self._pipeline.camera_status.get("error") or "传感器流水线未能启动")
+            except Exception as exc:
+                ok, message = False, str(exc)
+            try:
+                self.pipeline_started.emit(generation, ok, message)
+            except RuntimeError:
+                pass
+
+        threading.Thread(
+            target=_start_pipeline, name="pipeline-start", daemon=True).start()
+
+    def _on_pipeline_started(self, generation: int, ok: bool, message: str):
+        if generation != self._start_generation:
+            if ok:
+                self._pipeline.stop()
+            return
+        if self._state != TrainingState.STARTING:
+            if ok:
+                self._pipeline.stop()
+            return
+        if not ok:
+            self._update_state(TrainingState.IDLE)
+            self._append_feedback(f"Pipeline 启动失败：{message}")
+            InfoBar.error("启动失败", message,
                           position=InfoBarPosition.TOP_RIGHT, parent=self)
             return
         try:
             self._session_dir = self._pipeline.start_recording(
                 str(Path(self._config.record_path) / "sessions"))
         except OSError as exc:
-            self._pipeline.stop()
             self._append_feedback(f"录制启动失败：{exc}")
             InfoBar.error("录制启动失败", str(exc),
                           position=InfoBarPosition.TOP_RIGHT, parent=self)
+            self._end_session(
+                TrainingState.IDLE, generate_report=False,
+                reason="录制启动失败，设备已安全停止。")
             return
         self._preview.set_recording(True)
         self._preview.set_show_debug(self._config.ui_debug_enabled)
@@ -564,10 +622,10 @@ class TrainingPage(QWidget):
         self._elapsed_seconds = 0
 
         if not self._course_runner.start_course(self._current_course):
-            self._pipeline.stop_recording()
-            self._pipeline.stop()
-            self._preview.set_recording(False)
             self._append_feedback("课程不包含有效动作，训练已取消。")
+            self._end_session(
+                TrainingState.IDLE, generate_report=False,
+                reason="课程无有效动作，设备已安全停止。")
             return
         self._training_timer.start(1000)
         self._update_state(TrainingState.TRAINING)
@@ -620,28 +678,56 @@ class TrainingPage(QWidget):
 
     def _end_session(self, final_state: TrainingState,
                      generate_report: bool, reason: str):
-        """Single idempotent shutdown path for stop, finish and auto-finish."""
+        """Begin an ordered, non-blocking shutdown of the active runtime."""
         if self._ending:
             return
         self._ending = True
+        self._end_generation += 1
+        generation = self._end_generation
+        self._pending_end = (final_state, generate_report, reason)
         self._training_timer.stop()
-        if self._course_runner.state != RunnerState.FINISHED:
+        self._update_state(TrainingState.STOPPING)
+        self._append_feedback("正在安全停止采集、评分和录制，请稍候…")
+        try:
             self._course_runner.stop_course()
+        except Exception as exc:
+            self._append_feedback(f"课程计时器停止异常：{exc}")
+        self._score_generation += 1
         if self._score_bridge:
-            self._score_bridge.stop()
+            try:
+                self._score_bridge.stop()
+            except Exception as exc:
+                self._append_feedback(f"评分进程停止异常：{exc}")
             self._score_bridge = None
-        self._pipeline.stop_recording()
-        self._pipeline.stop()
         self._preview.set_recording(False)
+        self._pipeline.stop(
+            on_complete=lambda ok, msg: self.runtime_stopped.emit(
+                generation, ok, msg))
+
+    def _on_runtime_stopped(self, generation: int, success: bool, message: str):
+        if generation != self._end_generation or not self._pending_end:
+            return
+        final_state, generate_report, reason = self._pending_end
+        self._pending_end = None
         self._write_session_metadata(final_state)
         self._update_state(final_state)
         self._append_feedback(reason)
         self._log_stop_stats()
+        if not success:
+            self._append_feedback(f"后台停止不完整：{message}")
+            InfoBar.error(
+                "设备停止异常", message + "。为避免设备冲突，请重启应用后再训练。",
+                duration=8000, position=InfoBarPosition.TOP_RIGHT, parent=self)
 
+        self._ending = False
         if generate_report and self._session_dir:
             csv_path = str(Path(self._session_dir) / "skeleton_3d.csv")
+            # Signal emission is cheap and remains on the Qt thread. The report
+            # page performs file work in its own worker and returns via signal.
             self.report_requested.emit(self._session_dir, csv_path)
-        self._ending = False
+
+        if self._shutdown_requested:
+            self.shutdown_ready.emit()
 
     def _write_session_metadata(self, final_state: TrainingState):
         if not self._session_dir:
@@ -691,13 +777,36 @@ class TrainingPage(QWidget):
             fps = self._config.device.rgb_fps / max(1, self._config.pose.pose_interval)
             if self._score_bridge:
                 self._score_bridge.stop()
-            self._score_bridge = ScoreBridge()
-            self._score_bridge.on_score_updated = self.score_received.emit
-            self._score_bridge.on_error = self.score_failed.emit
-            if self._score_bridge.start(action.action_id, fps):
-                self._append_feedback(f"实时评分已启动：{action.action_id} @ {fps:.1f}fps")
-            else:
-                self._append_feedback("实时评分不可用，训练录制仍将继续。")
+            bridge = ScoreBridge()
+            bridge.on_score_updated = self.score_received.emit
+            bridge.on_error = self.score_failed.emit
+            self._score_bridge = bridge
+            self._score_generation += 1
+            generation = self._score_generation
+            self._append_feedback("正在后台启动实时评分…")
+
+            def _start_scoring():
+                ok = bridge.start(action.action_id, fps)
+                try:
+                    self.score_start_finished.emit(generation, bridge, ok)
+                except RuntimeError:
+                    bridge.stop()
+
+            threading.Thread(
+                target=_start_scoring,
+                name=f"score-start-{action.action_id}", daemon=True,
+            ).start()
+
+    def _on_score_start_finished(self, generation: int, bridge: ScoreBridge, ok: bool):
+        if (generation != self._score_generation or bridge is not self._score_bridge
+                or self._state not in (TrainingState.TRAINING, TrainingState.RESTING,
+                                       TrainingState.PAUSED)):
+            bridge.stop()
+            return
+        if ok:
+            self._append_feedback("实时评分已启动。")
+        else:
+            self._append_feedback("实时评分不可用，训练录制仍将继续。")
 
     def _on_action_completed(self, action, actual_reps, avg_score):
         self._append_feedback(
@@ -763,6 +872,21 @@ class TrainingPage(QWidget):
         self._elapsed_seconds += 1
         m, s = divmod(self._elapsed_seconds, 60)
         self._timer_label.setText(f"{m:02d}:{s:02d}")
+        if not self._pipeline.stub_mode and self._elapsed_seconds >= 3:
+            stats = self._pipeline.performance_stats()
+            healthy = (stats["rgb_30fps_ok"] and stats["depth_30fps_ok"]
+                       and stats["pair_30fps_ok"])
+            if not healthy and not self._fps_warning_active:
+                self._fps_warning_active = True
+                self._append_feedback(
+                    f"⚠ 真实采集帧率未达到30：RGB {stats['rgb_fps']:.1f}，"
+                    f"Depth {stats['depth_fps']:.1f}，显示 {stats['pair_fps']:.1f} fps")
+                InfoBar.warning(
+                    "相机帧率下降",
+                    "当前显示的仍是真实数据，请检查 USB 带宽、分辨率和设备负载。",
+                    duration=5000, position=InfoBarPosition.TOP_RIGHT, parent=self)
+            elif healthy:
+                self._fps_warning_active = False
 
     def _refresh_preview(self):
         frame = self._pipeline.preview.latest_frame()
@@ -782,11 +906,26 @@ class TrainingPage(QWidget):
     # ---- Shutdown ----
 
     def shutdown(self):
+        """Start application shutdown and emit shutdown_ready when safe to exit."""
         print("[TrainingPage] 关闭 Pipeline...", flush=True)
-        self._course_runner.stop_course()
-        self._pipeline.stop()
+        self._shutdown_requested = True
         self._preview_timer.stop()
         self._training_timer.stop()
+        if self._ending:
+            return
+        active = (self._pipeline.is_running or self._pipeline.is_recording
+                  or self._pipeline.is_stopping)
+        if active:
+            self._end_session(
+                TrainingState.IDLE, generate_report=False,
+                reason="应用关闭，训练数据已安全保存。")
+            return
+        try:
+            self._course_runner.stop_course()
+        except Exception:
+            pass
         if self._score_bridge:
             self._score_bridge.stop()
+            self._score_bridge = None
         print("[TrainingPage] Pipeline 已关闭", flush=True)
+        QTimer.singleShot(0, self.shutdown_ready.emit)

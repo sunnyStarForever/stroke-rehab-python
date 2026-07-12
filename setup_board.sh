@@ -279,7 +279,7 @@ info "Building with $(nproc) cores..."
 cmake --build build -j"$(nproc)" 2>&1 | tail -20
 
 # Find the built .so
-SO_FILE=$(find build -name "rehab_engine*.so" -type f 2>/dev/null | head -1)
+SO_FILE=$(find build -name "_core*.so" -type f 2>/dev/null | head -1)
 if [ -n "$SO_FILE" ]; then
     SO_SIZE=$(ls -lh "$SO_FILE" | awk '{print $5}')
     info "Engine built: ${SO_FILE} (${SO_SIZE})"

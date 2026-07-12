@@ -133,10 +133,9 @@ def run_diagnostics(config=None) -> Diagnostics:
     # ================================================================
     try:
         engine_so_path = None
-        # Try to find the compiled .so
         build_dir = Path(__file__).resolve().parent.parent / "build"
         if build_dir.is_dir():
-            so_files = list(build_dir.glob("rehab_engine*.so"))
+            so_files = list(build_dir.glob("_core*.so")) + list(build_dir.glob("_core*.pyd"))
             if so_files:
                 engine_so_path = so_files[0]
 

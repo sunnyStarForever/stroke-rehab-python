@@ -45,6 +45,8 @@ class StrokeRehabWindow(FluentWindow):
 
         # Store diagnostics for display
         self._diag = diagnostics
+        self._closing = False
+        self._allow_close = False
 
         self._config = load_pipeline_config()
         self.engine_log_received.connect(self._on_engine_log)
@@ -130,15 +132,23 @@ class StrokeRehabWindow(FluentWindow):
         )
 
         training.report_requested.connect(self.navigate_to_reports)
+        training.shutdown_ready.connect(self._on_training_shutdown_ready)
         settings.course_changed.connect(training.set_course)
         settings.debug_changed.connect(training.set_debug_enabled)
         training.set_debug_enabled(self._config.ui_debug_enabled)
 
     def navigate_to_reports(self, session_dir: str, csv_path: str):
+        if self._closing:
+            return
+        """Async report loading — defer to next event loop tick to avoid blocking UI."""
+        from PyQt5.QtCore import QTimer
         reports = self.findChild(ReportsPage)
         if reports:
-            reports.load_session(session_dir, csv_path)
-            self.switchTo(reports)
+            QTimer.singleShot(0, lambda: self._load_report_async(reports, session_dir, csv_path))
+
+    def _load_report_async(self, reports, session_dir: str, csv_path: str):
+        reports.load_session(session_dir, csv_path)
+        self.switchTo(reports)
 
     # ================================================================
     # Engine log callback
@@ -197,12 +207,33 @@ class StrokeRehabWindow(FluentWindow):
     # ================================================================
 
     def closeEvent(self, event):
-        print("\n[UI] 正在关闭应用...", flush=True)
+        if self._allow_close:
+            event.accept()
+            return
+        event.ignore()
+        if self._closing:
+            return
+        self._closing = True
+        print("\n[UI] Closing application safely...", flush=True)
+        self.setEnabled(False)
+        reports = self.findChild(ReportsPage)
+        if reports:
+            reports.shutdown()
         training = self.findChild(TrainingPage)
         if training:
-            training.shutdown()
-        print("[UI] 应用已关闭", flush=True)
-        super().closeEvent(event)
+            try:
+                training.shutdown()
+                return
+            except Exception as e:
+                print(f"[UI] Shutdown error: {e}", flush=True)
+        self._on_training_shutdown_ready()
+
+    def _on_training_shutdown_ready(self):
+        if not self._closing:
+            return
+        print("[UI] Application resources released", flush=True)
+        self._allow_close = True
+        QTimer.singleShot(0, self.close)
 
 
 def main():

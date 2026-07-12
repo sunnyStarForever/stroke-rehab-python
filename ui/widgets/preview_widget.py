@@ -114,6 +114,58 @@ class PreviewWidget(QWidget):
         self._quality_text = quality or "等待评分"
         self.update()
 
+    # ---- RGB background drawing ----
+
+    def _draw_rgb_background(self, painter: QPainter):
+        import numpy as np
+        rgb = self._frame.rgb_image
+        if rgb is None:
+            return
+        try:
+            h, w, _ = rgb.shape
+            qimg = QImage(rgb.data.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+            target_rect = self.rect()
+            scale = min(target_rect.width() / w, target_rect.height() / h)
+            dw = int(w * scale)
+            dh = int(h * scale)
+            draw_rect = QRect(
+                (target_rect.width() - dw) // 2,
+                (target_rect.height() - dh) // 2,
+                dw, dh,
+            )
+            painter.drawImage(draw_rect, qimg)
+        except Exception:
+            pass
+
+    # ---- Depth overlay ----
+
+    def _draw_depth_overlay(self, painter: QPainter, draw_rect):
+        import numpy as np
+        import cv2
+        depth = self._frame.depth_image
+        if depth is None:
+            return
+        try:
+            h, w = depth.shape
+            # Normalise 16-bit depth to 0-255 for visualization
+            valid = depth[depth > 0]
+            if len(valid) == 0:
+                return
+            dmin, dmax = np.percentile(valid, [5, 95])
+            drange = max(dmax - dmin, 1)
+            vis = np.clip((depth.astype(np.float32) - dmin) / drange * 255, 0, 255).astype(np.uint8)
+            # Apply color map (JET-like: near = warm, far = cold)
+            colored = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
+            colored_rgb = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+            h2, w2, _ = colored_rgb.shape
+            qimg = QImage(colored_rgb.data.tobytes(), w2, h2, w2 * 3, QImage.Format_RGB888)
+            target_rect = draw_rect
+            painter.setOpacity(0.45)
+            painter.drawImage(target_rect, qimg)
+            painter.setOpacity(1.0)
+        except Exception:
+            pass
+
     # ---- Paint ----
 
     def paintEvent(self, event):
@@ -123,45 +175,41 @@ class PreviewWidget(QWidget):
         # Background
         painter.fillRect(self.rect(), QColor(16, 18, 20))
 
-        # ---- No frame: show status overlay ----
-        if not self._frame or not self._frame.has_valid_2d:
+        # ---- No frame at all: status overlay only ----
+        if self._frame is None:
             self._draw_status_overlay(painter)
             return
 
-        # Compute image rect (keep aspect ratio, centered)
-        img_rect = self.rect()
-        target_h = self.height()
-        target_w = self.width()
-
-        # Use 640x480 as nominal source size for mapping
+        # Compute draw rect (640x480 nom., centered, keep aspect ratio)
+        target_w, target_h = self.width(), self.height()
         src_w, src_h = 640, 480
         scale = min(target_w / src_w, target_h / src_h)
-        draw_w = int(src_w * scale)
-        draw_h = int(src_h * scale)
         draw_rect = QRect(
-            (target_w - draw_w) // 2,
-            (target_h - draw_h) // 2,
-            draw_w, draw_h,
+            (target_w - int(src_w * scale)) // 2,
+            (target_h - int(src_h * scale)) // 2,
+            int(src_w * scale), int(src_h * scale),
         )
 
-        # Draw dark image area
-        painter.fillRect(draw_rect, QColor(26, 30, 34))
+        # ── Layer 1: RGB background (always draw if available) ──
+        if self._frame.rgb_image is not None:
+            self._draw_rgb_background(painter)
+        else:
+            painter.fillRect(draw_rect, QColor(26, 30, 34))
 
-        # --- Skeleton drawing ---
-        if self._show_skeleton:
+        # ── Layer 2: depth overlay (always draw if available) ──
+        if self._frame.depth_image is not None:
+            self._draw_depth_overlay(painter, draw_rect)
+
+        # ── Layer 3: skeleton (only if we have valid pose) ──
+        if self._show_skeleton and self._frame.has_valid_2d:
             self._draw_skeleton(painter, draw_rect)
 
-        # --- Debug text panel ---
+        # ── HUD layers ──
         if self._show_debug:
             self._draw_debug_panel(painter, draw_rect)
-
-        # --- Engine mode badge ---
         self._draw_engine_badge(painter, draw_rect)
-
-        # --- Patient-facing progress overlay ---
         self._draw_training_progress(painter, draw_rect)
 
-        # --- Recording indicator ---
         if self._recording:
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(224, 48, 48))
@@ -169,9 +217,12 @@ class PreviewWidget(QWidget):
             cy = draw_rect.top() + 20
             painter.drawEllipse(QPointF(cx, cy), 6, 6)
             painter.setPen(QColor(224, 48, 48))
-            font = QFont("Segoe UI", 11, QFont.Bold)
-            painter.setFont(font)
+            painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
             painter.drawText(cx - 70, cy + 5, "● REC")
+
+        # ── Startup: show status overlay until first frame with data ──
+        if not self._frame.has_valid_2d and self._frame.rgb_image is None:
+            self._draw_status_overlay(painter)
 
     def _draw_training_progress(self, painter: QPainter, img_rect: QRect):
         if self._progress_target <= 0:

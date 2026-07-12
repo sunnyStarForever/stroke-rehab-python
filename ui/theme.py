@@ -88,6 +88,8 @@ def state_badge_style(state_name: str) -> str:
         "TRAINING": (COLORS["success"], COLORS["success_soft"]),
         "RESTING": (COLORS["warning"], COLORS["warning_soft"]),
         "PAUSED": (COLORS["warning"], COLORS["warning_soft"]),
+        "STARTING": (COLORS["primary"], COLORS["primary_soft"]),
+        "STOPPING": (COLORS["warning"], COLORS["warning_soft"]),
         "FINISHED": (COLORS["primary"], COLORS["primary_soft"]),
         "IDLE": (COLORS["muted"], "#EEF2F6"),
     }

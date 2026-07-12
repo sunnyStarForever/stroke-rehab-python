@@ -42,11 +42,11 @@ if(STROKE_ENGINE_STUB)
     engine/util/FpsCounter.cpp
   )
 
-  pybind11_add_module(rehab_engine ${ENGINE_STUB_SOURCES})
-  target_include_directories(rehab_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_compile_definitions(rehab_engine PRIVATE STROKE_ENGINE_STUB=1)
+  pybind11_add_module(_core ${ENGINE_STUB_SOURCES})
+  target_include_directories(_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(_core PRIVATE STROKE_ENGINE_STUB=1)
   if(MSVC)
-    target_compile_options(rehab_engine PRIVATE /utf-8)
+    target_compile_options(_core PRIVATE /utf-8)
   endif()
 
 else()
@@ -167,6 +167,7 @@ else()
          _src MATCHES "PoseEstimatorRTMPoseOrt" OR
          _src MATCHES "PersonDetectorOrt" OR
          _src MATCHES "SoftwareRegistrationAligner" OR
+         _src MATCHES "SyncManager" OR
          _src MATCHES "RgbCaptureV4L2")
         set_source_files_properties(${_src} PROPERTIES COMPILE_OPTIONS "-O0")
         message(STATUS "  -O0: ${_src}")
@@ -175,17 +176,17 @@ else()
   endif()
 
   # ---- pybind11 module ----
-  pybind11_add_module(rehab_engine bindings/module.cpp)
-  target_link_libraries(rehab_engine PRIVATE rehab_engine_core)
+  pybind11_add_module(_core bindings/module.cpp)
+  target_link_libraries(_core PRIVATE rehab_engine_core)
 
   message(STATUS "  HAVE_OPENNI2:      ${HAVE_OPENNI2_DEF}")
   message(STATUS "  HAVE_ONNXRUNTIME:  ${HAVE_ONNXRUNTIME_DEF}")
 endif()
 
 # ---- Common output settings ----
-set_target_properties(rehab_engine PROPERTIES
+set_target_properties(_core PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
 
-message(STATUS "  Output: ${CMAKE_BINARY_DIR}/rehab_engine${CMAKE_SHARED_MODULE_SUFFIX}")
+message(STATUS "  Output: ${CMAKE_BINARY_DIR}/_core${CMAKE_SHARED_MODULE_SUFFIX}")

@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from threading import Timer
+from threading import RLock, Timer
 from typing import Callable, List, Optional
 
 
@@ -168,6 +168,8 @@ class CourseRunner:
         self._rest_remaining: int = 0
         self._rest_timer: Optional[Timer] = None
         self._state_before_pause: RunnerState = RunnerState.IDLE
+        self._state_lock = RLock()
+        self._rest_generation = 0
 
         # Callbacks (set by the caller, replaces Qt signals)
         self.on_action_changed: Optional[Callable[[CourseAction], None]] = None
@@ -203,60 +205,65 @@ class CourseRunner:
     # --- State machine ---
 
     def start_course(self, course: Course) -> bool:
-        if not course.actions:
-            return False
-        self._course = course
-        self._action_index = 0
-        self._actual_reps = 0
-        self._score_sum = 0.0
-        self._score_samples = 0
-        self._set_state(RunnerState.TRAINING)
-        self._notify_action()
-        return True
+        with self._state_lock:
+            if not course.actions:
+                return False
+            self._cancel_rest_timer()
+            self._course = course
+            self._action_index = 0
+            self._actual_reps = 0
+            self._score_sum = 0.0
+            self._score_samples = 0
+            self._set_state(RunnerState.TRAINING)
+            self._notify_action()
+            return True
 
     def stop_course(self) -> None:
-        self._cancel_rest_timer()
-        self._set_state(RunnerState.FINISHED)
+        with self._state_lock:
+            self._cancel_rest_timer()
+            self._set_state(RunnerState.FINISHED)
 
     def pause_course(self) -> bool:
         """Pause scoring progression and preserve an active rest countdown."""
-        if self._state not in (RunnerState.TRAINING, RunnerState.RESTING):
-            return False
-        self._state_before_pause = self._state
-        self._cancel_rest_timer()
-        self._set_state(RunnerState.PAUSED)
-        return True
+        with self._state_lock:
+            if self._state not in (RunnerState.TRAINING, RunnerState.RESTING):
+                return False
+            self._state_before_pause = self._state
+            self._cancel_rest_timer()
+            self._set_state(RunnerState.PAUSED)
+            return True
 
     def resume_course(self) -> bool:
         """Resume the state that was active before pause."""
-        if self._state != RunnerState.PAUSED:
-            return False
-        resume_state = self._state_before_pause
-        if resume_state not in (RunnerState.TRAINING, RunnerState.RESTING):
-            resume_state = RunnerState.TRAINING
-        self._set_state(resume_state)
-        if resume_state == RunnerState.RESTING:
-            self._start_rest_timer()
-        return True
+        with self._state_lock:
+            if self._state != RunnerState.PAUSED:
+                return False
+            resume_state = self._state_before_pause
+            if resume_state not in (RunnerState.TRAINING, RunnerState.RESTING):
+                resume_state = RunnerState.TRAINING
+            self._set_state(resume_state)
+            if resume_state == RunnerState.RESTING:
+                self._start_rest_timer()
+            return True
 
     def on_score_updated(self, score: "ScoreResult") -> None:
         """
         Receive a real-time score update from ScoreBridge.
         Tracks reps and average score; triggers action completion.
         """
-        if self._state != RunnerState.TRAINING:
-            return
-        action = self.current_action
-        if action is None:
-            return
+        with self._state_lock:
+            if self._state != RunnerState.TRAINING:
+                return
+            action = self.current_action
+            if action is None:
+                return
 
-        self._actual_reps = max(self._actual_reps, score.completed_count)
-        self._score_sum += score.overall_score if score.count > 0 else 0.0
-        self._score_samples += 1
+            self._actual_reps = max(self._actual_reps, score.completed_count)
+            self._score_sum += score.overall_score if score.count > 0 else 0.0
+            self._score_samples += 1
 
-        # Complete action when target reps reached
-        if self._actual_reps >= action.target_reps > 0:
-            self._complete_current_action()
+            if self._actual_reps >= action.target_reps > 0:
+                self._complete_current_action()
 
     def _complete_current_action(self) -> None:
         action = self.current_action
@@ -301,22 +308,25 @@ class CourseRunner:
 
     def _start_rest_timer(self) -> None:
         self._cancel_rest_timer()
-        self._rest_tick()
+        generation = self._rest_generation
+        self._rest_tick(generation)
 
-    def _rest_tick(self) -> None:
-        if self._state != RunnerState.RESTING:
-            return
-        if self._rest_remaining <= 0:
-            self._advance_to_next()
-            return
-        if self.on_rest_tick:
-            self.on_rest_tick(self._rest_remaining)
-        self._rest_remaining -= 1
-        self._rest_timer = Timer(1.0, self._rest_tick)
-        self._rest_timer.daemon = True
-        self._rest_timer.start()
+    def _rest_tick(self, generation: int) -> None:
+        with self._state_lock:
+            if generation != self._rest_generation or self._state != RunnerState.RESTING:
+                return
+            if self._rest_remaining <= 0:
+                self._advance_to_next()
+                return
+            if self.on_rest_tick:
+                self.on_rest_tick(self._rest_remaining)
+            self._rest_remaining -= 1
+            self._rest_timer = Timer(1.0, self._rest_tick, args=(generation,))
+            self._rest_timer.daemon = True
+            self._rest_timer.start()
 
     def _cancel_rest_timer(self) -> None:
+        self._rest_generation += 1
         if self._rest_timer:
             self._rest_timer.cancel()
             self._rest_timer = None

@@ -12,15 +12,53 @@ To use in full mode (with compiled C++ engine):
     from rehab_engine._core import PipelineConfig, ...
 """
 
-# Try to import the compiled C++ module; fall back to stub if not found.
+import sys
+
+# Try to import the compiled C++ module (named _core.so / _core.pyd).
+# It is built from bindings/module.cpp with PYBIND11_MODULE(_core, m) {...}
 _STUB_MODE = False
+_core_loaded = False
 try:
     from . import _core  # noqa: F401 — compiled pybind11 module
+    _core_loaded = True
 except ImportError:
     _STUB_MODE = True
 
-# Re-export from appropriate backend
+# ---- Logger adapter ----
+# C++ Logger bindings only export set_callback().  Add info/warn/error so all
+# Python code that calls logger.info(msg) etc. works in full mode as well.
+
+class _FullLogger:
+    """Logger wrapper for C++ _core.logger — adds info/warn/error + stderr output."""
+
+    def __init__(self, core_logger):
+        self._core = core_logger
+        self._cb = None   # (level, msg) -> None
+
+    def set_callback(self, callback):
+        self._cb = callback
+        if callback is not None:
+            self._core.set_callback(callback)
+
+    # -- public logging API (mirrors _StubLogger) --
+    def info(self, msg: str):
+        print(f"[INFO] {msg}", flush=True, file=sys.stderr)
+        if self._cb:
+            self._cb("INFO", msg)
+
+    def warn(self, msg: str):
+        print(f"[WARN] {msg}", flush=True, file=sys.stderr)
+        if self._cb:
+            self._cb("WARN", msg)
+
+    def error(self, msg: str):
+        print(f"[ERROR] {msg}", flush=True, file=sys.stderr)
+        if self._cb:
+            self._cb("ERROR", msg)
+
+
 if _STUB_MODE:
+    # Stub mode: use pure-Python dataclass config types
     from ._stub import (  # noqa: F401
         DeviceConfig,
         SyncConfig,
@@ -34,10 +72,7 @@ if _STUB_MODE:
         __engine_version__,
     )
 else:
-    # When the compiled engine is available, import directly.
-    # The user is expected to have the .pyd/.so in sys.path.
-    import rehab_engine as _core  # type: ignore[import-not-found]
-
+    # Full mode: the compiled _core module provides all types
     DeviceConfig = _core.DeviceConfig
     SyncConfig = _core.SyncConfig
     PoseConfig = _core.PoseConfig
@@ -46,7 +81,7 @@ else:
     DebugConfig = _core.DebugConfig
     EmgConfig = _core.EmgConfig
     PipelineConfig = _core.PipelineConfig
-    logger = _core.logger
+    logger = _FullLogger(_core.logger)
     __engine_version__ = getattr(_core, "__version__", "unknown")
 
 # Diagnostics (run before UI to check hardware status)

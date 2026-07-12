@@ -121,16 +121,21 @@ class Skeleton3DRecorder:
         return True
 
     def stop(self) -> None:
-        if not self._recording:
-            return
-        self._recording = False
-        self._write_meta(datetime.now(timezone.utc).isoformat())
-        if self._csv:
-            self._csv.close()
-            self._csv = None
-        if self._debug_csv:
-            self._debug_csv.close()
-            self._debug_csv = None
+        # Serialize close with record().  Without this lock the UI could close
+        # the CSV while the pipeline worker was inside writerow().
+        with self._lock:
+            if not self._recording:
+                return
+            self._recording = False
+            self._write_meta(datetime.now(timezone.utc).isoformat())
+            if self._csv:
+                self._csv.flush()
+                self._csv.close()
+                self._csv = None
+            if self._debug_csv:
+                self._debug_csv.flush()
+                self._debug_csv.close()
+                self._debug_csv = None
 
     @property
     def is_recording(self) -> bool:
@@ -153,10 +158,11 @@ class Skeleton3DRecorder:
         Record one frame of 3D skeleton data.
         joints_3d: list of 22 [x, y, z] arrays.
         """
-        if not self._recording or self._csv_writer is None:
-            return False
-
         with self._lock:
+            # Re-check after acquiring the lock: stop() may have run between
+            # the caller's frame check and this write.
+            if not self._recording or self._csv is None or self._csv_writer is None:
+                return False
             self._frame_count += 1
 
             if len(joints_3d) != 22:

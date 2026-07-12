@@ -61,7 +61,9 @@ class ScoreBridge:
         self._skeleton_fps: float = 20.0
         self._running: bool = False
         self._reader_thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        self._cancel_start = threading.Event()
 
         # Callbacks
         self.on_score_updated: Optional[Callable[[ScoreResult], None]] = None
@@ -70,6 +72,7 @@ class ScoreBridge:
     def start(self, action_id: str, skeleton_fps: float = 20.0) -> bool:
         """Launch score_server.py and negotiate the initial state."""
         self.stop()
+        self._cancel_start.clear()
 
         engine_dir = _find_scoring_engine()
         if engine_dir is None:
@@ -78,7 +81,7 @@ class ScoreBridge:
 
         server_path = engine_dir / "score_server.py"
         try:
-            self._process = subprocess.Popen(
+            proc = subprocess.Popen(
                 [sys.executable, str(server_path),
                  "--action", action_id,
                  "--fs", str(skeleton_fps)],
@@ -97,41 +100,72 @@ class ScoreBridge:
             self._emit_error(f"Failed to start score_server: {e}")
             return False
 
+        with self._state_lock:
+            if self._cancel_start.is_set():
+                self._terminate_process(proc)
+                return False
+            self._process = proc
+
         # Read the initial "ready" message
         try:
-            line = self._process.stdout.readline()
-            if line:
-                ready_msg = json.loads(line)
-                if not ready_msg.get("ok"):
-                    self._emit_error(f"score_server not ready: {ready_msg}")
-                    return False
+            line = proc.stdout.readline()
+            if not line:
+                self._emit_error("score_server exited before ready handshake")
+                self.stop()
+                return False
+            ready_msg = json.loads(line)
+            if not ready_msg.get("ok"):
+                self._emit_error(f"score_server not ready: {ready_msg}")
+                self.stop()
+                return False
         except Exception as e:
             self._emit_error(f"score_server handshake failed: {e}")
+            self.stop()
             return False
 
-        self._action_id = action_id
-        self._skeleton_fps = skeleton_fps
-        self._running = True
+        with self._state_lock:
+            if self._cancel_start.is_set() or self._process is not proc:
+                self._terminate_process(proc)
+                return False
+            self._action_id = action_id
+            self._skeleton_fps = skeleton_fps
+            self._running = True
 
         # Start stderr reader thread (for logging)
-        self._reader_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._reader_thread = threading.Thread(
+            target=self._read_stderr, args=(proc,), name="score-stderr", daemon=True)
         self._reader_thread.start()
 
         return True
 
     def stop(self) -> None:
-        """Terminate the scoring subprocess."""
-        self._running = False
-        if self._process:
-            try:
-                self._process.stdin.close()
-                self._process.stdout.close()
-                self._process.wait(timeout=3)
-            except Exception:
-                self._process.kill()
+        """Request subprocess termination without blocking the Qt thread."""
+        with self._state_lock:
+            self._cancel_start.set()
+            self._running = False
+            proc = self._process
             self._process = None
-        if self._reader_thread and self._reader_thread.is_alive():
-            self._reader_thread.join(timeout=1)
+        if proc:
+            threading.Thread(
+                target=self._terminate_process, args=(proc,),
+                name="score-kill", daemon=True,
+            ).start()
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen) -> None:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+        finally:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
 
     def reset(self) -> None:
         """Send a reset command."""
@@ -159,31 +193,40 @@ class ScoreBridge:
         Submit a 22x3 joint array for real-time scoring.
         joints: list of [x, y, z] for each of the 22 Rehab22 joints.
         """
-        if not self._running or self._process is None:
-            return False
+        with self._state_lock:
+            if not self._running or self._process is None:
+                return False
+            proc = self._process
         msg = {
             "cmd": "frame",
             "frame_index": frame_index,
             "joints": joints,
         }
-        self._send_command(msg)
-
-        # Read response
-        try:
-            line = self._process.stdout.readline()
-            if not line:
+        # A single request/response transaction owns the pipe. stop() can kill
+        # the local process to unblock readline, but cannot swap in a new one.
+        with self._io_lock:
+            try:
+                if proc.poll() is not None or not proc.stdin or not proc.stdout:
+                    return False
+                proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+                if not line:
+                    return False
+                result = json.loads(line)
+                if result.get("ok") and self.on_score_updated:
+                    self.on_score_updated(_parse_score_result(result))
+                    return True
+                if not result.get("ok"):
+                    self._emit_error(
+                        f"score_server error: {result.get('message', 'unknown')}")
+            except (BrokenPipeError, OSError, ValueError, json.JSONDecodeError) as e:
+                # Expected when stop() interrupts a pending read.
+                with self._state_lock:
+                    still_running = self._running and self._process is proc
+                if still_running:
+                    self._emit_error(f"score_server read error: {e}")
                 return False
-            result = json.loads(line)
-            if result.get("ok") and self.on_score_updated:
-                score = _parse_score_result(result)
-                self.on_score_updated(score)
-                return True
-            elif not result.get("ok"):
-                self._emit_error(f"score_server error: {result.get('message', 'unknown')}")
-                return False
-        except Exception as e:
-            self._emit_error(f"score_server read error: {e}")
-            return False
         return True
 
     def _send_command(self, data: dict) -> None:
@@ -194,11 +237,13 @@ class ScoreBridge:
             except (BrokenPipeError, OSError):
                 self._emit_error("score_server pipe broken")
 
-    def _read_stderr(self) -> None:
+    def _read_stderr(self, proc: Optional[subprocess.Popen]) -> None:
         """Read stderr from the subprocess for logging."""
-        if self._process and self._process.stderr:
-            for line in self._process.stderr:
-                if not self._running:
+        if proc and proc.stderr:
+            for line in proc.stderr:
+                with self._state_lock:
+                    active = self._running and self._process is proc
+                if not active:
                     break
                 # stderr contains log messages; forward to our logger
                 pass  # Could hook into rehab_engine._stub.logger here

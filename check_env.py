@@ -99,7 +99,7 @@ def run(verbose: bool = False, camera_test: bool = False):
     header("3. C++ Engine (.so)")
     build_dir = HERE / "build"
     if build_dir.is_dir():
-        so_files = list(build_dir.glob("rehab_engine*.so"))
+        so_files = list(build_dir.glob("_core*.so")) + list(build_dir.glob("_core*.pyd"))
         if so_files:
             for f in so_files:
                 check_file_size(f, f"Engine .so: {f.name}")

@@ -27,7 +27,10 @@ _DEVICE_ITEMS = ["/dev/video0", "/dev/video1", "/dev/video2"]
 _RGB_FORMATS = ["MJPG", "YUYV"]
 _RESOLUTIONS = ["640x480", "1280x720", "1920x1080"]
 _DEPTH_RESOLUTIONS = ["640x480", "320x240", "1280x720"]
-_FPS_VALUES = ["15", "30", "60"]
+# RGB and depth are intentionally locked to the synchronized 30 FPS profile.
+# If hardware cannot sustain it, the runtime reports the measured rate instead
+# of substituting mock frames.
+_FPS_VALUES = ["30"]
 _EMG_MODES = ["disabled", "mock", "real"]
 
 

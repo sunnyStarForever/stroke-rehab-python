@@ -1,6 +1,7 @@
 """Integration checks for the training workflow added around the UI."""
 
 import json
+import threading
 import tempfile
 import time
 import unittest
@@ -15,6 +16,22 @@ from rehab_engine.sensor_pipeline import SensorPipeline
 
 
 class CourseRunnerWorkflowTests(unittest.TestCase):
+    def test_stop_cancels_pending_rest_timer_without_advancing(self):
+        runner = CourseRunner()
+        course = Course(
+            course_id="stop-race",
+            actions=[
+                CourseAction(action_id="M1", target_reps=1, rest_sec_after=1),
+                CourseAction(action_id="M2", target_reps=1),
+            ],
+        )
+        runner.start_course(course)
+        runner.on_score_updated(ScoreResult(count=1, completed_count=1, overall_score=80))
+        runner.stop_course()
+        time.sleep(1.2)
+        self.assertEqual(runner.state, RunnerState.FINISHED)
+        self.assertEqual(runner.current_action_index, 0)
+
     def test_pause_and_resume_preserve_rest_countdown(self):
         runner = CourseRunner()
         course = Course(
@@ -43,6 +60,27 @@ class CourseRunnerWorkflowTests(unittest.TestCase):
 
 
 class PipelineWorkflowTests(unittest.TestCase):
+    def test_async_stop_returns_immediately_and_waits_for_cleanup(self):
+        pipeline = SensorPipeline(PipelineConfig())
+        completed = threading.Event()
+        result = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(pipeline.start())
+            pipeline.start_recording(tmp)
+            time.sleep(0.15)
+            started = time.monotonic()
+            pipeline.stop(lambda ok, message: (result.append((ok, message)), completed.set()))
+            self.assertLess(time.monotonic() - started, 0.1)
+            self.assertTrue(completed.wait(3.0))
+            self.assertTrue(result[0][0], result[0][1])
+            self.assertFalse(pipeline.is_running)
+            self.assertFalse(pipeline.is_recording)
+            self.assertFalse(pipeline.is_stopping)
+            self.assertTrue(pipeline.start())
+            restarted = threading.Event()
+            pipeline.stop(lambda *_: restarted.set())
+            self.assertTrue(restarted.wait(3.0))
+
     def test_recording_pause_skips_frames_and_resume_continues(self):
         config = PipelineConfig()
         config.device.rgb_fps = 30
