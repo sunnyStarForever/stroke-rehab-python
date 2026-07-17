@@ -47,10 +47,16 @@ from qfluentwidgets import (
 )
 
 from rehab_engine.course import CourseRepository, CourseRunner, RunnerState
-from rehab_engine.scoring import ScoreBridge, ScoreResult
-from rehab_engine.recorder import Skeleton3DRecorder, EmgRecorder
+from rehab_engine.scoring import (
+    OfflineReportRunner,
+    ScoreBridge,
+    ScoreResult,
+    ScoringCsvRecorder,
+    ScoringSkeletonAdapter,
+)
 from rehab_engine.sensor_pipeline import SensorPipeline
 from rehab_engine.preview import PreviewComposer, PreviewFrame
+from rehab_engine.voice import VoiceAssistant
 from rehab_engine import PipelineConfig, logger
 import rehab_engine  # for rehab_engine._STUB_MODE
 
@@ -101,6 +107,8 @@ class TrainingPage(QWidget):
     score_start_finished = pyqtSignal(int, object, bool)
     shutdown_ready = pyqtSignal()
     pipeline_started = pyqtSignal(int, bool, str)
+    offline_report_ready = pyqtSignal(int, str)
+    offline_report_failed = pyqtSignal(int, str)
 
     def __init__(self, config: PipelineConfig, parent=None):
         super().__init__(parent)
@@ -117,6 +125,12 @@ class TrainingPage(QWidget):
         self._start_generation = 0
         self._fps_warning_active = False
         self._paused_from = TrainingState.IDLE
+        self._displayed_action_reps = 0
+        self._session_start_time = ""
+        self._current_action_dir = ""
+        self._current_action_csv = ""
+        self._action_summaries = []
+        self._offline_report_runners = {}
 
         # Camera detection
         self._cameras_found: list = []
@@ -124,10 +138,12 @@ class TrainingPage(QWidget):
 
         # Pipeline modules
         self._pipeline = SensorPipeline(config)
-        self._recorder = Skeleton3DRecorder()
-        self._emg_recorder = EmgRecorder()
         self._course_runner = CourseRunner()
         self._score_bridge: Optional[ScoreBridge] = None
+        self._scoring_recorder = ScoringCsvRecorder()
+        self._voice = VoiceAssistant(config.voice)
+        self._voice.on_status = lambda message: logger.info(f"[Voice] {message}")
+        self._voice.start()
         self._course_repo = CourseRepository()
 
         # Load course
@@ -514,6 +530,8 @@ class TrainingPage(QWidget):
         self.runtime_stopped.connect(self._on_runtime_stopped)
         self.score_start_finished.connect(self._on_score_start_finished)
         self.pipeline_started.connect(self._on_pipeline_started)
+        self.offline_report_ready.connect(self._on_offline_report_ready)
+        self.offline_report_failed.connect(self._on_offline_report_failed)
         self._pipeline.set_on_frame(self._on_pipeline_frame)
 
     # ---- State machine ----
@@ -610,6 +628,24 @@ class TrainingPage(QWidget):
                 TrainingState.IDLE, generate_report=False,
                 reason="录制启动失败，设备已安全停止。")
             return
+        self._session_start_time = datetime.now().isoformat(timespec="seconds")
+        self._current_action_dir = ""
+        self._current_action_csv = ""
+        self._action_summaries = [
+            {
+                "action_id": action.action_id,
+                "movement_id": action.movement_id,
+                "name_cn": action.name_cn,
+                "target_reps": action.target_reps,
+                "actual_reps": 0,
+                "average_score": 0.0,
+                "action_dir": "",
+                "csv_path": "",
+                "report_path": "",
+            }
+            for action in self._current_course.actions
+        ]
+        self._write_course_summary(False)
         self._preview.set_recording(True)
         self._preview.set_show_debug(self._config.ui_debug_enabled)
 
@@ -629,6 +665,9 @@ class TrainingPage(QWidget):
             return
         self._training_timer.start(1000)
         self._update_state(TrainingState.TRAINING)
+        self._voice.speak(
+            f"训练开始，课程是{self._current_course.course_name}",
+            key="session_start", priority=2, force=True)
 
     def _on_pause(self):
         if self._state == TrainingState.PAUSED:
@@ -643,6 +682,7 @@ class TrainingPage(QWidget):
                 self._update_state(resume_state)
                 self._preview.set_recording(True)
                 self._append_feedback("训练已继续。")
+                self._voice.speak("训练继续", key="resume", priority=3, force=True)
             return
 
         if self._state not in (TrainingState.TRAINING, TrainingState.RESTING):
@@ -654,6 +694,7 @@ class TrainingPage(QWidget):
             self._preview.set_recording(False)
             self._update_state(TrainingState.PAUSED)
             self._append_feedback("训练已暂停，采集画面保留但数据不计入训练。")
+            self._voice.speak("训练已暂停", key="pause", priority=2, force=True)
 
     def _on_stop(self):
         if self._state in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED):
@@ -692,6 +733,7 @@ class TrainingPage(QWidget):
             self._course_runner.stop_course()
         except Exception as exc:
             self._append_feedback(f"课程计时器停止异常：{exc}")
+        self._stop_current_action_artifacts()
         self._score_generation += 1
         if self._score_bridge:
             try:
@@ -712,6 +754,10 @@ class TrainingPage(QWidget):
         self._write_session_metadata(final_state)
         self._update_state(final_state)
         self._append_feedback(reason)
+        if not self._shutdown_requested:
+            self._voice.clear()
+            self._voice.speak(
+                reason.replace("…", ""), key="session_end", priority=1, force=True)
         self._log_stop_stats()
         if not success:
             self._append_feedback(f"后台停止不完整：{message}")
@@ -733,13 +779,20 @@ class TrainingPage(QWidget):
         if not self._session_dir:
             return
         metadata = {
+            "patient_id": self._config.patient_id,
             "patient_name": self._config.patient_name,
+            "patient_gender": self._config.patient_gender,
+            "patient_age": self._config.patient_age,
+            "patient_diagnosis": self._config.patient_diagnosis,
             "course_id": self._current_course.course_id if self._current_course else "",
             "course_name": self._current_course.course_name if self._current_course else "",
+            "start_time": self._session_start_time,
             "elapsed_seconds": self._elapsed_seconds,
             "finished": final_state == TrainingState.FINISHED,
             "end_time": datetime.now().isoformat(timespec="seconds"),
             "engine_mode": "stub" if rehab_engine._STUB_MODE else "full",
+            "pipeline_csv_path": str(Path(self._session_dir) / "skeleton_3d.csv"),
+            "course_summary_path": str(Path(self._session_dir) / "course_summary.json"),
         }
         try:
             path = Path(self._session_dir) / "session_ui_meta.json"
@@ -747,6 +800,34 @@ class TrainingPage(QWidget):
                             encoding="utf-8")
         except OSError as exc:
             self._append_feedback(f"会话元数据保存失败：{exc}")
+        self._write_course_summary(final_state == TrainingState.FINISHED)
+
+    def _write_course_summary(self, finished: bool):
+        if not self._session_dir or not self._current_course:
+            return
+        payload = {
+            "patient_id": self._config.patient_id,
+            "patient_name": self._config.patient_name,
+            "course_id": self._current_course.course_id,
+            "course_name": self._current_course.course_name,
+            "category": self._current_course.category,
+            "difficulty": self._current_course.difficulty,
+            "estimated_minutes": self._current_course.estimated_minutes,
+            "description": self._current_course.description,
+            "start_time": self._session_start_time,
+            "end_time": datetime.now().isoformat(timespec="seconds") if finished else "",
+            "status": "finished" if finished else self._state.value,
+            "session_dir": str(Path(self._session_dir).resolve()),
+            "actions": self._action_summaries,
+        }
+        output = Path(self._session_dir) / "course_summary.json"
+        temporary = output.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(output)
+        except OSError as exc:
+            self._append_feedback(f"课程摘要保存失败：{exc}")
 
     # ---- Stop stats ----
 
@@ -761,6 +842,7 @@ class TrainingPage(QWidget):
     # ---- Course callbacks ----
 
     def _on_action_changed(self, action):
+        self._displayed_action_reps = 0
         self._action_label.setText(f"当前动作：{action.name_cn} ({action.action_id})")
         self._info_action.setText(f"{action.name_cn}\n{action.action_id}")
         self._instruction_label.setText(
@@ -771,6 +853,27 @@ class TrainingPage(QWidget):
         self._score_panel.set_target(action.target_reps)
         self._preview.set_training_progress(0, action.target_reps, "准备开始动作")
         self._rest_label.setText("休息：—")
+        instruction = ACTION_TIPS.get(
+            action.action_id, "请在舒适范围内缓慢完成动作，保持自然呼吸。")
+        self._voice.speak(
+            f"下一动作，{action.name_cn}。目标{action.target_reps}次。{instruction}",
+            key=f"action_{action.order}", priority=4, force=True)
+
+        movement = action.movement_id or "movement"
+        action_dir = Path(self._session_dir) / "actions" / (
+            f"{action.order:02d}_{action.action_id}_{movement}")
+        action_dir.mkdir(parents=True, exist_ok=True)
+        self._current_action_dir = str(action_dir.resolve())
+        self._current_action_csv = str((action_dir / "skeleton3d.csv").resolve())
+        if not self._scoring_recorder.start(self._current_action_dir):
+            self._append_feedback(f"动作 CSV 启动失败：{self._current_action_dir}")
+        if not self._pipeline.start_action_recording(self._current_action_dir):
+            self._append_feedback(f"动作 EMG 录制启动失败：{self._current_action_dir}")
+        summary = self._summary_for_action(action.order)
+        if summary is not None:
+            summary["action_dir"] = self._current_action_dir
+            summary["csv_path"] = self._current_action_csv
+        self._write_course_summary(False)
 
         # Start scoring for this action
         if self._pipeline.is_running:
@@ -809,9 +912,70 @@ class TrainingPage(QWidget):
             self._append_feedback("实时评分不可用，训练录制仍将继续。")
 
     def _on_action_completed(self, action, actual_reps, avg_score):
+        action_dir = self._current_action_dir
+        csv_path = self._current_action_csv
+        self._stop_current_action_artifacts()
+        self._score_generation += 1
+        if self._score_bridge:
+            self._score_bridge.stop()
+            self._score_bridge = None
+        summary = self._summary_for_action(action.order)
+        if summary is not None:
+            summary.update({
+                "actual_reps": actual_reps,
+                "average_score": avg_score,
+                "action_dir": action_dir,
+                "csv_path": csv_path,
+            })
         self._append_feedback(
             f"完成 {action.name_cn}：{actual_reps}/{action.target_reps} 次，"
             f"平均评分 {avg_score:.1f}")
+        self._voice.speak(
+            f"{action.name_cn}完成，平均评分{avg_score:.0f}分",
+            key=f"action_complete_{action.order}", priority=3, force=True)
+        if action_dir and csv_path and Path(csv_path).exists():
+            report_dir = Path(action_dir) / "report"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            expected = str((report_dir / "offline_action_report.html").resolve())
+            if summary is not None:
+                summary["report_path"] = expected
+            runner = OfflineReportRunner()
+            self._offline_report_runners[action.order] = runner
+            runner.on_ready = lambda path, order=action.order: (
+                self.offline_report_ready.emit(order, path))
+            runner.on_error = lambda message, order=action.order: (
+                self.offline_report_failed.emit(order, message))
+            if runner.run(csv_path, action.action_id, str(report_dir), self._skeleton_fps()):
+                self._append_feedback(f"动作 {action.action_id} 已完成，正在生成离线报告。")
+            else:
+                self._offline_report_runners.pop(action.order, None)
+        self._write_course_summary(False)
+
+    def _on_offline_report_ready(self, order: int, html_path: str):
+        self._offline_report_runners.pop(order, None)
+        summary = self._summary_for_action(order)
+        if summary is not None:
+            summary["report_path"] = html_path
+        self._write_course_summary(self._state == TrainingState.FINISHED)
+        self._append_feedback(f"离线动作报告已生成：{html_path}")
+
+    def _on_offline_report_failed(self, order: int, message: str):
+        self._offline_report_runners.pop(order, None)
+        self._append_feedback(f"动作离线报告失败：{message}")
+
+    def _summary_for_action(self, order: int):
+        index = int(order) - 1
+        return self._action_summaries[index] if 0 <= index < len(self._action_summaries) else None
+
+    def _stop_current_action_artifacts(self):
+        self._scoring_recorder.stop()
+        try:
+            self._pipeline.stop_action_recording()
+        except Exception as exc:
+            self._append_feedback(f"动作 EMG 录制停止异常：{exc}")
+
+    def _skeleton_fps(self) -> float:
+        return self._config.device.rgb_fps / max(1, self._config.pose.pose_interval)
 
     def _on_rest_started(self, action, rest_sec):
         self._update_state(TrainingState.RESTING)
@@ -821,12 +985,19 @@ class TrainingPage(QWidget):
             next_action = self._current_course.actions[next_index]
             self._instruction_label.setText(f"下一动作：{next_action.name_cn}。请调整站位并准备。")
         self._append_feedback(f"动作完成，休息 {rest_sec} 秒…")
+        self._voice.speak(
+            f"动作完成，请休息{rest_sec}秒",
+            key=f"rest_{action.order}", priority=3, force=True)
 
     def _on_rest_tick(self, remaining):
         self._rest_label.setText(f"休息：{remaining} 秒")
+        if remaining in (10, 5, 3, 2, 1):
+            self._voice.speak(
+                f"还有{remaining}秒", key=f"rest_tick_{remaining}", priority=8)
 
     def _on_course_finished(self):
         self._append_feedback("全部动作已完成！")
+        self._voice.speak("全部动作已完成", key="course_finished", priority=1, force=True)
         self._end_session(
             TrainingState.FINISHED, generate_report=True,
             reason="课程已自动完成，正在生成报告…")
@@ -837,7 +1008,13 @@ class TrainingPage(QWidget):
 
     def _on_score(self, result: ScoreResult):
         self._score_panel.set_score(result)
-        count = max(result.count, result.completed_count)
+        reported = max(result.count, result.completed_count)
+        if reported > self._displayed_action_reps + 1:
+            self._displayed_action_reps += 1
+        else:
+            self._displayed_action_reps = max(self._displayed_action_reps, reported)
+        count = self._displayed_action_reps
+        self._score_panel.set_display_count(count)
         quality = (
             "动作质量：优秀" if result.overall_score >= 85 else
             "动作质量：良好" if result.overall_score >= 70 else
@@ -849,6 +1026,10 @@ class TrainingPage(QWidget):
         self._preview.set_training_progress(count, target, quality)
         if self._course_runner:
             self._course_runner.on_score_updated(result)
+        if result.status == "new_completed_cycle":
+            self._voice.speak(
+                f"完成第{count}次，评分{result.overall_score:.0f}分",
+                key=f"score_cycle_{count}", priority=7, force=True)
 
     def _on_score_error(self, message: str):
         self._append_feedback(f"评分提示：{message}")
@@ -856,15 +1037,19 @@ class TrainingPage(QWidget):
     def _on_pipeline_frame(self, frame: PreviewFrame):
         """Runs on the pipeline worker; submit only valid active-training frames."""
         bridge = self._score_bridge
-        if (self._state != TrainingState.TRAINING or bridge is None
+        if (self._state != TrainingState.TRAINING
                 or not frame.has_valid_3d or len(frame.joints_3d) < 22):
             return
         self._frame_index += 1
-        joints = [
-            [joint.x, joint.y, joint.z] if joint.valid else [0.0, 0.0, 0.0]
-            for joint in frame.joints_3d[:22]
-        ]
-        bridge.submit_skeleton(self._frame_index, time.monotonic_ns(), joints)
+        joints = frame.joints_3d[:22]
+        if ScoringSkeletonAdapter.valid_joint_count(joints) >= 18:
+            self._scoring_recorder.append(
+                self._frame_index, ScoringSkeletonAdapter.convert(joints))
+        # ScoreBridge owns the original Rehab22 -> P-Coder coordinate transform,
+        # validity gate and synthetic joint fallbacks.
+        if bridge is not None:
+            bridge.submit_skeleton(
+                self._frame_index, time.monotonic_ns(), joints)
 
     # ---- Timer ticks ----
 
@@ -911,6 +1096,7 @@ class TrainingPage(QWidget):
         self._shutdown_requested = True
         self._preview_timer.stop()
         self._training_timer.stop()
+        self._voice.stop()
         if self._ending:
             return
         active = (self._pipeline.is_running or self._pipeline.is_recording

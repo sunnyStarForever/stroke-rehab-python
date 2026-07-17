@@ -108,6 +108,10 @@ class PoseConfig:
     depth_median_window: int = 5
     enable_smoothing: bool = True
     smoothing_alpha: float = 0.35
+    inference_backend: str = "python"  # python / native / auto
+    onnx_execution_provider: str = "auto"
+    onnx_intra_op_threads: int = 1
+    onnx_inter_op_threads: int = 1
 
 
 @dataclass
@@ -153,6 +157,16 @@ class DebugConfig:
 
 
 @dataclass
+class VoiceConfig:
+    enabled: bool = True
+    backend: str = "auto"
+    rate: int = 175
+    volume: float = 0.9
+    cooldown_seconds: float = 2.0
+    queue_size: int = 12
+
+
+@dataclass
 class EmgConfig:
     enabled: bool = False
     mode: str = "mock"  # disabled / mock / real
@@ -162,10 +176,14 @@ class EmgConfig:
     ble_name_prefix: str = "ESP32_EMG"
     ble_address: str = ""
     ble_service_uuid: str = ""
+    ble_command_rx_uuid: str = ""
+    ble_status_tx_uuid: str = ""
     ble_notify_char_uuid: str = ""
+    ble_command_timeout_ms: int = 5000
     sample_rate_hz: int = 1000
     channel_count: int = 2
-    raw_chunk_samples: int = 16
+    raw_chunk_samples: int = 25
+    strict_real_mode: bool = True
     rpmsg_enabled: bool = True
     rpmsg_ctrl_device: str = "/dev/rpmsg_ctrl0"
     rpmsg_data_device: str = "/dev/rpmsg0"
@@ -183,10 +201,15 @@ class PipelineConfig:
     depth_sampler: DepthSamplerConfig = field(default_factory=DepthSamplerConfig)
     skeleton_filter: SkeletonFilterConfig = field(default_factory=SkeletonFilterConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    voice: VoiceConfig = field(default_factory=VoiceConfig)
     emg: EmgConfig = field(default_factory=EmgConfig)
     calibration_file: str = ""
     record_pairs: bool = False
     record_path: str = "recordings"
     selected_course_id: str = ""
     patient_name: str = ""
+    patient_id: str = "P0001"
+    patient_gender: str = ""
+    patient_age: int = 0
+    patient_diagnosis: str = ""
     ui_debug_enabled: bool = False

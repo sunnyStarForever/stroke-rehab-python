@@ -6,6 +6,8 @@ In the Python architecture, this is a pure computation module — no Qt.
 The UI layer (PySide6 in Stage 3) will read PreviewFrame and paint it.
 """
 
+from __future__ import annotations
+
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +39,16 @@ class PreviewFrame:
     Lightweight preview data snapshot for the UI.
     Analogous to the C++ PreviewFrame struct.
     """
+    seq: int = 0
+    pair_id: int = 0
+    rgb_frame_id: int = 0
+    depth_frame_id: int = 0
+    host_ts_ns: int = 0
+    rgb_width: int = 0
+    rgb_height: int = 0
+    depth_width: int = 0
+    depth_height: int = 0
+    pose_interval: int = 0
     # Pose
     joints_2d: List[Joint2DDisplay] = field(default_factory=list)    # 22 Rehab22 joints
     joints_3d: List[Joint3DDisplay] = field(default_factory=list)
@@ -118,8 +130,18 @@ class PreviewComposer:
     def __init__(self):
         self._lock = threading.Lock()
         self._latest: Optional[PreviewFrame] = None
+        self._seq = 0
 
     def submit(self,
+               pair_id: int = 0,
+               rgb_frame_id: int = 0,
+               depth_frame_id: int = 0,
+               host_ts_ns: int = 0,
+               rgb_width: int = 0,
+               rgb_height: int = 0,
+               depth_width: int = 0,
+               depth_height: int = 0,
+               pose_interval: int = 0,
                # Pose arrays: 22-element lists of [x,y,z], [x,y], etc.
                joints_2d_raw: Optional[List[Tuple[float, float, float, bool]]] = None,
                joints_3d: Optional[List[Tuple[float, float, float, float, bool]]] = None,
@@ -156,6 +178,17 @@ class PreviewComposer:
                ) -> None:
         """Submit new frame data. Called from the pipeline worker thread."""
         frame = PreviewFrame()
+        self._seq += 1
+        frame.seq = self._seq
+        frame.pair_id = pair_id
+        frame.rgb_frame_id = rgb_frame_id
+        frame.depth_frame_id = depth_frame_id
+        frame.host_ts_ns = host_ts_ns
+        frame.rgb_width = rgb_width
+        frame.rgb_height = rgb_height
+        frame.depth_width = depth_width
+        frame.depth_height = depth_height
+        frame.pose_interval = pose_interval
         frame.bones = list(_REHAB22_BONES)
 
         if joints_2d_raw:

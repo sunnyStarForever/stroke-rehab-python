@@ -23,6 +23,7 @@
 #include "engine/capture/DepthCaptureOpenNI.h"
 #include "engine/capture/RgbCaptureV4L2.h"
 #include "engine/common/FrameEnvelope.h"
+#ifndef STROKE_HARDWARE_ONLY
 #include "engine/emg/EmgRpmsgClient.h"
 #include "engine/emg/EmgTypes.h"
 #include "engine/pose/AdaptiveRoiBoundingBoxProvider.h"
@@ -36,6 +37,7 @@
 #include "engine/pose/Rehab22Types.h"
 #include "engine/pose/SkeletonSmoother.h"
 #include "engine/sync/SyncManager.h"
+#endif
 #endif
 
 namespace py = pybind11;
@@ -224,16 +226,23 @@ static void registerLoggerBindings(py::module_& m) {
 // This avoids binding cv::Mat / FrameEnvelope — no OpenCV Python needed on the C++ side.
 // Python callback signature: callback(
 //     jpeg_bytes: bytes, width: int, height: int,
-//     ts_ns: int, frame_id: int, source: str
+//     ts_ns: int, frame_id: int, device_ts_us: int,
+//     depth_unit_to_meter: float, pixel_format: str, source: str
 // )
-using JpegFrameCallback = std::function<void(py::bytes, int, int, uint64_t, uint64_t, std::string)>;
+using JpegFrameCallback = std::function<void(
+    py::bytes, int, int, uint64_t, uint64_t, uint64_t, float,
+    std::string, std::string)>;
 
 static JpegFrameCallback wrapJpegCallback(py::object obj) {
   if (obj.is_none()) return nullptr;
   auto fn = obj.cast<py::function>();
-  return [fn](py::bytes jpeg, int w, int h, uint64_t ts, uint64_t fid, std::string src) {
+  return [fn](py::bytes jpeg, int w, int h, uint64_t ts, uint64_t fid,
+              uint64_t deviceTsUs, float depthUnitToMeter,
+              std::string pixelFormat, std::string src) {
     py::gil_scoped_acquire gil;
-    try { fn(jpeg, w, h, ts, fid, src); } catch (py::error_already_set&) {}
+    try {
+      fn(jpeg, w, h, ts, fid, deviceTsUs, depthUnitToMeter, pixelFormat, src);
+    } catch (py::error_already_set&) {}
   };
 }
 
@@ -252,11 +261,14 @@ static void registerCaptureBindings(py::module_& m) {
                    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
                    cv::imencode(".jpg", env.image, buf, params);
                    py::bytes jpeg(reinterpret_cast<const char*>(buf.data()), buf.size());
-                   pyCb(jpeg, env.width, env.height, env.hostTsNs, env.frameId, "rgb");
+                   pyCb(jpeg, env.width, env.height, env.hostTsNs, env.frameId,
+                        env.deviceTsUs, env.depthUnitToMeter,
+                        env.pixelFormatName, "rgb");
                  });
            },
            py::arg("config"), py::arg("frame_callback"))
-      .def("stop", &RgbCaptureV4L2::stop)
+      .def("stop", &RgbCaptureV4L2::stop,
+           py::call_guard<py::gil_scoped_release>())
       .def("is_running", &RgbCaptureV4L2::isRunning)
       .def("set_on_status",
            [](RgbCaptureV4L2& self, py::object callback) {
@@ -279,15 +291,19 @@ static void registerCaptureBindings(py::module_& m) {
                    std::vector<int> params = {cv::IMWRITE_PNG_COMPRESSION, 1};
                    cv::imencode(".png", env.image, buf, params);
                    py::bytes png(reinterpret_cast<const char*>(buf.data()), buf.size());
-                   pyCb(png, env.width, env.height, env.hostTsNs, env.frameId, "depth");
+                   pyCb(png, env.width, env.height, env.hostTsNs, env.frameId,
+                        env.deviceTsUs, env.depthUnitToMeter,
+                        env.pixelFormatName, "depth");
                  });
            },
            py::arg("config"), py::arg("frame_callback"))
-      .def("stop", &DepthCaptureOpenNI::stop)
+      .def("stop", &DepthCaptureOpenNI::stop,
+           py::call_guard<py::gil_scoped_release>())
       .def("is_running", &DepthCaptureOpenNI::isRunning)
       .def("hardware_d2c_active", &DepthCaptureOpenNI::hardwareD2CActive);
 }
 
+#ifndef STROKE_HARDWARE_ONLY
 static void registerSyncBindings(py::module_& m) {
   py::class_<SyncManager>(m, "SyncManager")
       .def(py::init<SyncConfig>(), py::arg("config"))
@@ -446,7 +462,8 @@ static void registerSyncedCaptureBinding(py::module_& m) {
       .def(py::init<>())
       .def("start", &SyncedCapture::start,
            py::arg("config"), py::arg("pair_callback"))
-      .def("stop", &SyncedCapture::stop)
+      .def("stop", &SyncedCapture::stop,
+           py::call_guard<py::gil_scoped_release>())
       .def("is_running", &SyncedCapture::is_running)
       .def("hardware_d2c_active", &SyncedCapture::hardware_d2c_active)
       .def("set_on_status",
@@ -684,6 +701,7 @@ static void registerEmgBindings(py::module_& m) {
            },
            py::arg("callback"));
 }
+#endif  // !STROKE_HARDWARE_ONLY
 
 #endif  // !STROKE_ENGINE_STUB
 
@@ -695,8 +713,8 @@ PYBIND11_MODULE(_core, m) {
   m.doc() = R"pbdoc(
     Stroke Rehab C++ Engine
     -----------------------
-    Low-level hardware drivers and AI inference engine for the
-    stroke rehabilitation training system.
+    Low-level hardware drivers for the Python-main stroke rehabilitation
+    training system. Legacy native algorithms are compatibility-only.
   )pbdoc";
 
   registerConfigBindings(m);
@@ -704,10 +722,12 @@ PYBIND11_MODULE(_core, m) {
 
 #ifndef STROKE_ENGINE_STUB
   registerCaptureBindings(m);
+#ifndef STROKE_HARDWARE_ONLY
   registerSyncBindings(m);
   registerSyncedCaptureBinding(m);
   registerPoseBindings(m);
   registerEmgBindings(m);
+#endif
 #endif
 
   m.attr("__version__") = "0.1.0";

@@ -104,6 +104,10 @@ class ScorePanel(SimpleCardWidget):
                     f"{attr:.1f}" if attr > 0 else "—")
                 self._bars[key].setValue(max(0, min(100, int(attr))))
 
+    def set_display_count(self, count: int):
+        """Apply the original UI's one-step jump guard to the visible count."""
+        self._count_label.setText(f"{max(0, int(count))} / {self._target or '—'}")
+
     def reset(self):
         """Reset all scores to default."""
         self._count_label.setText(f"0 / {self._target or '—'}")

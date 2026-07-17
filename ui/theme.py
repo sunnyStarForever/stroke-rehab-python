@@ -1,5 +1,7 @@
 """Shared visual tokens and small stylesheet helpers for the desktop UI."""
 
+from __future__ import annotations
+
 from typing import Dict
 
 

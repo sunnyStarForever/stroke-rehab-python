@@ -11,12 +11,16 @@ Full mode data flow:
 Stub mode: mock capture thread + synthetic pose.
 """
 
+from __future__ import annotations
+
 import math
+import json
 import os as _os
 import queue
 import threading
 import time
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -30,12 +34,38 @@ from . import PipelineConfig, logger
 _STUB_MODE = False
 _engine = None
 try:
+    if _os.environ.get("STROKE_REHAB_FORCE_STUB", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        raise ImportError("stub mode forced by STROKE_REHAB_FORCE_STUB")
     from . import _core as _engine
 except ImportError:
     _STUB_MODE = True
+else:
+    _STUB_MODE = not all(
+        hasattr(_engine, name)
+        for name in ("RgbCaptureV4L2", "DepthCaptureOpenNI", "DeviceConfig")
+    )
 
 from .preview import PreviewComposer, PreviewFrame
-from .recorder import Skeleton3DRecorder
+from .recorder import PairDebugRecorder, RgbDepthVideoRecorder, Skeleton3DRecorder
+from .emg import EmgManager
+from .inference import (
+    AdaptiveRoiTracker,
+    BoundingBox2D as PythonBoundingBox,
+    PersonDetector as PythonPersonDetector,
+    RtmposeEstimator as PythonRtmposeEstimator,
+    map_halpe26_to_rehab22,
+)
+from .capture import NativeRgbDepthBackend
+from .alignment import SoftwareRegistrationAligner, load_calibration as load_registration_calibration
+from .pose3d import (
+    DepthSampler as PythonDepthSampler,
+    EmaSkeletonFilter,
+    JointProjector3D as PythonJointProjector3D,
+    SkeletonSmoother as PythonSkeletonSmoother,
+    make_rehab22_joints,
+)
 
 
 def _decode_jpeg_to_rgb(jpeg: bytes) -> Any:
@@ -50,13 +80,25 @@ def _decode_jpeg_to_rgb(jpeg: bytes) -> Any:
         return None
 
 
+@dataclass(frozen=True)
+class RecordingOptions:
+    save_root: str = "records"
+    record_skeleton: bool = True
+    record_rgb: bool = True
+    record_depth: bool = False
+    mirror_preview: bool = False
+    record_valid_3d_only: bool = False
+
+
 class SensorPipeline:
-    """Main pipeline orchestrator: dual-mode (stub / full ONNX)."""
+    """Python-owned pipeline orchestrator with mock and real-hardware modes."""
 
     def __init__(self, config: Optional[PipelineConfig] = None):
         self._config = config or PipelineConfig()
         self._stub_mode = _STUB_MODE
-        self._pair_queue: queue.Queue = queue.Queue(maxsize=100)
+        self._pair_queue: queue.Queue = queue.Queue(
+            maxsize=max(1, int(self._config.pose.max_pair_queue))
+        )
         self._worker_thread: Optional[threading.Thread] = None
         self._running = threading.Event()
         self._accept_frames = threading.Event()
@@ -66,27 +108,36 @@ class SensorPipeline:
         self._stop_lock = threading.Lock()
         self._stop_callbacks: List[Callable[[bool, str], None]] = []
 
-        # C++ capture
-        self._synced_capture = None
+        # Python-owned capture orchestration; low-level drivers are adapters.
+        self._capture_backend = None
 
-        # C++ pose pipeline (ONNX)
+        # Python owns pose inference and all 2D -> 3D processing. Native pose
+        # objects exist only in explicitly built legacy compatibility modules.
         self._person_detector = None
         self._pose_estimator = None
+        self._roi_tracker = None
         self._halpe_mapper = None
-        self._depth_sampler = None
-        self._joint_projector = None
-        self._ema_filter = None
-        self._smoother = None
+        self._depth_sampler = PythonDepthSampler(self._config.depth_sampler)
+        self._joint_projector = PythonJointProjector3D()
+        self._ema_filter = EmaSkeletonFilter(self._config.skeleton_filter)
+        self._smoother = PythonSkeletonSmoother(self._config.pose.smoothing_alpha)
         self._pose_models_ready = False
+        self._python_inference = False
         self._frame_counter = 0
         self._last_pose_time = 0.0
 
         self._preview = PreviewComposer()
         self._recorder = Skeleton3DRecorder()
+        self._video_recorder = RgbDepthVideoRecorder()
+        self._pair_recorder = PairDebugRecorder()
+        self._emg = EmgManager(self._config.emg)
+        self._emg.set_on_status(lambda status: self._emit_status(status.message))
 
         self._recording = False
         self._recording_paused = False
         self._session_dir = ""
+        self._recording_options = RecordingOptions()
+        self._recording_started_at = ""
         self._recording_lock = threading.Lock()
 
         self._pair_id = 0
@@ -102,6 +153,9 @@ class SensorPipeline:
         self._depth_fps = 0.0
         self._pair_fps = 0.0
         self._pose_fps = 0.0
+        self._last_yolo_ms = 0.0
+        self._last_pose_ms = 0.0
+        self._last_record_write_ms = 0.0
         self._rgb_since_last = 0
         self._depth_since_last = 0
         self._pair_since_last = 0
@@ -117,15 +171,20 @@ class SensorPipeline:
         self._last_j2d: list = []
         self._last_j3d: list = []
         self._last_bbox = None
+        self._last_rehab2d = []
+        self._last_depth_debug = []
+        self._last_raw_j3d = []
+        self._last_ema_j3d = []
+        self._last_ema_debug = []
 
         # Depth diagnostic counters
         self._depth_has_data = False
         self._depth_empty_count = 0
 
-        # Spatial alignment — precomputed remap LUT (depth → RGB coordinate frame)
-        self._align_map_x = None
-        self._align_map_y = None
+        # Spatial alignment (depth → RGB coordinate frame)
         self._align_ready = False
+        self._software_aligner = None
+        self._hardware_d2c_active = False
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -151,6 +210,15 @@ class SensorPipeline:
     def camera_status(self):
         return {"status": self._camera_status, "error": self._camera_error,
                 "rgb_fps": self._rgb_fps, "mode": "STUB" if self._stub_mode else "FULL"}
+    @property
+    def emg_status(self): return self._emg.runtime_status()
+
+    def start_action_recording(self, action_dir: str) -> bool:
+        """Start EMG artifacts for one course action, matching the original layout."""
+        return self._emg.start_recording(action_dir)
+
+    def stop_action_recording(self) -> None:
+        self._emg.stop_recording()
 
     # ── Start / Stop ──────────────────────────────────────────────
 
@@ -172,6 +240,23 @@ class SensorPipeline:
         self._start_done.clear()
         self._drain_pair_queue()
         self._reset_performance_counters()
+        self._ema_filter.reset()
+        self._smoother.reset()
+        if self._roi_tracker is not None:
+            self._roi_tracker.reset()
+        self._last_pose_time = 0.0
+        self._last_j2d = []
+        self._last_j3d = []
+        self._last_bbox = None
+        self._last_rehab2d = []
+        self._last_depth_debug = []
+        self._last_raw_j3d = []
+        self._last_ema_j3d = []
+        self._last_ema_debug = []
+        if self._config.record_pairs and not self._pair_recorder.start(
+            str(self._config.record_path)
+        ):
+            self._emit_status("WARNING: RGB-D pair debug recorder failed to start")
         self._accept_frames.set()
         self._running.set()
         self._worker_thread = threading.Thread(
@@ -185,8 +270,30 @@ class SensorPipeline:
                 self._running.clear()
                 if self._worker_thread and self._worker_thread.is_alive():
                     self._worker_thread.join(timeout=1.0)
+                self._pair_recorder.stop()
                 self._start_done.set()
                 return False
+        emg_ok = self._emg.start()
+        strict_real = (
+            self._config.emg.enabled
+            and str(self._config.emg.mode).lower() == "real"
+            and bool(getattr(self._config.emg, "strict_real_mode", True))
+        )
+        if not emg_ok and strict_real:
+            self._accept_frames.clear()
+            self._running.clear()
+            try:
+                self._stop_real_capture()
+            except Exception as exc:
+                self._camera_error = str(exc)
+            if self._worker_thread and self._worker_thread.is_alive():
+                self._worker_thread.join(timeout=1.0)
+            self._pair_recorder.stop()
+            self._camera_status = "error"
+            self._camera_error = self._emg.runtime_status().message
+            self._start_done.set()
+            self._emit_status(f"ERROR: {self._camera_error}")
+            return False
         self._start_done.set()
         return True
 
@@ -222,6 +329,10 @@ class SensorPipeline:
         if not self._start_done.wait(timeout=10.0):
             errors.append("pipeline start did not finish within 10 seconds")
         try:
+            self._emg.stop()
+        except Exception as exc:
+            errors.append(f"emg: {exc}")
+        try:
             self._stop_real_capture()
         except Exception as exc:
             errors.append(f"camera: {exc}")
@@ -239,8 +350,12 @@ class SensorPipeline:
             self.stop_recording()
         except Exception as exc:
             errors.append(f"recorder: {exc}")
+        self._pair_recorder.stop()
 
         self._worker_thread = None
+        self._ema_filter.reset()
+        self._smoother.reset()
+        self._last_pose_time = 0.0
         self._camera_status = "stop_error" if errors else "stopped"
         self._camera_error = "; ".join(errors)
         self._stopping.clear()
@@ -266,6 +381,23 @@ class SensorPipeline:
         except queue.Empty:
             pass
 
+    def _enqueue_pair(self, pair: dict) -> None:
+        """Keep the newest pairs, matching the original bounded deque."""
+        try:
+            self._pair_queue.put_nowait(pair)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._pair_queue.get_nowait()
+            self._dropped += 1
+        except queue.Empty:
+            pass
+        try:
+            self._pair_queue.put_nowait(pair)
+        except queue.Full:
+            self._dropped += 1
+
     def _reset_performance_counters(self) -> None:
         with self._perf_lock:
             self._pair_id = self._processed = self._dropped = 0
@@ -277,19 +409,60 @@ class SensorPipeline:
 
     # ── Recording ─────────────────────────────────────────────────
 
-    def start_recording(self, save_root: str) -> str:
+    def start_recording(self, save_root) -> str:
         with self._recording_lock:
             if self._recording: return self._session_dir
+            options = (
+                save_root if isinstance(save_root, RecordingOptions)
+                else RecordingOptions(save_root=str(save_root))
+            )
+            if not (options.record_skeleton or options.record_rgb or options.record_depth):
+                raise ValueError("At least one recording output must be enabled")
             now = datetime.now()
             date_folder = now.strftime("%Y%m%d")
-            session_name = f"{now:%Y%m%d_%H%M%S}_{now.microsecond // 1000:03d}"
-            session_dir = Path(save_root) / date_folder / session_name
+            output_root = Path(options.save_root)
+            if output_root.name != "output":
+                output_root = output_root / "output"
+            day_dir = output_root / date_folder
+            session_dir = next(
+                day_dir / f"session_{index:03d}"
+                for index in range(1, 10_000)
+                if not (day_dir / f"session_{index:03d}").exists()
+            )
             session_dir.mkdir(parents=True, exist_ok=True)
-            if not self._recorder.start(str(session_dir)):
+            video_ok = self._video_recorder.start(
+                str(session_dir),
+                self._config.device.rgb_fps,
+                self._config.device.rgb_width,
+                self._config.device.rgb_height,
+                options.record_rgb,
+                options.record_depth,
+            )
+            if not video_ok:
+                raise OSError(f"Cannot open video recording files in {session_dir}")
+            meta = {
+                "rgb_width": self._config.device.rgb_width,
+                "rgb_height": self._config.device.rgb_height,
+                "depth_width": self._config.device.depth_width,
+                "depth_height": self._config.device.depth_height,
+                "rgb_fps": self._config.device.rgb_fps,
+                "depth_fps": self._config.device.depth_fps,
+                "pose_model_path": self._config.pose.model_path,
+                "detector_model_path": self._config.pose.detector_model_path,
+                "pose_interval": self._config.pose.pose_interval,
+                "hardware_d2c_enabled": self._config.device.enable_hardware_d2c,
+                "mirror_rgb_at_capture": self._config.device.mirror_rgb_at_capture,
+                "mirror_preview": options.mirror_preview,
+            }
+            if options.record_skeleton and not self._recorder.start(str(session_dir), meta):
+                self._video_recorder.stop()
                 raise OSError(f"Cannot open recording files in {session_dir}")
             self._session_dir = str(session_dir)
+            self._recording_options = options
+            self._recording_started_at = datetime.now().astimezone().isoformat()
             self._recording = True
             self._recording_paused = False
+            self._write_recording_meta("")
             self._emit_status(f"Recording started: {session_dir}")
             return self._session_dir
 
@@ -297,7 +470,10 @@ class SensorPipeline:
         with self._recording_lock:
             if not self._recording: return
             self._recording = False; self._recording_paused = False
+            self._emg.stop_recording()
             self._recorder.stop()
+            self._video_recorder.stop()
+            self._write_recording_meta(datetime.now().astimezone().isoformat())
             self._emit_status(f"Recording stopped: {self._session_dir}")
 
     def pause_recording(self):
@@ -314,14 +490,61 @@ class SensorPipeline:
 
     def recording_stats(self):
         s = self._recorder.stats()
-        return {"recording": s.recording, "paused": self._recording_paused,
-                "session_dir": s.session_dir, "csv_path": s.csv_path,
-                "frames": s.frames, "rows": s.rows, "skipped": s.skipped_frames}
+        video = self._video_recorder.stats()
+        return {"recording": self._recording, "paused": self._recording_paused,
+                "session_dir": self._session_dir, "csv_path": s.csv_path,
+                "frames": s.frames, "rows": s.rows, "skipped": s.skipped_frames,
+                "rgb_frames": video.rgb_frames, "depth_frames": video.depth_frames,
+                "rgb_path": video.rgb_path, "depth_path": video.depth_path,
+                "last_write_ms": video.last_write_ms}
+
+    def _write_recording_meta(self, end_time: str) -> None:
+        if not self._session_dir:
+            return
+        skeleton = self._recorder.stats()
+        video = self._video_recorder.stats()
+        options = self._recording_options
+        data = {
+            "start_time": self._recording_started_at,
+            "end_time": end_time,
+            "rgb_device": self._config.device.rgb_device_path,
+            "depth_device": self._config.device.openni_device_uri or "OpenNI2 ANY_DEVICE",
+            "rgb_format": self._config.device.rgb_pixel_format,
+            "depth_format": self._config.device.depth_pixel_format,
+            "rgb_width": self._config.device.rgb_width,
+            "rgb_height": self._config.device.rgb_height,
+            "depth_width": self._config.device.depth_width,
+            "depth_height": self._config.device.depth_height,
+            "rgb_fps": self._config.device.rgb_fps,
+            "depth_fps": self._config.device.depth_fps,
+            "hardware_d2c_enabled": self._config.device.enable_hardware_d2c,
+            "rgb_mirror_at_capture": self._config.device.mirror_rgb_at_capture,
+            "mirror_preview": options.mirror_preview,
+            "record_skeleton": options.record_skeleton,
+            "record_rgb": options.record_rgb,
+            "record_depth": options.record_depth,
+            "record_valid_3d_only": options.record_valid_3d_only,
+            "skeleton_csv": "skeleton_3d.csv" if options.record_skeleton else None,
+            "rgb_video": "rgb.mp4" if options.record_rgb else None,
+            "depth_video": "depth.avi" if options.record_depth else None,
+            "saved_skeleton_frames": skeleton.frames,
+            "saved_rgb_frames": video.rgb_frames,
+            "saved_depth_frames": video.depth_frames,
+        }
+        try:
+            (Path(self._session_dir) / "meta.json").write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.warn(f"Recording metadata write failed: {exc}")
 
     def performance_stats(self):
         with self._perf_lock:
-            return {"rgb_fps": self._rgb_fps, "depth_fps": self._depth_fps,
+            stats = {"rgb_fps": self._rgb_fps, "depth_fps": self._depth_fps,
                     "pair_fps": self._pair_fps, "pose_fps": self._pose_fps,
+                    "yolo_ms": self._last_yolo_ms,
+                    "pose_ms": self._last_pose_ms,
+                    "record_write_ms": self._last_record_write_ms,
                     "queue_length": self._pair_queue.qsize(),
                     "dropped_pairs": self._dropped, "processed": self._processed,
                     "stub_mode": self._stub_mode, "real_data": not self._stub_mode,
@@ -331,6 +554,21 @@ class SensorPipeline:
                     "pair_30fps_ok": 27.0 <= self._pair_fps <= 33.5,
                     "camera_status": self._camera_status,
                     "stopping": self._stopping.is_set()}
+            pair_recording = self._pair_recorder.stats()
+            stats.update({
+                "debug_pairs_recording": pair_recording.recording,
+                "debug_pairs_saved": pair_recording.pairs,
+                "debug_pairs_dir": pair_recording.session_dir,
+            })
+            if self._capture_backend is not None:
+                sync = self._capture_backend.sync_stats()
+                stats.update({
+                    "sync_matched": sync.matched,
+                    "sync_threshold_misses": sync.threshold_misses,
+                    "sync_rgb_trimmed": sync.rgb_trimmed,
+                    "sync_depth_trimmed": sync.depth_trimmed,
+                })
+            return stats
 
     # ── Stub capture ──────────────────────────────────────────────
 
@@ -341,49 +579,120 @@ class SensorPipeline:
     def _mock_capture_loop(self):
         interval = 1.0 / max(1, self._config.device.rgb_fps)
         while self._running.is_set():
-            try: self._pair_queue.put_nowait({"ts": time.monotonic_ns(), "mock": True})
-            except queue.Full: self._dropped += 1
+            self._enqueue_pair({"ts": time.monotonic_ns(), "mock": True})
             self._rgb_count += 1; self._depth_count += 1
             self._rgb_since_last += 1; self._depth_since_last += 1
             time.sleep(interval)
 
     # ── ONNX pose model init ──────────────────────────────────────
 
+    def _model_assets(self):
+        python_root = Path(__file__).resolve().parent.parent
+        repo_root = python_root.parent
+        roots = [
+            repo_root / "stroke-rehab" / "including",
+            repo_root / "including",
+            python_root / "including",
+        ]
+
+        def configured_or_default(configured, relative):
+            if configured:
+                path = Path(configured).expanduser()
+                if not path.is_absolute():
+                    for root in (python_root, repo_root):
+                        candidate = (root / path).resolve()
+                        if candidate.exists():
+                            return str(candidate)
+                return str(path.resolve())
+            for root in roots:
+                candidate = root / relative
+                if candidate.exists():
+                    return str(candidate)
+            return str(roots[0] / relative)
+
+        pose = self._config.pose
+        return {
+            "detector": configured_or_default(
+                pose.detector_model_path, Path("yolov8n") / "yolov8n.onnx"
+            ),
+            "pose": configured_or_default(
+                pose.model_path, Path("rtmpose-t") / "end2end.onnx"
+            ),
+            "pipeline": configured_or_default(
+                pose.pipeline_json_path, Path("rtmpose-t") / "pipeline.json"
+            ),
+            "detail": configured_or_default(
+                pose.detail_json_path, Path("rtmpose-t") / "detail.json"
+            ),
+            "deploy": configured_or_default(
+                pose.deploy_json_path, Path("rtmpose-t") / "deploy.json"
+            ),
+        }
+
     def _init_pose_models(self):
-        if _engine is None: return False
+        if not self._config.pose.enable_pose:
+            self._pose_models_ready = False
+            self._person_detector = self._pose_estimator = self._roi_tracker = None
+            logger.info("Pose inference disabled by configuration")
+            return False
+        assets = self._model_assets()
+        backend = str(getattr(self._config.pose, "inference_backend", "python")).lower()
+        if backend not in ("python", "native", "auto"):
+            logger.error(
+                f"Unsupported inference_backend={backend!r}; expected python, native, or auto")
+            return False
+        self._python_inference = False
         try:
-            model_dir = _os.path.normpath(_os.path.join(
-                _os.path.dirname(_os.path.dirname(__file__)), "..", "including"))
-            yolo_path = _os.path.join(model_dir, "yolov8n", "yolov8n.onnx")
-            pose_path = _os.path.join(model_dir, "rtmpose-t", "end2end.onnx")
+            if backend in ("python", "auto"):
+                detector = PythonPersonDetector(self._config.pose)
+                pose_estimator = PythonRtmposeEstimator(self._config.pose)
+                detector_ok = detector.initialize(assets["detector"])
+                pose_ok = pose_estimator.initialize(
+                    assets["pose"], assets["pipeline"], assets["detail"]
+                )
+                if pose_ok:
+                    self._person_detector = detector if detector_ok else None
+                    self._pose_estimator = pose_estimator
+                    self._roi_tracker = (
+                        AdaptiveRoiTracker(detector, self._config.pose)
+                        if detector_ok and self._config.pose.enable_adaptive_roi
+                        else None
+                    )
+                    self._python_inference = True
+                    logger.info(
+                        f"Python ONNX pose ready: detector={detector_ok} pose={assets['pose']}"
+                    )
+                elif backend == "python":
+                    logger.error(
+                        "Python ONNX backend unavailable; install onnxruntime and verify model paths"
+                    )
 
-            self._person_detector = _engine.PersonDetectorOrt()
-            if _os.path.exists(yolo_path) and self._person_detector.initialize(yolo_path):
-                logger.info(f"YOLO initialized: {yolo_path}")
-            else:
-                logger.warn(f"YOLO not available: {yolo_path}")
-                self._person_detector = None
-
-            self._pose_estimator = _engine.PoseEstimatorRTMPoseOrt()
-            if _os.path.exists(pose_path):
+            native_pose_api = (
+                _engine is not None
+                and all(hasattr(_engine, name) for name in (
+                    "PersonDetectorOrt", "PoseEstimatorRTMPoseOrt",
+                    "PoseEstimatorConfig", "Halpe26ToRehab22Mapper",
+                ))
+            )
+            if not self._python_inference and backend in ("native", "auto") and native_pose_api:
+                self._person_detector = _engine.PersonDetectorOrt()
+                if not self._person_detector.initialize(assets["detector"]):
+                    self._person_detector = None
+                self._pose_estimator = _engine.PoseEstimatorRTMPoseOrt()
                 cfg = _engine.PoseEstimatorConfig()
-                cfg.model_path = pose_path
-                cfg.pipeline_json_path = _os.path.join(model_dir, "rtmpose-t", "pipeline.json")
-                cfg.detail_json_path = _os.path.join(model_dir, "rtmpose-t", "detail.json")
-                cfg.deploy_json_path = _os.path.join(model_dir, "rtmpose-t", "deploy.json")
-                if self._pose_estimator.initialize(cfg):
-                    logger.info(f"RTMPose initialized: {pose_path}")
-                else:
+                cfg.model_path = assets["pose"]
+                cfg.pipeline_json_path = assets["pipeline"]
+                cfg.detail_json_path = assets["detail"]
+                cfg.deploy_json_path = assets["deploy"]
+                if not self._pose_estimator.initialize(cfg):
                     self._pose_estimator = None
-            else:
-                logger.warn(f"RTMPose model not found: {pose_path}")
-                self._pose_estimator = None
+                self._halpe_mapper = _engine.Halpe26ToRehab22Mapper()
+            elif not self._python_inference and backend in ("native", "auto"):
+                logger.error(
+                    "Native pose backend is unavailable in the hardware-only _core build; "
+                    "use inference_backend=python or rebuild with "
+                    "STROKE_BUILD_LEGACY_NATIVE_PIPELINE=ON for compatibility testing")
 
-            self._halpe_mapper = _engine.Halpe26ToRehab22Mapper()
-            self._depth_sampler = _engine.DepthSampler()
-            self._joint_projector = _engine.JointProjector3D()
-            self._ema_filter = _engine.EMASkeletonFilter()
-            self._smoother = _engine.SkeletonSmoother()
             # Use RGB intrinsics from calibration.yaml for accurate 3D projection
             calib = self._load_calibration()
             if calib:
@@ -391,14 +700,23 @@ class SensorPipeline:
                 self._joint_projector.set_intrinsics(rgb["fx"], rgb["fy"], rgb["cx"], rgb["cy"])
                 logger.info(f"Projector intrinsics from calibration: fx={rgb['fx']:.1f} fy={rgb['fy']:.1f}")
             else:
-                self._joint_projector.set_intrinsics(570.34, 570.34, 319.5, 239.5)
-                logger.warn("Using fallback intrinsics (no calibration.yaml)")
+                self._joint_projector.set_intrinsics(0.0, 0.0, 0.0, 0.0)
+                logger.warn("RGB intrinsics invalid; Python 3D projection disabled")
 
             # Build depth→RGB remap LUT for spatial alignment
-            self._build_alignment_remap(calib)
+            registration = load_registration_calibration(self._calibration_path())
+            self._software_aligner = SoftwareRegistrationAligner(registration)
+            self._align_ready = self._software_aligner.valid
+            if self._align_ready:
+                logger.info(f"Python software registration ready: {registration.source_path}")
+            else:
+                logger.warn("Software registration calibration unavailable; nearest resize fallback")
 
             self._pose_models_ready = self._pose_estimator is not None
-            logger.info(f"Pose pipeline ready: {self._pose_models_ready}")
+            logger.info(
+                f"Pose pipeline ready: {self._pose_models_ready} "
+                f"backend={'python' if self._python_inference else 'native'}"
+            )
             return self._pose_models_ready
         except Exception as e:
             logger.error(f"Pose model init failed: {e}")
@@ -418,53 +736,52 @@ class SensorPipeline:
         self._camera_status = "opening"
 
         try:
-            cfg = _engine.PipelineConfig()
-            dev = cfg.device
-            dev.rgb_device_path = self._config.device.rgb_device_path or \
-                f"/dev/video{self._config.device.rgb_device_index}"
-            dev.rgb_width = self._config.device.rgb_width
-            dev.rgb_height = self._config.device.rgb_height
-            dev.rgb_fps = self._config.device.rgb_fps
-            dev.rgb_pixel_format = self._config.device.rgb_pixel_format
-            dev.mirror_rgb_at_capture = self._config.device.mirror_rgb_at_capture
-            dev.rgb_device_index = self._config.device.rgb_device_index
-            dev.depth_width = self._config.device.depth_width
-            dev.depth_height = self._config.device.depth_height
-            dev.depth_fps = self._config.device.depth_fps
-            dev.depth_pixel_format = self._config.device.depth_pixel_format
-            dev.enable_hardware_d2c = self._config.device.enable_hardware_d2c
+            self._capture_backend = NativeRgbDepthBackend(
+                _engine, self._config.device, self._config.sync
+            )
+            self._capture_backend.set_on_status(self._on_camera_status)
 
-            self._synced_capture = _engine.SyncedCapture()
-            self._synced_capture.set_on_status(lambda s: self._on_camera_status(s))
-
-            def _on_pair(jpeg, png, rw, rh, dw, dh, rts, dts, delta):
+            def _on_pair(pair):
                 if not self._accept_frames.is_set():
                     return
                 self._rgb_count += 1; self._rgb_since_last += 1
                 self._depth_count += 1; self._depth_since_last += 1
-                try:
-                    self._pair_queue.put_nowait({
-                        "ts": rts, "mock": False,
-                        "jpeg": jpeg, "width": rw, "height": rh,
-                        "depth_png": png, "depth_width": dw, "depth_height": dh,
-                        "delta_ns": delta, "frame_id": 0, "source": "synced",
+                self._enqueue_pair({
+                        "ts": pair.rgb.host_ts_ns, "mock": False,
+                        "jpeg": pair.rgb.payload,
+                        "width": pair.rgb.width,
+                        "height": pair.rgb.height,
+                        "depth_png": pair.depth.payload,
+                        "depth_width": pair.depth.width,
+                        "depth_height": pair.depth.height,
+                        "delta_ns": pair.delta_ns,
+                        "frame_id": pair.rgb.frame_id,
+                        "depth_frame_id": pair.depth.frame_id,
+                        "rgb_host_ts_ns": pair.rgb.host_ts_ns,
+                        "depth_host_ts_ns": pair.depth.host_ts_ns,
+                        "rgb_device_ts_us": pair.rgb.device_ts_us,
+                        "depth_device_ts_us": pair.depth.device_ts_us,
+                        "depth_unit_to_meter": pair.depth.depth_unit_to_meter,
+                        "rgb_pixel_format_name": pair.rgb.pixel_format_name,
+                        "depth_pixel_format_name": pair.depth.pixel_format_name,
+                        "source": "python-sync",
                     })
-                except queue.Full: self._dropped += 1
 
-            if not self._synced_capture.start(dev, _on_pair):
-                raise RuntimeError("SyncedCapture.start() returned False")
+            if not self._capture_backend.start(_on_pair):
+                raise RuntimeError("Native RGB/Depth backend failed to start")
             self._camera_status = "running"
-            hw_d2c = self._synced_capture.hardware_d2c_active()
+            hw_d2c = self._capture_backend.hardware_d2c_active()
+            self._hardware_d2c_active = hw_d2c
             align_mode = "HW_D2C" if hw_d2c else ("SW_REMAP" if self._align_ready else "NONE")
             self._emit_status(
-                f"Pipeline: started | align={align_mode} | HW_D2C={hw_d2c}")
+                f"Pipeline: started | sync=PYTHON_NEAREST | align={align_mode} | HW_D2C={hw_d2c}")
             return True
         except Exception as e:
             self._camera_status = "error"; self._camera_error = str(e)
             logger.error(f"SyncedCapture start failed: {e}")
             self._emit_status(f"ERROR: SyncedCapture failed: {e}")
-            capture = self._synced_capture
-            self._synced_capture = None
+            capture = self._capture_backend
+            self._capture_backend = None
             if capture is not None:
                 try:
                     capture.stop()
@@ -473,9 +790,10 @@ class SensorPipeline:
             return False
 
     def _stop_real_capture(self):
-        capture = self._synced_capture
-        self._synced_capture = None
+        capture = self._capture_backend
+        self._capture_backend = None
         if capture is None:
+            self._hardware_d2c_active = False
             return
         done = threading.Event()
         failure = []
@@ -494,6 +812,7 @@ class SensorPipeline:
             raise TimeoutError("SyncedCapture.stop timed out after 5 seconds")
         if failure:
             raise RuntimeError(str(failure[0]))
+        self._hardware_d2c_active = False
 
     def _on_camera_status(self, status: str):
         logger.info(f"[Camera] {status}")
@@ -502,43 +821,102 @@ class SensorPipeline:
     # ── Worker loop ───────────────────────────────────────────────
 
     def _worker_loop(self):
+        if self._config.pose.enable_cpu_affinity and hasattr(_os, "sched_setaffinity"):
+            try:
+                _os.sched_setaffinity(0, {int(self._config.pose.pose_cpu)})
+                logger.info(f"bind thread pose_worker to CPU{self._config.pose.pose_cpu}")
+            except (OSError, ValueError) as exc:
+                logger.warn(f"bind thread pose_worker failed: {exc}")
         pose_interval = max(1, self._config.pose.pose_interval)
         while self._running.is_set():
             try: pair = self._pair_queue.get(timeout=0.1)
             except queue.Empty: continue
 
             self._processed += 1; self._pair_since_last += 1; self._pair_id += 1
-            emg_status, emg_rms = self._tick_emg()
+            emg_status, emg_rms, emg_fatigue = self._tick_emg(
+                int(pair.get("ts", 0))
+            )
 
             if pair.get("mock"):
+                depth_unit_to_meter = 0.001
                 pose_2d, pose_3d, bbox = self._synthetic_pose_full()
-                rgb_image = None; depth_image = None
+                rgb_image, depth_image = self._synthetic_images()
+                depth_raw = depth_image
                 pose_ms = 0.0; yolo_ms = 0.0
             else:
+                depth_unit_to_meter = float(pair.get("depth_unit_to_meter", 0.001))
                 jpeg = pair.get("jpeg"); depth_png = pair.get("depth_png")
                 rgb_image = _decode_jpeg_to_rgb(jpeg) if jpeg else None
                 depth_raw = self._decode_depth_png(depth_png)
-                depth_image = self._align_depth(depth_raw)
-                # Re-encode aligned depth for C++ DepthSampler (uses PNG bytes)
-                aligned_png = self._encode_depth_png(depth_image)
+                depth_image = self._align_depth(depth_raw, depth_unit_to_meter)
                 pose_2d, pose_3d, bbox, pose_ms, yolo_ms = \
-                    self._infer_pose_full(jpeg, aligned_png or depth_png, depth_image, pose_interval)
+                    self._infer_pose_full(
+                        jpeg, depth_image, pose_interval, depth_unit_to_meter)
+
+            if self._pair_recorder.stats().recording and all(
+                image is not None for image in (rgb_image, depth_raw, depth_image)
+            ):
+                self._pair_recorder.record(
+                    rgb_image=rgb_image,
+                    depth_raw=depth_raw,
+                    depth_aligned=depth_image,
+                    rgb_frame_id=int(pair.get("frame_id", self._pair_id)),
+                    depth_frame_id=int(pair.get("depth_frame_id", self._pair_id)),
+                    rgb_host_ts_ns=int(pair.get("rgb_host_ts_ns", pair.get("ts", 0))),
+                    depth_host_ts_ns=int(pair.get("depth_host_ts_ns", pair.get("ts", 0))),
+                    rgb_device_ts_us=int(pair.get("rgb_device_ts_us", 0)),
+                    depth_device_ts_us=int(pair.get("depth_device_ts_us", 0)),
+                    delta_ns=int(pair.get("delta_ns", 0)),
+                    align_mode="hardware" if self._hardware_d2c_active else "software",
+                )
+
+            record_write_ms = 0.0
+            if self._recording and not self._recording_paused:
+                if self._recording_options.record_skeleton:
+                    self._record_skeleton(pose_3d, int(pair.get("ts", 0)))
+                record_write_ms = self._video_recorder.record(rgb_image, depth_image)
+            with self._perf_lock:
+                self._last_yolo_ms = yolo_ms
+                self._last_pose_ms = pose_ms
+                self._last_record_write_ms = record_write_ms
+            video_stats = self._video_recorder.stats()
+            raw_j3d = [
+                (point.x, point.y, point.z, point.score, point.valid)
+                for point in self._last_raw_j3d
+            ]
+            ema_j3d = [
+                (point.x, point.y, point.z, point.score, point.valid)
+                for point in self._last_ema_j3d
+            ]
 
             self._preview.submit(
+                pair_id=self._pair_id,
+                rgb_frame_id=int(pair.get("frame_id", self._pair_id)),
+                depth_frame_id=int(pair.get("depth_frame_id", self._pair_id)),
+                host_ts_ns=int(pair.get("rgb_host_ts_ns", pair.get("ts", 0))),
+                rgb_width=int(pair.get("width", self._config.device.rgb_width)),
+                rgb_height=int(pair.get("height", self._config.device.rgb_height)),
+                depth_width=int(pair.get("depth_width", self._config.device.depth_width)),
+                depth_height=int(pair.get("depth_height", self._config.device.depth_height)),
+                pose_interval=pose_interval,
                 joints_2d_raw=pose_2d, joints_3d=pose_3d,
+                raw_joints_3d=raw_j3d, ema_joints_3d=ema_j3d,
                 rgb_fps=self._rgb_fps, depth_fps=self._depth_fps,
                 pair_fps=self._pair_fps, pose_fps=self._pose_fps,
                 yolo_ms=yolo_ms, pose_ms=pose_ms,
+                record_write_ms=record_write_ms,
                 queue_length=self._pair_queue.qsize(),
-                dropped_pairs=self._dropped, delta_ms=0.0, bbox=bbox,
+                dropped_pairs=self._dropped,
+                delta_ms=float(pair.get("delta_ns", 0)) / 1_000_000.0,
+                bbox=bbox,
                 recording=self._recording and not self._recording_paused,
                 skeleton_recording=self._recording and not self._recording_paused,
                 skeleton_frames=self._recorder.stats().frames if self._recording else 0,
+                rgb_frames=video_stats.rgb_frames,
+                depth_frames=video_stats.depth_frames,
                 emg_status=emg_status, emg_rms=emg_rms,
+                emg_fatigue=emg_fatigue,
                 rgb_image=rgb_image, depth_image=depth_image)
-
-            if self._recording and not self._recording_paused:
-                self._record_skeleton(pose_3d)
 
             self._update_performance()
 
@@ -550,117 +928,83 @@ class SensorPipeline:
 
     # ── Calibration & spatial alignment ────────────────────────────
 
-    def _load_calibration(self) -> Optional[dict]:
-        """Return Astra Pro calibration constants from configs/calibration.yaml."""
-        calib_path = _os.path.normpath(_os.path.join(
-            _os.path.dirname(_os.path.dirname(__file__)), "..", "configs", "calibration.yaml"))
-        try:
-            if _os.path.exists(calib_path):
-                import yaml as _yaml  # requires PyYAML (already installed)
-                with open(calib_path, "r") as f:
-                    data = _yaml.safe_load(f)
-                R = data.get("depth_to_rgb_extrinsics", {}).get("R", [])
-                T = data.get("depth_to_rgb_extrinsics", {}).get("T", [])
-                rgb = data.get("rgb_intrinsics", {})
-                depth = data.get("depth_intrinsics", {})
-                if R and T:
-                    return {
-                        "rgb_intrinsics": {"fx": float(rgb.get("fx", 592)), "fy": float(rgb.get("fy", 592)),
-                                           "cx": float(rgb.get("cx", 320)), "cy": float(rgb.get("cy", 240))},
-                        "depth_intrinsics": {"fx": float(depth.get("fx", 576)), "fy": float(depth.get("fy", 575)),
-                                             "cx": float(depth.get("cx", 325)), "cy": float(depth.get("cy", 261))},
-                        "R": [float(x) for x in R], "T": [float(x) for x in T],
-                        "width": 640, "height": 480,
-                    }
-        except Exception as e:
-            logger.warn(f"YAML calibration load failed ({e}), using hardcoded defaults")
+    def _calibration_path(self) -> str:
+        configured = str(getattr(self._config, "calibration_file", "")).strip()
+        if configured:
+            path = Path(configured).expanduser()
+            if not path.is_absolute():
+                path = Path(__file__).resolve().parent.parent / path
+            return str(path.resolve())
+        python_root = Path(__file__).resolve().parent.parent
+        candidates = [
+            python_root / "configs" / "calibration.yaml",
+            python_root.parent / "stroke-rehab" / "configs" / "calibration.yaml",
+        ]
+        return str(next((path for path in candidates if path.is_file()), candidates[0]))
 
-        # Hardcoded fallback (same values as calibration.yaml)
+    def _load_calibration(self) -> Optional[dict]:
+        calibration = load_registration_calibration(self._calibration_path())
+        if calibration is None:
+            return None
         return {
-            "rgb_intrinsics": {"fx": 592.966, "fy": 591.582, "cx": 319.775, "cy": 252.137},
-            "depth_intrinsics": {"fx": 575.688, "fy": 574.712, "cx": 325.402, "cy": 260.708},
-            "R": [0.999665, -0.025406, 0.004879, 0.025396, 0.999675, 0.002035, -0.004930, -0.001910, 0.999986],
-            "T": [26.476, 3.024, -2.781],
-            "width": 640, "height": 480,
+            "rgb_intrinsics": {
+                "fx": calibration.rgb.fx,
+                "fy": calibration.rgb.fy,
+                "cx": calibration.rgb.cx,
+                "cy": calibration.rgb.cy,
+            },
+            "depth_intrinsics": {
+                "fx": calibration.depth.fx,
+                "fy": calibration.depth.fy,
+                "cx": calibration.depth.cx,
+                "cy": calibration.depth.cy,
+            },
+            "R": calibration.rotation.reshape(-1).tolist(),
+            "T": calibration.translation_m.tolist(),
+            "width": calibration.rgb.width or self._config.device.rgb_width,
+            "height": calibration.rgb.height or self._config.device.rgb_height,
         }
 
-    def _build_alignment_remap(self, calib: Optional[dict]):
-        """Precompute cv2.remap LUT for depth → RGB spatial alignment.
-
-        Uses inverse projection: for each RGB pixel, find the corresponding
-        depth-pixel source.  Approximates Z = 1.5 m (negligible parallax
-        error for rehab-range distances with Astro Pro's 25 mm baseline).
-        """
-        self._align_ready = False
-        if calib is None or np is None:
-            return
-        try:
-            import cv2
-            w, h = calib["width"], calib["height"]
-            Z_REF = 1.5  # metres
-
-            R = np.array(calib["R"]).reshape(3, 3).astype(np.float64)
-            T = np.array(calib["T"]).reshape(3, 1).astype(np.float64)
-            R_inv = R.T
-            Kd = np.array([[calib["depth_intrinsics"]["fx"], 0, calib["depth_intrinsics"]["cx"]],
-                           [0, calib["depth_intrinsics"]["fy"], calib["depth_intrinsics"]["cy"]],
-                           [0, 0, 1]], dtype=np.float64)
-            Kr = np.array([[calib["rgb_intrinsics"]["fx"], 0, calib["rgb_intrinsics"]["cx"]],
-                           [0, calib["rgb_intrinsics"]["fy"], calib["rgb_intrinsics"]["cy"]],
-                           [0, 0, 1]], dtype=np.float64)
-
-            # For each RGB output pixel, inverse-project to 3D, then to depth pixel
-            ur = np.arange(w, dtype=np.float32)
-            vr = np.arange(h, dtype=np.float32)
-            ur_grid, vr_grid = np.meshgrid(ur, vr)  # (h, w) — RGB grid
-
-            # RGB pixel → 3D ray (at Z_REF)
-            Xr = (ur_grid - Kr[0, 2]) * Z_REF / Kr[0, 0]
-            Yr = (vr_grid - Kr[1, 2]) * Z_REF / Kr[1, 1]
-            Zr = np.full_like(Xr, Z_REF)
-
-            # Transform to depth camera frame: P_d = R^T · (P_r - T)
-            pts_r = np.stack([Xr, Yr, Zr], axis=-1).reshape(-1, 3).T  # (3, h*w)
-            pts_d = R_inv @ (pts_r - T)  # (3, h*w)
-            pts_d = pts_d.reshape(3, h, w)
-            Zd = np.maximum(pts_d[2], 1e-6)
-            ud = (pts_d[0] / Zd) * Kd[0, 0] + Kd[0, 2]
-            vd = (pts_d[1] / Zd) * Kd[1, 1] + Kd[1, 2]
-
-            # Clamp to image bounds
-            map_x = np.clip(ud, 0, w - 1).astype(np.float32)
-            map_y = np.clip(vd, 0, h - 1).astype(np.float32)
-
-            self._align_map_x = map_x
-            self._align_map_y = map_y
-            self._align_ready = True
-            logger.info(f"Alignment remap built: depth({w}x{h}) → RGB")
-        except Exception as e:
-            logger.warn(f"Failed to build alignment remap: {e}")
-            self._align_ready = False
-
-    def _align_depth(self, depth_image):
-        """Warp depth to RGB coordinate frame using precomputed remap LUT."""
-        if depth_image is None or not self._align_ready or np is None:
+    def _align_depth(self, depth_image, depth_unit_to_meter: float = 0.001):
+        """Align depth to RGB using hardware D2C or calibrated point projection."""
+        if depth_image is None or np is None:
             return depth_image
-        try:
-            import cv2
-            aligned = cv2.remap(depth_image, self._align_map_x, self._align_map_y,
-                                cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            return aligned
-        except Exception:
+        if self._capture_backend is not None and not self._hardware_d2c_active:
+            self._hardware_d2c_active = self._capture_backend.hardware_d2c_active()
+        if self._hardware_d2c_active:
             return depth_image
+        if self._software_aligner is None:
+            self._software_aligner = SoftwareRegistrationAligner(
+                load_registration_calibration(self._calibration_path())
+            )
+        return self._software_aligner.align(
+            depth_image,
+            (self._config.device.rgb_width, self._config.device.rgb_height),
+            depth_unit_to_meter,
+        )
 
     # ── Full ONNX pose inference ──────────────────────────────────
 
-    def _infer_pose_full(self, jpeg, depth_png, depth_image, pose_interval):
+    def _infer_pose_full(
+        self, jpeg, depth_image, pose_interval, depth_unit_to_meter: float = 0.001
+    ):
         # If pose is disabled or models aren't ready, return last cached skeleton
         if jpeg is None or not self._pose_models_ready:
             return self._last_j2d, self._last_j3d, self._last_bbox, 0.0, 0.0
 
         self._frame_counter += 1
-        if self._frame_counter % pose_interval != 0:
-            # ── Skip: reuse last cached skeleton (no flicker) ──
+        should_run_pose = (
+            not self._last_j2d
+            or not self._config.pose.enable_pose_reuse
+            or self._frame_counter % max(1, pose_interval) == 0
+        )
+        if not should_run_pose:
+            # Match the original pipeline: reuse 2D, but sample the current
+            # aligned depth so the 3D skeleton is not frozen between inferences.
+            if self._last_j2d and depth_image is not None:
+                self._last_j3d = self._lift_pose_to_3d(
+                    self._last_j2d, depth_image, self._last_bbox,
+                    time.monotonic_ns(), depth_unit_to_meter)
             return self._last_j2d, self._last_j3d, self._last_bbox, 0.0, 0.0
 
         # ── Run full ONNX inference ──
@@ -668,58 +1012,129 @@ class SensorPipeline:
         bbox = None; pose_ms = 0.0; yolo_ms = 0.0
 
         try:
-            # 1. YOLO
-            t0 = time.monotonic()
-            box = self._person_detector.detect_largest_person_jpeg(jpeg) if self._person_detector else None
-            yolo_ms = (time.monotonic() - t0) * 1000.0
+            if self._python_inference:
+                import cv2
+                bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if bgr is None:
+                    raise ValueError("cannot decode RGB JPEG for Python inference")
+                t0 = time.monotonic()
+                box = (
+                    self._roi_tracker.get_primary_box(bgr)
+                    if self._roi_tracker is not None
+                    else PythonBoundingBox(
+                        0.0, 0.0, float(bgr.shape[1]), float(bgr.shape[0]), 1.0, True
+                    )
+                )
+                yolo_ms = (time.monotonic() - t0) * 1000.0
+                if not box.valid:
+                    box = PythonBoundingBox(
+                        0.0, 0.0, float(bgr.shape[1]), float(bgr.shape[0]), 1.0, True
+                    )
+                result = self._pose_estimator.infer(bgr, box)
+                pose_ms = result.pose_ms
+                if self._roi_tracker is not None:
+                    self._roi_tracker.update_from_pose(result.used_box, result.keypoints)
+                if not result.model_loaded:
+                    return self._last_j2d, self._last_j3d, self._last_bbox, pose_ms, yolo_ms
+                rehab_points = map_halpe26_to_rehab22(result.keypoints)
+                used = result.used_box
+                if used.valid:
+                    bbox = (
+                        used.x, used.y, used.w, used.h, True,
+                        self._roi_tracker.debug_state if self._roi_tracker else "full_fallback",
+                    )
+            else:
+                t0 = time.monotonic()
+                box = (
+                    self._person_detector.detect_largest_person_jpeg(jpeg)
+                    if self._person_detector
+                    else None
+                )
+                yolo_ms = (time.monotonic() - t0) * 1000.0
+                t1 = time.monotonic()
+                if box:
+                    bb = _engine.BoundingBox2D()
+                    bb.x = box.x; bb.y = box.y; bb.w = box.w; bb.h = box.h
+                    bb.valid = box.valid; bb.score = box.score
+                    self._pose_estimator.set_bounding_box_provider_fallback(bb)
+                result = self._pose_estimator.infer_jpeg(jpeg)
+                pose_ms = (time.monotonic() - t1) * 1000.0
+                if result is None or not result.model_loaded:
+                    return self._last_j2d, self._last_j3d, self._last_bbox, pose_ms, yolo_ms
+                rehab_points = self._halpe_mapper.map(result.keypoints)
+                used = result.used_box
+                if used.valid:
+                    bbox = (used.x, used.y, used.w, used.h, True, "detect")
 
-            # 2. RTMPose
-            t1 = time.monotonic()
-            if box:
-                bb = _engine.BoundingBox2D()
-                bb.x = box.x; bb.y = box.y; bb.w = box.w; bb.h = box.h
-                bb.valid = box.valid; bb.score = box.score
-                self._pose_estimator.set_bounding_box_provider_fallback(bb)
-            result = self._pose_estimator.infer_jpeg(jpeg)
-            pose_ms = (time.monotonic() - t1) * 1000.0
-
-            if result is None or not result.model_loaded:
-                return self._last_j2d, self._last_j3d, self._last_bbox, pose_ms, yolo_ms
-
-            # 3. Halpe26 → Rehab22
-            rehab2d = self._halpe_mapper.map(result.keypoints)
-
-            # 4. Depth → 3D
-            depth_meters = [0.0] * 22
-            if depth_png is not None and self._joint_projector.intrinsics_valid():
-                depth_meters = self._depth_sampler.sample_png(depth_png, rehab2d, 0.001)
-
-            j3d_raw = self._joint_projector.project(rehab2d, depth_meters)
-            kn = time.monotonic()
-            dt = max(0.001, kn - self._last_pose_time) if self._last_pose_time > 0 else 0.033
-            j3d_ema = self._ema_filter.filter(j3d_raw, dt)
-            j3d_smooth = self._smoother.smooth(j3d_ema)
-            self._last_pose_time = kn
-
-            for i in range(22):
-                k = j3d_smooth[i]
-                j3d.append((k.x, k.y, k.z, k.score, k.valid))
-            for i in range(22):
-                k = rehab2d[i]
-                j2d.append((k.x, k.y, k.score, k.valid))
-
-            used = result.used_box
-            if used.valid:
-                bbox = (used.x, used.y, used.w, used.h, True, "detect")
+            rehab2d = make_rehab22_joints(rehab_points, self._config.pose.min_score)
+            j2d = [(p.x, p.y, p.score, p.valid) for p in rehab2d]
+            j3d = self._lift_pose_to_3d(
+                rehab2d, depth_image, bbox, time.monotonic_ns(),
+                depth_unit_to_meter)
 
         except Exception as e:
             logger.warn(f"Pose inference error: {e}")
             return self._last_j2d, self._last_j3d, self._last_bbox, 0.0, 0.0
 
         # ── Cache for skipped frames ──
-        self._last_j2d, self._last_j3d, self._last_bbox = j2d, j3d, bbox
         self._pose_count += 1; self._pose_since_last += 1
+        if any(point[3] for point in j2d):
+            self._last_j2d, self._last_j3d, self._last_bbox = j2d, j3d, bbox
+        else:
+            self._last_j2d = self._last_j3d = []
+            self._last_bbox = None
+            self._ema_filter.reset()
+            self._smoother.reset()
         return j2d, j3d, bbox, pose_ms, yolo_ms
+
+    def _lift_pose_to_3d(
+        self, points, depth_image, bbox, timestamp_ns,
+        depth_unit_to_meter: float = 0.001,
+    ):
+        rehab2d = make_rehab22_joints(points, self._config.pose.min_score)
+        if depth_image is None or not self._joint_projector.intrinsics_valid():
+            self._last_rehab2d = rehab2d
+            self._last_depth_debug = []
+            self._last_raw_j3d = []
+            self._last_ema_j3d = []
+            self._last_ema_debug = []
+            return [(0.0, 0.0, 0.0, point.score, False) for point in rehab2d]
+        roi = None
+        if bbox and len(bbox) >= 5 and bbox[4]:
+            roi = tuple(int(round(value)) for value in bbox[:4])
+        samples = self._depth_sampler.sample_skeleton(
+            depth_image, rehab2d, depth_unit_to_meter, roi)
+        raw = self._joint_projector.project(rehab2d, samples)
+        self._last_rehab2d = rehab2d
+        self._last_depth_debug = samples
+        self._last_raw_j3d = raw
+        now = timestamp_ns / 1.0e9
+        dt = max(0.001, now - self._last_pose_time) if self._last_pose_time > 0 else (
+            1.0 / max(1, self._config.device.rgb_fps))
+        mode = str(self._config.skeleton_filter.mode).lower()
+        if not self._config.pose.enable_smoothing or mode == "none":
+            filtered = raw
+            ema_debug = [
+                {"alpha": 1.0, "reason": "smoothing_disabled", "invalid_hold_count": 0}
+                for _ in range(22)
+            ]
+        elif mode == "legacy_stabilizer":
+            filtered, _ = self._smoother.smooth(raw, timestamp_ns)
+            ema_debug = [
+                {"alpha": self._config.pose.smoothing_alpha,
+                 "reason": "legacy_stabilizer", "invalid_hold_count": 0}
+                for _ in range(22)
+            ]
+        else:
+            filtered = self._ema_filter.filter(raw, dt)
+            ema_debug = self._ema_filter.last_debug
+        self._last_ema_j3d = filtered
+        self._last_ema_debug = ema_debug
+        self._last_pose_time = now
+        return [
+            (point.x, point.y, point.z, point.score, point.valid)
+            for point in filtered
+        ]
 
     # ── Helpers ───────────────────────────────────────────────────
 
@@ -731,34 +1146,77 @@ class SensorPipeline:
             return cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
         except Exception: return None
 
+    def _tick_emg(self, host_ts_ns: int = 0):
+        status = self._emg.runtime_status()
+        frame = (
+            self._emg.nearest_feature(host_ts_ns, 300_000_000)
+            if host_ts_ns > 0
+            else self._emg.latest_feature()
+        )
+        if frame is None:
+            return self._format_emg_status(status), [], []
+        return (
+            self._format_emg_status(status),
+            [channel.rms for channel in frame.channels],
+            [channel.fatigue_index for channel in frame.channels],
+        )
+
     @staticmethod
-    def _encode_depth_png(depth_img):
-        """Encode aligned (or raw) depth back to PNG for C++ DepthSampler."""
-        if depth_img is None or np is None: return None
-        try:
-            import cv2
-            ok, buf = cv2.imencode(".png", depth_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-            return bytes(buf) if ok else None
-        except Exception: return None
+    def _format_emg_status(status) -> str:
+        return (
+            f"mode={status.mode} "
+            f"rpmsg={'connected' if status.rpmsg_connected else 'off'} "
+            f"ble={'connected' if status.ble_connected else 'off'} "
+            f"{status.message}"
+        ).strip()
 
-    def _tick_emg(self):
-        if not self._config.emg.enabled: return "disabled", []
-        if self._config.emg.mode == "mock":
-            phase = time.monotonic()
-            return "mock", [900 + 420 * abs(math.sin(phase * 2.1)),
-                            760 + 360 * abs(math.sin(phase * 1.8 + 0.7))]
-        return "waiting for real EMG data", []
-
-    def _record_skeleton(self, pose_3d):
-        ts = time.monotonic_ns(); joints = []
+    def _record_skeleton(self, pose_3d, timestamp_ns: int = 0):
+        ts = timestamp_ns or time.monotonic_ns(); joints = []
         for j in pose_3d:
             score = j[3] if len(j) > 3 else 1.0
             valid = 1 if (j[4] if len(j) > 4 else False) else 0
             joints.append([j[0], j[1], j[2], score, valid])
+        if self._recording_options.record_valid_3d_only and not any(
+            bool(joint[4]) for joint in joints
+        ):
+            return
         self._recorder.record(
             timestamp_ns=ts, frame_id=self._pair_id, pair_id=self._pair_id,
             dt_seconds=0.033, bbox_mode="full" if not self._stub_mode else "mock",
-            joints_3d=joints)
+            joints_3d=joints,
+            joints_2d=self._last_rehab2d,
+            raw_joints_3d=self._last_raw_j3d,
+            ema_joints_3d=self._last_ema_j3d,
+            depth_debug=self._last_depth_debug,
+            ema_debug=self._last_ema_debug,
+        )
+
+    def _synthetic_images(self):
+        if np is None:
+            return None, None
+        width = max(1, int(self._config.device.rgb_width))
+        height = max(1, int(self._config.device.rgb_height))
+        rgb = np.full((height, width, 3), 30, dtype=np.uint8)
+        depth = np.fromfunction(
+            lambda y, x: ((x + y + self._pair_id) % 4000) + 500,
+            (height, width),
+            dtype=int,
+        ).astype(np.uint16)
+        try:
+            import cv2
+            cv2.putText(
+                rgb,
+                f"RGB fallback frame_id={self._pair_id}",
+                (20, height // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        except Exception:
+            pass
+        return rgb, depth
 
     def _synthetic_pose_full(self):
         t = time.monotonic()

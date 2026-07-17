@@ -116,3 +116,40 @@ QT_QPA_PLATFORM=offscreen python test_ui.py
 - 正式训练前应确认患者站位、遮挡、相机距离和关节有效率。
 - 停止或完成训练会统一关闭课程计时器、评分进程、录制器和传感器流水线。
 - 本项目用于康复训练辅助和技术研究，不替代治疗师判断或医疗诊断。
+
+## Python ONNX 模型部署
+
+检测和姿态模型现在可由 Python ONNX Runtime 直接运行，原生 `_core` 作为相机、深度和可选 native 推理适配器。模型路径、Execution Provider、线程数及 `python/native/auto` 后端选择见 [`docs/model_deployment.md`](docs/model_deployment.md)。
+
+安装依赖后可执行真实模型自检：
+
+```bash
+python verify_models.py
+python test_inference.py
+```
+
+## Python 主框架迁移
+
+当前 Python 层已经拥有配置、采集生命周期、RGB/Depth 时间戳同步、处理队列、深度软件配准、ONNX 推理以及 EMG 协议和 RPMsg 调度。`_core` 保留为 V4L2/OpenNI 等底层驱动及可选 native 推理适配器，不再作为主程序控制层。
+
+- 采集、同步与深度对齐：[`docs/capture_pipeline.md`](docs/capture_pipeline.md)
+- BLE/串口 EMG 与 CPU1 RPMsg：[`docs/emg_pipeline.md`](docs/emg_pipeline.md)
+- Python ONNX 模型部署：[`docs/model_deployment.md`](docs/model_deployment.md)
+- 非阻塞训练语音：[`docs/voice_assistant.md`](docs/voice_assistant.md)
+
+核心逻辑回归：
+
+```bash
+python test_capture.py
+python test_alignment.py
+python test_emg.py
+python test_inference.py
+python test_pose3d.py
+python test_scoring.py
+python test_voice.py
+python test_stage2.py
+python test_workflows.py
+QT_QPA_PLATFORM=offscreen python test_ui.py
+```
+
+真实相机、OpenNI 硬件 D2C、蓝牙射频、RFCOMM、remoteproc/RPMsg 与 CPU1 特征结果必须在目标 Linux 板上另行验收；桌面测试通过不能替代上板验证。

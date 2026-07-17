@@ -7,6 +7,17 @@ depth_capture:
   height: 480
   fps: 30
 
+pose:
+  inference_backend: "python"
+  onnx_execution_provider: "auto"
+  onnx_intra_op_threads: 1
+  onnx_inter_op_threads: 1
+  detector_input_size: 320
+  detector_conf_threshold: 0.35
+  detector_nms_threshold: 0.45
+  min_score: 0.15
+  pose_interval: 6
+
 depth_sampler:
   min_depth_mm: 300
   max_depth_mm: 5000
@@ -42,3 +53,11 @@ debug:
   save_depth_sampling_overlay: false
   save_skeleton_raw_csv: true
   save_skeleton_ema_csv: true
+
+voice:
+  enabled: true
+  backend: "auto"
+  rate: 175
+  volume: 0.9
+  cooldown_seconds: 2.0
+  queue_size: 12

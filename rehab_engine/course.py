@@ -4,7 +4,10 @@ Replaces core/course/CourseRepository.cpp + CourseRunner.cpp.
 Pure Python, no Qt dependency.
 """
 
+from __future__ import annotations
+
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -71,36 +74,61 @@ class CourseRepository:
             self._last_error = f"Course config not found: {path}"
             return False
 
+        self._courses = []
+        self._last_error = ""
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
-            self._courses = []
-            for obj in data.get("courses", []):
-                course = Course(
-                    course_id=obj.get("course_id", ""),
-                    course_name=obj.get("course_name", ""),
-                    category=obj.get("category", ""),
-                    difficulty=obj.get("difficulty", 0),
-                    estimated_minutes=obj.get("estimated_minutes", 0),
-                    description=obj.get("description", ""),
-                )
-                for action_obj in obj.get("actions", []):
-                    action = CourseAction(
-                        order=action_obj.get("order", 0),
-                        action_id=action_obj.get("action_id", ""),
-                        movement_id=action_obj.get("movement_id", ""),
-                        name_cn=action_obj.get("name_cn", ""),
-                        name_en=action_obj.get("name_en", ""),
-                        target_reps=action_obj.get("target_reps", 0),
-                        rest_sec_after=action_obj.get("rest_sec_after", 0),
-                        side_mode=action_obj.get("side_mode", "none"),
-                    )
-                    course.actions.append(action)
-                self._courses.append(course)
+            entries = data.get("courses", []) if isinstance(data, dict) else data
+            if not isinstance(entries, list) or not entries:
+                raise ValueError(f"课程配置为空: {path}")
+            loaded = [self._parse_course(obj) for obj in entries]
+            self._courses = loaded
             self._config_path = path
             return True
-        except (json.JSONDecodeError, KeyError) as e:
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             self._last_error = str(e)
+            self._courses = []
             return False
+
+    def _parse_course(self, obj) -> Course:
+        if not isinstance(obj, dict):
+            raise ValueError("课程配置包含非对象条目")
+        course = Course(
+            course_id=str(obj.get("course_id", "")).strip(),
+            course_name=str(obj.get("course_name", "")).strip(),
+            category=str(obj.get("category", "")).strip(),
+            difficulty=int(obj.get("difficulty", 0) or 0),
+            estimated_minutes=int(obj.get("estimated_minutes", 0) or 0),
+            description=str(obj.get("description", "")),
+        )
+        if not course.course_id or not course.course_name:
+            raise ValueError("课程缺少 course_id 或 course_name")
+        actions = obj.get("actions", [])
+        if not isinstance(actions, list) or not actions:
+            raise ValueError(f"课程 {course.course_id} 没有动作")
+        for action_obj in actions:
+            if not isinstance(action_obj, dict):
+                raise ValueError(f"课程 {course.course_id} 包含非对象动作")
+            side_mode = str(action_obj.get("side_mode", "none")).strip() or "none"
+            action = CourseAction(
+                order=int(action_obj.get("order", 0) or 0),
+                action_id=str(action_obj.get("action_id", "")).strip(),
+                movement_id=str(action_obj.get("movement_id", "")).strip(),
+                name_cn=str(action_obj.get("name_cn", "")).strip(),
+                name_en=str(action_obj.get("name_en", "")).strip(),
+                target_reps=int(action_obj.get("target_reps", 0) or 0),
+                rest_sec_after=int(action_obj.get("rest_sec_after", 0) or 0),
+                side_mode=side_mode,
+            )
+            if not self.is_valid_action_id(action.action_id):
+                raise ValueError(
+                    f"课程 {course.course_id} 的动作 {action.action_id} 非法，P-Coder 只接受 M1-M10")
+            if action.order <= 0 or action.target_reps <= 0:
+                raise ValueError(
+                    f"课程 {course.course_id} 的动作 {action.action_id} 缺少合法 order 或 target_reps")
+            course.actions.append(action)
+        course.actions.sort(key=lambda action: action.order)
+        return course
 
     @property
     def courses(self) -> List[Course]:
@@ -119,13 +147,17 @@ class CourseRepository:
 
     @staticmethod
     def _canonical(course_id: str) -> str:
-        return course_id.strip().lower()
+        course_id = course_id.strip()
+        aliases = {
+            "shoulder_basic": "upper_limb_shoulder_rom_basic",
+            "lower_limb_stability": "lower_limb_balance_transfer_basic",
+        }
+        return aliases.get(course_id, course_id)
 
     @staticmethod
     def is_valid_action_id(action_id: str) -> bool:
         """Check if action_id matches the M1-M10 pattern."""
-        import re
-        return bool(re.match(r'^M([1-9]|10)$', action_id))
+        return bool(re.fullmatch(r'M([1-9]|10)', action_id.strip()))
 
     @staticmethod
     def default_config_path() -> str:
@@ -221,7 +253,14 @@ class CourseRunner:
     def stop_course(self) -> None:
         with self._state_lock:
             self._cancel_rest_timer()
-            self._set_state(RunnerState.FINISHED)
+            self._course = None
+            self._action_index = -1
+            self._rest_remaining = 0
+            self._actual_reps = 0
+            self._score_sum = 0.0
+            self._score_samples = 0
+            self._state_before_pause = RunnerState.IDLE
+            self._set_state(RunnerState.IDLE)
 
     def pause_course(self) -> bool:
         """Pause scoring progression and preserve an active rest countdown."""
@@ -258,9 +297,18 @@ class CourseRunner:
             if action is None:
                 return
 
-            self._actual_reps = max(self._actual_reps, score.completed_count)
-            self._score_sum += score.overall_score if score.count > 0 else 0.0
-            self._score_samples += 1
+            # Preserve the original runner's tolerance for the scorer briefly
+            # reporting a detected centre before the completed cycle count.
+            reported = max(score.count, score.completed_count)
+            if reported > self._actual_reps + 1:
+                self._actual_reps += 1
+            else:
+                self._actual_reps = max(self._actual_reps, reported)
+
+            # Only completed cycles carry a meaningful last_cycle score.
+            if score.status == "new_completed_cycle":
+                self._score_sum += score.overall_score
+                self._score_samples += 1
 
             if self._actual_reps >= action.target_reps > 0:
                 self._complete_current_action()

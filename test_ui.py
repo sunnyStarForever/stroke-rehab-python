@@ -5,6 +5,7 @@ Run: /d/miniforge3/envs/stroke-rehab/python.exe test_ui.py
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -49,6 +50,12 @@ print("  ReportsPage import: OK")
 from ui.pages.settings_page import SettingsPage
 print("  SettingsPage import: OK")
 
+from ui.pages.patient_home_page import CourseCard, PatientHomePage
+print("  PatientHomePage import: OK")
+
+from ui.dialogs import LogDialog, LogEntry, PerformanceDialog
+print("  Runtime dialogs import: OK")
+
 # 3. Main window import
 print("\n[3] MainWindow")
 from ui.main_window import StrokeRehabWindow
@@ -68,13 +75,36 @@ print("  ReportsPage instantiated: OK")
 settings_page = SettingsPage(cfg)
 print("  SettingsPage instantiated: OK")
 
+home_page = PatientHomePage(cfg)
+assert home_page.findChildren(CourseCard)
+print("  PatientHomePage instantiated: OK")
+
+log_dialog = LogDialog()
+log_dialog.append_entry(LogEntry("12:00:00", "INFO", "pipeline ready"))
+log_dialog.append_entry(LogEntry("12:00:01", "ERROR", "camera failed"))
+assert len(log_dialog.entries) == 2
+log_dialog._level_combo.setCurrentText("错误")
+assert "camera failed" in log_dialog._log_edit.toPlainText()
+assert "pipeline ready" not in log_dialog._log_edit.toPlainText()
+performance_dialog = PerformanceDialog()
+performance_dialog.set_snapshot({"rgb_fps": 30.0, "pose_ms": 12.5})
+assert performance_dialog._labels["rgb_fps"].text() == "30.0"
+assert performance_dialog._labels["pose_ms"].text() == "12.5 ms"
+print("  Runtime dialogs instantiated: OK")
+
 # Test main window instantiation (without show)
 mw = StrokeRehabWindow()
 print("  StrokeRehabWindow instantiated: OK")
 assert mw.findChild(TrainingPage) is not None
 assert mw.findChild(ReportsPage) is not None
 assert mw.findChild(SettingsPage) is not None
-print("  Navigation pages: 3")
+assert mw.findChild(PatientHomePage) is not None
+course_card = mw.findChildren(CourseCard)[0]
+with patch("ui.main_window.save_pipeline_config"):
+    mw._open_course(course_card.course.course_id)
+assert mw._config.selected_course_id == course_card.course.course_id
+assert mw.stackedWidget.currentWidget() is mw.findChild(TrainingPage)
+print("  Navigation pages: 4")
 
 print()
 print("=" * 50)

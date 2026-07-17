@@ -1,362 +1,239 @@
-"""
-System diagnostics module — checks hardware, engine, and environment status.
-Run at startup to provide clear feedback about what's working and what's not.
-"""
+"""Python-main runtime diagnostics with platform-aware hardware checks."""
 
+from __future__ import annotations
+
+import importlib
+import importlib.metadata
 import os
-import sys
 import platform
+import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 @dataclass
 class DiagItem:
     name: str
-    status: str          # "OK", "WARN", "ERROR", "DISABLED"
+    status: str
     detail: str = ""
     hint: str = ""
 
 
 @dataclass
 class Diagnostics:
-    """Complete system diagnostic report."""
     items: List[DiagItem] = field(default_factory=list)
 
     def add(self, name: str, status: str, detail: str = "", hint: str = ""):
         self.items.append(DiagItem(name, status, detail, hint))
 
     def summary(self) -> str:
-        ok = sum(1 for i in self.items if i.status == "OK")
-        warn = sum(1 for i in self.items if i.status == "WARN")
-        err = sum(1 for i in self.items if i.status == "ERROR")
-        disabled = sum(1 for i in self.items if i.status == "DISABLED")
-        parts = []
-        if ok:
-            parts.append(f"{ok} OK")
-        if warn:
-            parts.append(f"{warn} 警告")
-        if err:
-            parts.append(f"{err} 错误")
-        if disabled:
-            parts.append(f"{disabled} 已禁用")
-        return ", ".join(parts) if parts else "未检测"
+        labels = (("OK", "正常"), ("WARN", "警告"), ("ERROR", "错误"),
+                  ("DISABLED", "未启用"))
+        parts = [f"{sum(item.status == status for item in self.items)}项{label}"
+                 for status, label in labels
+                 if any(item.status == status for item in self.items)]
+        return " / ".join(parts) if parts else "未检测"
 
     def all_ok(self) -> bool:
-        return all(i.status in ("OK", "DISABLED") for i in self.items)
+        return all(item.status in ("OK", "DISABLED") for item in self.items)
 
     def errors(self) -> List[DiagItem]:
-        return [i for i in self.items if i.status == "ERROR"]
+        return [item for item in self.items if item.status == "ERROR"]
 
     def warnings(self) -> List[DiagItem]:
-        return [i for i in self.items if i.status == "WARN"]
+        return [item for item in self.items if item.status == "WARN"]
 
     def format_lines(self, ascii_only: bool = False) -> List[str]:
-        lines = []
-        if ascii_only:
-            emoji = {"OK": "  [PASS]", "WARN": "  [WARN]", "ERROR": "  [FAIL]", "DISABLED": "  [OFF]"}
-        else:
-            # Try Unicode, fall back to ASCII if stdout doesn't support it
-            try:
-                '✓'.encode(sys.stdout.encoding or 'utf-8')
-            except (UnicodeEncodeError, LookupError):
-                ascii_only = True
-                emoji = {"OK": "  [PASS]", "WARN": "  [WARN]", "ERROR": "  [FAIL]", "DISABLED": "  [OFF]"}
-            else:
-                emoji = {"OK": "  ✓", "WARN": "  ⚠", "ERROR": "  ✗", "DISABLED": "  ○"}
-        for item in self.items:
-            prefix = emoji.get(item.status, "  ?")
-            line = f"{prefix} {item.name}: {item.detail}"
-            if item.hint:
-                line += f"  ({item.hint})"
-            lines.append(line)
-        return lines
+        markers = ({"OK": "[PASS]", "WARN": "[WARN]", "ERROR": "[FAIL]",
+                    "DISABLED": "[OFF]"} if ascii_only else
+                   {"OK": "✓", "WARN": "⚠", "ERROR": "✗", "DISABLED": "○"})
+        return [
+            f"  {markers.get(item.status, '?')} {item.name}: {item.detail}"
+            + (f"（{item.hint}）" if item.hint else "")
+            for item in self.items
+        ]
 
 
-def _find_project_root() -> Path:
-    root = os.environ.get("STROKE_REHAB_ROOT")
-    if root:
-        return Path(root)
-    p = Path(__file__).resolve().parent  # rehab_engine/
-    for _ in range(5):
-        if (p / "python_version").is_dir() and (p / "configs").is_dir():
-            return p
-        if (p / "configs").is_dir():
-            return p
-        p = p.parent
-    return Path.cwd()
+def _python_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _repo_root() -> Path:
+    return _python_root().parent
+
+
+def _configured_project_root() -> Optional[Path]:
+    raw = os.environ.get("STROKE_REHAB_ROOT", "").strip()
+    return Path(raw).expanduser().resolve() if raw else None
+
+
+def _stroke_root() -> Path:
+    configured = _configured_project_root()
+    candidates = []
+    if configured:
+        candidates.extend((configured, configured / "stroke-rehab"))
+    candidates.extend((_repo_root() / "stroke-rehab", _python_root()))
+    return next((path for path in candidates if (path / "including").is_dir()), candidates[0])
 
 
 def _check_file(path: Path) -> Tuple[bool, str]:
-    if path.exists():
-        size_mb = path.stat().st_size / (1024 * 1024)
-        return True, f"{path} ({size_mb:.1f} MB)"
-    return False, f"不存在: {path}"
+    if path.is_file():
+        return True, f"{path}（{path.stat().st_size / 1024 / 1024:.1f} MB）"
+    return False, f"不存在：{path}"
+
+
+def _package_version(module_name: str) -> Tuple[bool, str]:
+    distribution_names = {
+        "cv2": ("opencv-python", "opencv-contrib-python", "opencv-python-headless"),
+        "yaml": ("PyYAML",),
+        "PyQt5": ("PyQt5",),
+        "qfluentwidgets": ("PyQt-Fluent-Widgets",),
+        "serial": ("pyserial",),
+    }.get(module_name, (module_name,))
+    for distribution_name in distribution_names:
+        try:
+            return True, importlib.metadata.version(distribution_name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    try:
+        module = importlib.import_module(module_name)
+        return True, str(getattr(module, "__version__", "已安装"))
+    except Exception as exc:
+        return False, str(exc)
 
 
 def run_diagnostics(config=None) -> Diagnostics:
-    """
-    Run a comprehensive system diagnostic.
+    if config is None:
+        try:
+            from .config_loader import load_pipeline_config
+            config = load_pipeline_config()
+        except Exception:
+            config = None
 
-    Returns a Diagnostics object that can be printed to console
-    or displayed in the UI.
-    """
-    d = Diagnostics()
-    root = _find_project_root()
+    diagnostics = Diagnostics()
+    python_root = _python_root()
+    stroke_root = _stroke_root()
 
-    # ================================================================
-    # 1. Platform
-    # ================================================================
-    d.add("操作系统", "OK",
-          f"{platform.system()} {platform.release()}",
-          f"架构: {platform.machine()}")
+    diagnostics.add("操作系统", "OK", f"{platform.system()} {platform.release()} / {platform.machine()}")
+    diagnostics.add("Python", "OK", f"{platform.python_version()} / {sys.executable}")
 
-    # ================================================================
-    # 2. Python environment
-    # ================================================================
-    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    py_arch = "64-bit" if sys.maxsize > 2**32 else "32-bit"
-    d.add("Python 版本", "OK", f"Python {py_ver} ({py_arch})")
-    d.add("Python 路径", "OK", sys.executable)
-
-    # Check if we're in a conda environment
-    conda_env = os.environ.get("CONDA_DEFAULT_ENV", "")
-    if conda_env:
-        d.add("Conda 环境", "OK", conda_env)
-    else:
-        d.add("Conda 环境", "WARN", "未检测到 conda 环境",
-              "建议在 stroke38 环境中运行")
-
-    # ================================================================
-    # 3. C++ Engine (rehab_engine._core)
-    # ================================================================
-    try:
-        engine_so_path = None
-        build_dir = Path(__file__).resolve().parent.parent / "build"
-        if build_dir.is_dir():
-            so_files = list(build_dir.glob("_core*.so")) + list(build_dir.glob("_core*.pyd"))
-            if so_files:
-                engine_so_path = so_files[0]
-
-        if engine_so_path:
-            so_size_mb = engine_so_path.stat().st_size / (1024 * 1024)
-            d.add("C++ 引擎 (.so)", "OK",
-                  f"{engine_so_path.name} ({so_size_mb:.1f} MB)")
-        else:
-            # Check if we can import it
-            try:
-                from . import _core  # noqa: F401
-                d.add("C++ 引擎", "OK", "已导入 (imported)")
-            except ImportError:
-                d.add("C++ 引擎 (.so)", "WARN",
-                      "未找到编译产物 — 使用 STUB 模式",
-                      "运行 setup_board.sh 编译引擎")
-    except Exception as e:
-        d.add("C++ 引擎 (.so)", "ERROR", str(e),
-              "重新编译: cmake --build build -j$(nproc)")
-
-    # Stub mode check
     try:
         from . import _STUB_MODE
         if _STUB_MODE:
-            d.add("引擎模式", "WARN", "STUB（模拟数据）",
-                  "编译 C++ 引擎以使用真实硬件")
+            diagnostics.add(
+                "原生硬件适配器", "WARN", "未加载 _core，桌面使用模拟采集",
+                "目标板真实 V4L2/OpenNI 采集需要编译 _core")
         else:
-            d.add("引擎模式", "OK", "FULL（真实引擎）")
-    except Exception:
-        d.add("引擎模式", "WARN", "未知", "检查 rehab_engine 导入")
+            diagnostics.add("原生硬件适配器", "OK", "_core 已加载；Python 仍负责主流程")
+    except Exception as exc:
+        diagnostics.add("原生硬件适配器", "WARN", str(exc))
 
-    # ================================================================
-    # 4. Python packages
-    # ================================================================
-    PKG_CHECKS = [
-        ("numpy", "NumPy"),
-        ("cv2", "OpenCV Python"),
-        ("yaml", "PyYAML"),
-        ("PyQt5", "PyQt5"),
-        ("qfluentwidgets", "QFluentWidgets"),
-    ]
-    for mod_name, display in PKG_CHECKS:
-        try:
-            m = __import__(mod_name)
-            ver = getattr(m, "__version__", "?")
-            d.add(display, "OK", f"v{ver}")
-        except ImportError:
-            d.add(display, "ERROR", "未安装",
-                  f"pip install {mod_name}")
+    packages = (
+        ("numpy", "NumPy", True), ("cv2", "OpenCV Python", True),
+        ("yaml", "PyYAML", True), ("onnxruntime", "ONNX Runtime Python", True),
+        ("PyQt5", "PyQt5", True), ("qfluentwidgets", "QFluentWidgets", True),
+        ("bleak", "Bleak", False), ("serial", "pyserial", False),
+        ("pyttsx3", "pyttsx3", False),
+    )
+    for module, label, required in packages:
+        ok, detail = _package_version(module)
+        diagnostics.add(
+            label, "OK" if ok else ("ERROR" if required else "WARN"),
+            detail if ok else "未安装",
+            "执行 pip install -r requirements.txt" if not ok else "")
 
-    # ================================================================
-    # 5. Camera devices (V4L2)
-    # ================================================================
-    camera_found = False
-    for dev_idx in range(4):
-        dev_path = f"/dev/video{dev_idx}"
-        if os.path.exists(dev_path):
-            camera_found = True
-            # Try to get device name via v4l2-ctl
-            detail = dev_path
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ["v4l2-ctl", "-d", dev_path, "--all"],
-                    capture_output=True, text=True, timeout=3)
-                # Extract driver/card info
-                for line in result.stdout.splitlines()[:5]:
-                    line = line.strip()
-                    if line:
-                        detail += f" [{line}]"
-                        break
-            except Exception:
-                pass
-            d.add(f"摄像头 /dev/video{dev_idx}", "OK", detail)
-    if not camera_found:
-        d.add("摄像头", "ERROR", "未检测到任何 /dev/video* 设备",
-              "确认 USB 摄像头已连接并已启用")
+    model_files = (
+        ("YOLO 检测模型", stroke_root / "including/yolov8n/yolov8n.onnx"),
+        ("RTMPose 姿态模型", stroke_root / "including/rtmpose-t/end2end.onnx"),
+        ("RTMPose pipeline", stroke_root / "including/rtmpose-t/pipeline.json"),
+    )
+    for name, path in model_files:
+        exists, detail = _check_file(path)
+        diagnostics.add(name, "OK" if exists else "ERROR", detail,
+                        "检查模型资产或 STROKE_REHAB_ROOT" if not exists else "")
 
-    # ================================================================
-    # 6. Depth camera (OpenNI2)
-    # ================================================================
-    openni_lib = root / "including" / "OpenNI" / "sdk" / "libs" / "libOpenNI2.so"
-    if openni_lib.exists():
-        d.add("OpenNI2 库", "OK", str(openni_lib))
+    scorer = stroke_root / "tools/scoring_engine/score_server.py"
+    exists, detail = _check_file(scorer)
+    diagnostics.add("实时评分服务", "OK" if exists else "ERROR", detail)
+
+    for name in ("device.yaml", "emg.yaml", "courses.json", "calibration.yaml"):
+        path = python_root / "configs" / name
+        exists, detail = _check_file(path)
+        diagnostics.add(f"配置文件 {name}", "OK" if exists else "ERROR", detail)
+
+    if platform.system() == "Linux":
+        videos = sorted(Path("/dev").glob("video*"))
+        diagnostics.add(
+            "V4L2 RGB 设备", "OK" if videos else "ERROR",
+            ", ".join(map(str, videos)) if videos else "未找到 /dev/video*",
+            "检查 USB、权限和 v4l2 驱动" if not videos else "")
+        openni_candidates = (
+            stroke_root / "including/OpenNI/sdk/libs/libOpenNI2.so",
+            stroke_root / "including/OpenNI/sdk/Redist/libOpenNI2.so",
+        )
+        openni = next((path for path in openni_candidates if path.exists()), None)
+        diagnostics.add(
+            "OpenNI2", "OK" if openni else "WARN",
+            str(openni) if openni else "项目目录未找到 libOpenNI2.so",
+            "也可使用系统 OpenNI2 库")
     else:
-        # Check system paths
-        import ctypes.util
-        sys_openni = ctypes.util.find_library("OpenNI2")
-        if sys_openni:
-            d.add("OpenNI2 库", "OK", f"系统路径: {sys_openni}")
-        else:
-            d.add("OpenNI2 库", "WARN", "未找到",
-                  "Depth 深度相机将不可用")
+        diagnostics.add("目标板相机", "DISABLED", "当前不是 Linux，未执行 /dev 与 OpenNI 硬件检查")
 
-    # ================================================================
-    # 7. ONNX Runtime + AI models
-    # ================================================================
-    onnx_lib = root / "including" / "onnxruntime" / "lib" / "libonnxruntime.so"
-    exists, detail = _check_file(onnx_lib)
-    if exists:
-        # Check if it's a real file or broken symlink
-        if onnx_lib.stat().st_size == 0:
-            d.add("ONNX Runtime", "ERROR", "符号链接损坏 (0 字节)",
-                  "修复: rm libonnxruntime.so && ln -s libonnxruntime.so.1.25.0 libonnxruntime.so")
-        else:
-            d.add("ONNX Runtime", "OK", detail)
+    emg = getattr(config, "emg", None)
+    emg_enabled = bool(getattr(emg, "enabled", False))
+    emg_mode = str(getattr(emg, "mode", "disabled")).lower()
+    if not emg_enabled or emg_mode == "disabled":
+        diagnostics.add("EMG", "DISABLED", "配置未启用")
+    elif emg_mode == "mock":
+        diagnostics.add("EMG", "OK", "mock 模式")
+    elif platform.system() != "Linux":
+        diagnostics.add("EMG 真实链路", "WARN", "需要在目标 Linux 板验证 RPMsg 与采集设备")
     else:
-        # Check for any version
-        onnx_dir = root / "including" / "onnxruntime" / "lib"
-        if onnx_dir.is_dir():
-            found = list(onnx_dir.glob("libonnxruntime.so*"))
-            if found:
-                d.add("ONNX Runtime", "OK", f"已找到 {len(found)} 个文件")
-            else:
-                d.add("ONNX Runtime", "ERROR", "库文件不存在")
-        else:
-            d.add("ONNX Runtime", "ERROR", "目录不存在",
-                  "检查 ~/stroke-rehab/including/onnxruntime/")
+        rpmsg = Path(str(getattr(emg, "rpmsg_ctrl_device", "/dev/rpmsg_ctrl0")))
+        backend = str(getattr(emg, "capture_backend", "serial")).lower()
+        capture_ok = (backend == "bluez" or Path(str(
+            getattr(emg, "serial_device", "/dev/rfcomm0"))).exists())
+        diagnostics.add(
+            "EMG 真实链路", "OK" if rpmsg.exists() and capture_ok else "ERROR",
+            f"backend={backend}, rpmsg={rpmsg}",
+            "启动 remoteproc/rpmsg_char 并连接 BLE 或 RFCOMM" if not (rpmsg.exists() and capture_ok) else "")
 
-    # YOLO model
-    yolo_model = root / "including" / "yolov8n" / "yolov8n.onnx"
-    exists, detail = _check_file(yolo_model)
-    d.add("YOLO 检测模型", "OK" if exists else "ERROR",
-          detail, "检查 including/yolov8n/yolov8n.onnx" if not exists else "")
-
-    # RTMPose model
-    rtm_model = root / "including" / "rtmpose-t" / "end2end.onnx"
-    exists, detail = _check_file(rtm_model)
-    d.add("RTMPose 姿态模型", "OK" if exists else "ERROR",
-          detail, "检查 including/rtmpose-t/end2end.onnx" if not exists else "")
-
-    # ================================================================
-    # 8. EMG devices
-    # ================================================================
-    rpmsg_ctrl = "/dev/rpmsg_ctrl0"
-    if os.path.exists(rpmsg_ctrl):
-        d.add("EMG (RPMsg)", "OK", f"{rpmsg_ctrl} 已检测到")
+    voice = getattr(config, "voice", None)
+    if voice is not None and not bool(getattr(voice, "enabled", True)):
+        diagnostics.add("语音提示", "DISABLED", "配置未启用")
     else:
-        d.add("EMG (RPMsg)", "DISABLED",
-              f"{rpmsg_ctrl} 未检测到",
-              "EMG 将使用模拟数据")
+        ok, detail = _package_version("pyttsx3")
+        diagnostics.add("语音提示", "OK" if ok else "WARN",
+                        "pyttsx3 可用" if ok else "pyttsx3 未安装")
 
-    rfcomm = "/dev/rfcomm0"
-    if os.path.exists(rfcomm):
-        d.add("EMG (Serial)", "OK", f"{rfcomm} 已检测到")
-    else:
-        d.add("EMG (Serial)", "DISABLED",
-              "未检测到蓝牙串口设备",
-              "EMG 串口模式不可用")
+    record_path = Path(str(getattr(config, "record_path", "recordings") if config else "recordings"))
+    if not record_path.is_absolute():
+        record_path = python_root / record_path
+    existing_parent = next((path for path in (record_path, *record_path.parents) if path.exists()), None)
+    writable = bool(existing_parent and os.access(existing_parent, os.W_OK))
+    diagnostics.add(
+        "录制输出目录", "OK" if writable else "ERROR", str(record_path),
+        "检查目录权限" if not writable else "")
 
-    # ================================================================
-    # 9. Config files
-    # ================================================================
-    for cfg_name in ["device.yaml", "emg.yaml", "courses.json"]:
-        cfg_path = root / "configs" / cfg_name
-        exists, detail = _check_file(cfg_path)
-        d.add(f"配置文件: {cfg_name}", "OK" if exists else "WARN",
-              detail)
-
-    # ================================================================
-    # 10. Output directory
-    # ================================================================
-    records_dir = root / "records"
-    if records_dir.is_dir():
-        writable = os.access(str(records_dir), os.W_OK)
-        if writable:
-            d.add("录制输出目录", "OK", str(records_dir))
-        else:
-            d.add("录制输出目录", "ERROR", "目录不可写",
-                  f"chmod 755 {records_dir}")
-    else:
-        d.add("录制输出目录", "OK", "将自动创建")
-
-    # ================================================================
-    # 11. OpenCV C++ (system library, used by engine)
-    # ================================================================
-    opencv_config = None
-    for search in [
-        "/usr/lib/aarch64-linux-gnu/cmake/opencv4/OpenCVConfig.cmake",
-        "/usr/lib/x86_64-linux-gnu/cmake/opencv4/OpenCVConfig.cmake",
-    ]:
-        if os.path.exists(search):
-            opencv_config = search
-            break
-    if opencv_config:
-        d.add("OpenCV C++ 开发库", "OK", opencv_config)
-    else:
-        d.add("OpenCV C++ 开发库", "WARN", "未找到 cmake 配置",
-              "安装: sudo apt install libopencv-dev")
-
-    return d
+    if platform.system() == "Linux":
+        tools = [name for name in ("cmake", "v4l2-ctl") if shutil.which(name)]
+        diagnostics.add("目标板工具", "OK" if tools else "WARN",
+                        ", ".join(tools) if tools else "未找到 cmake/v4l2-ctl")
+    return diagnostics
 
 
-def print_diagnostics(diag: Diagnostics) -> None:
-    """Print diagnostics to console in a formatted manner."""
-    # Detect if we can use Unicode characters
-    use_unicode = True
+def print_diagnostics(diagnostics: Diagnostics) -> None:
+    ascii_only = False
     try:
-        '✓'.encode(sys.stdout.encoding or 'utf-8')
+        "✓".encode(sys.stdout.encoding or "utf-8")
     except (UnicodeEncodeError, LookupError):
-        use_unicode = False
-
-    sep = "=" * 58
-    print(f"\n{sep}")
-    print("  Stroke Rehab — System Diagnostics")
-    print(f"  Status: {diag.summary()}")
-    print(sep)
-    for line in diag.format_lines(ascii_only=not use_unicode):
+        ascii_only = True
+    print("\n" + "=" * 58)
+    print("  Stroke Rehab — Python 主框架启动诊断")
+    print(f"  状态：{diagnostics.summary()}")
+    print("=" * 58)
+    for line in diagnostics.format_lines(ascii_only=ascii_only):
         print(line)
-    print(sep)
-
-    errors = diag.errors()
-    warnings = diag.warnings()
-    if errors:
-        print(f"\n  !! {len(errors)} error(s) to fix:")
-        for e in errors:
-            print(f"     - {e.name}: {e.detail}")
-            if e.hint:
-                print(f"       -> {e.hint}")
-    if warnings:
-        print(f"\n  !! {len(warnings)} warning(s):")
-        for w in warnings:
-            print(f"     - {w.name}: {w.detail}")
-    print()
+    print("=" * 58)

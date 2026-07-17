@@ -61,6 +61,9 @@ joints_2d = [(320 + i * 5, 240 + i * 3, 0.9, True) for i in range(22)]
 joints_3d = [(i * 0.05 - 0.5, -(i * 0.04 - 0.4), 2.0, 0.85, True) for i in range(22)]
 
 composer.submit(
+    pair_id=12, rgb_frame_id=20, depth_frame_id=21,
+    host_ts_ns=1_000_000_000, rgb_width=640, rgb_height=480,
+    depth_width=640, depth_height=480, pose_interval=6,
     joints_2d_raw=joints_2d,
     joints_3d=joints_3d,
     rgb_fps=30.0, pair_fps=28.5,
@@ -72,6 +75,8 @@ composer.submit(
 
 frame = composer.latest_frame()
 assert frame is not None and len(frame.joints_2d) == 22
+assert frame.pair_id == 12 and frame.rgb_frame_id == 20 and frame.depth_frame_id == 21
+assert frame.host_ts_ns == 1_000_000_000 and frame.pose_interval == 6
 assert frame.bbox_mode == "detect"
 assert frame.mirror
 print("  PreviewComposer: OK")
@@ -97,7 +102,14 @@ assert stats.frames == 5 and stats.rows == 5
 csv_path = os.path.join(tmpdir, "skeleton_3d.csv")
 assert os.path.exists(csv_path)
 with open(csv_path) as f:
-    assert len(f.readlines()) == 6
+    rows = f.readlines()
+    assert len(rows) == 6
+    assert len(rows[0].strip().split(",")) == 67
+    assert rows[0].startswith("frame_idx,00_waist_x")
+    assert float(rows[1].split(",")[4]) == -0.01
+assert os.path.exists(os.path.join(tmpdir, "skeleton_3d_detailed.csv"))
+with open(os.path.join(tmpdir, "skeleton3d_debug.csv")) as f:
+    assert len(f.readlines()) == 1 + 5 * 22
 print(f"  Skeleton3DRecorder: {stats.frames} frames -> {csv_path}")
 
 emg_rec = EmgRecorder()
@@ -121,6 +133,7 @@ time.sleep(1.0)
 stats = pipeline.performance_stats()
 pipeline.stop()
 assert len(frames) > 0
+assert {"yolo_ms", "pose_ms", "record_write_ms"}.issubset(stats)
 print(f"  Frames: {len(frames)}, pair_fps={stats['pair_fps']:.1f}, processed={stats['processed']}")
 print("  SensorPipeline start/stop: OK")
 

@@ -12,8 +12,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(STROKE_ENGINE_STUB
   "Build stub engine for desktop dev validation (excludes camera/pose/EMG)"
   OFF)
+option(STROKE_BUILD_LEGACY_NATIVE_PIPELINE
+  "Build legacy native sync/pose/EMG compatibility bindings"
+  OFF)
 
-# ---- pybind11 ----
+# ---- Python + pybind11 ----
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
+set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 QUIET)
 if(NOT pybind11_FOUND)
   execute_process(
@@ -25,8 +30,6 @@ if(NOT pybind11_FOUND)
   find_package(pybind11 REQUIRED)
 endif()
 
-# ---- Python ----
-find_package(Python COMPONENTS Interpreter Development REQUIRED)
 message(STATUS "Python: ${Python_EXECUTABLE} (${Python_VERSION})")
 
 if(STROKE_ENGINE_STUB)
@@ -53,7 +56,7 @@ else()
   # ==============================
   # FULL MODE — Linux AArch64 target
   # ==============================
-  message(STATUS "=== FULL BUILD (Linux AArch64 target) ===")
+  message(STATUS "=== PYTHON-MAIN HARDWARE ADAPTER BUILD ===")
 
   # ---- OpenCV ----
   set(OpenCV_HINTS
@@ -75,11 +78,13 @@ else()
 
   # ---- OpenNI2 ----
   find_path(OpenNI2_INCLUDE_DIR OpenNI.h
-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../including/OpenNI/sdk/Include
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../stroke-rehab/including/OpenNI/sdk/Include
+          ${CMAKE_CURRENT_SOURCE_DIR}/../including/OpenNI/sdk/Include
           /usr/include/openni2  /usr/include/ni2
           /usr/local/include/openni2  /usr/local/include/ni2)
   find_library(OpenNI2_LIBRARY NAMES OpenNI2
-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../including/OpenNI/sdk/libs
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../stroke-rehab/including/OpenNI/sdk/libs
+          ${CMAKE_CURRENT_SOURCE_DIR}/../including/OpenNI/sdk/libs
           /usr/lib  /usr/local/lib)
   if(OpenNI2_INCLUDE_DIR AND OpenNI2_LIBRARY)
     set(HAVE_OPENNI2_DEF TRUE)
@@ -87,7 +92,8 @@ else()
     set(HAVE_OPENNI2_DEF FALSE)
   endif()
 
-  # ---- ONNX Runtime ----
+  # ---- ONNX Runtime (legacy compatibility only; Python uses onnxruntime) ----
+  if(STROKE_BUILD_LEGACY_NATIVE_PIPELINE)
   set(ONNXRUNTIME_HINTS
     ${CMAKE_CURRENT_SOURCE_DIR}/../including/onnxruntime
     /usr  /usr/local  /opt/onnxruntime)
@@ -103,29 +109,35 @@ else()
   else()
     set(HAVE_ONNXRUNTIME_DEF FALSE)
   endif()
+  else()
+    set(HAVE_ONNXRUNTIME_DEF FALSE)
+  endif()
 
   # ---- Engine sources ----
   set(ENGINE_SOURCES
     engine/capture/RgbCaptureV4L2.cpp
     engine/capture/DepthCaptureOpenNI.cpp
-    engine/sync/SyncManager.cpp
     engine/sync/TimestampNormalizer.cpp
-    engine/align/HardwareD2CAligner.cpp
-    engine/align/SoftwareRegistrationAligner.cpp
-    engine/pose/PoseEstimator.cpp
-    engine/pose/PoseEstimatorRTMPoseOrt.cpp
-    engine/pose/PersonDetectorOrt.cpp
-    engine/pose/AdaptiveRoiBoundingBoxProvider.cpp
-    engine/pose/DepthSampler.cpp
-    engine/pose/JointProjector3D.cpp
-    engine/pose/EMASkeletonFilter.cpp
-    engine/pose/SkeletonSmoother.cpp
-    engine/pose/Halpe26ToRehab22Mapper.cpp
-    engine/pose/JointNameMapper.cpp
-    engine/emg/EmgRpmsgClient.cpp
     engine/util/FpsCounter.cpp
     engine/util/ThreadAffinity.cpp
   )
+  if(STROKE_BUILD_LEGACY_NATIVE_PIPELINE)
+    list(APPEND ENGINE_SOURCES
+      engine/sync/SyncManager.cpp
+      engine/align/HardwareD2CAligner.cpp
+      engine/align/SoftwareRegistrationAligner.cpp
+      engine/pose/PoseEstimator.cpp
+      engine/pose/PoseEstimatorRTMPoseOrt.cpp
+      engine/pose/PersonDetectorOrt.cpp
+      engine/pose/AdaptiveRoiBoundingBoxProvider.cpp
+      engine/pose/DepthSampler.cpp
+      engine/pose/JointProjector3D.cpp
+      engine/pose/EMASkeletonFilter.cpp
+      engine/pose/SkeletonSmoother.cpp
+      engine/pose/Halpe26ToRehab22Mapper.cpp
+      engine/pose/JointNameMapper.cpp
+      engine/emg/EmgRpmsgClient.cpp)
+  endif()
 
   # ---- Static lib ----
   add_library(rehab_engine_core STATIC ${ENGINE_SOURCES})
@@ -178,9 +190,13 @@ else()
   # ---- pybind11 module ----
   pybind11_add_module(_core bindings/module.cpp)
   target_link_libraries(_core PRIVATE rehab_engine_core)
+  if(NOT STROKE_BUILD_LEGACY_NATIVE_PIPELINE)
+    target_compile_definitions(_core PRIVATE STROKE_HARDWARE_ONLY=1)
+  endif()
 
   message(STATUS "  HAVE_OPENNI2:      ${HAVE_OPENNI2_DEF}")
   message(STATUS "  HAVE_ONNXRUNTIME:  ${HAVE_ONNXRUNTIME_DEF}")
+  message(STATUS "  LEGACY_PIPELINE:   ${STROKE_BUILD_LEGACY_NATIVE_PIPELINE}")
 endif()
 
 # ---- Common output settings ----

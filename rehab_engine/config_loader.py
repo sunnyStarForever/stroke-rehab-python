@@ -25,6 +25,7 @@ from ._stub import (
     PoseConfig,
     SkeletonFilterConfig,
     SyncConfig,
+    VoiceConfig,
     logger,
 )
 
@@ -140,6 +141,12 @@ def load_pipeline_config(
                 if hasattr(config.depth_sampler, k):
                     setattr(config.depth_sampler, k, v)
 
+        if "pose" in ydata:
+            pose = ydata["pose"]
+            for k, v in pose.items():
+                if hasattr(config.pose, k):
+                    setattr(config.pose, k, v)
+
         if "skeleton_filter" in ydata:
             sf = ydata["skeleton_filter"]
             for k, v in sf.items():
@@ -151,6 +158,12 @@ def load_pipeline_config(
             for k, v in dbg.items():
                 if hasattr(config.debug, k):
                     setattr(config.debug, k, v)
+
+        if "voice" in ydata:
+            voice = ydata["voice"]
+            for k, v in voice.items():
+                if hasattr(config.voice, k):
+                    setattr(config.voice, k, v)
 
     # --- Load emg.yaml ---
     emg_path = root / emg_yaml
@@ -212,8 +225,16 @@ def _env_override(config: PipelineConfig) -> None:
         config.emg.enabled = os.environ["STROKE_EMG_ENABLED"] in ("1", "true", "True")
     if os.environ.get("STROKE_EMG_MODE"):
         config.emg.mode = os.environ["STROKE_EMG_MODE"]
+    if os.environ.get("STROKE_EMG_CAPTURE_BACKEND"):
+        config.emg.capture_backend = os.environ["STROKE_EMG_CAPTURE_BACKEND"]
     if os.environ.get("STROKE_EMG_SERIAL_DEVICE"):
         config.emg.serial_device = os.environ["STROKE_EMG_SERIAL_DEVICE"]
+    if os.environ.get("STROKE_EMG_BLE_ADDRESS"):
+        config.emg.ble_address = os.environ["STROKE_EMG_BLE_ADDRESS"]
+    if os.environ.get("STROKE_EMG_STRICT_REAL"):
+        config.emg.strict_real_mode = os.environ["STROKE_EMG_STRICT_REAL"] in (
+            "1", "true", "True"
+        )
     if os.environ.get("STROKE_EMG_RPMSG_CTRL"):
         config.emg.rpmsg_ctrl_device = os.environ["STROKE_EMG_RPMSG_CTRL"]
     if os.environ.get("STROKE_EMG_RPMSG_DATA"):
@@ -230,3 +251,10 @@ def _env_override(config: PipelineConfig) -> None:
     # Calibration
     if os.environ.get("STROKE_CALIBRATION_FILE"):
         config.calibration_file = os.environ["STROKE_CALIBRATION_FILE"]
+    if os.environ.get("STROKE_INFERENCE_BACKEND"):
+        config.pose.inference_backend = os.environ["STROKE_INFERENCE_BACKEND"]
+    if os.environ.get("STROKE_ONNX_PROVIDER"):
+        config.pose.onnx_execution_provider = os.environ["STROKE_ONNX_PROVIDER"]
+    if os.environ.get("STROKE_VOICE_ENABLED"):
+        config.voice.enabled = os.environ["STROKE_VOICE_ENABLED"].lower() in (
+            "1", "true", "yes", "on")

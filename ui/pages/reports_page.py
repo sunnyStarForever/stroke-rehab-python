@@ -32,8 +32,9 @@ class ReportsPage(QWidget):
     report_loaded = pyqtSignal(int, str, str, str)
     history_loaded = pyqtSignal(int, object)
 
-    def __init__(self, parent=None):
+    def __init__(self, config=None, parent=None):
         super().__init__(parent)
+        self._config = config
         self._session_dir = ""
         self._csv_path = ""
         self._history_entries = []
@@ -207,7 +208,14 @@ class ReportsPage(QWidget):
     def _scan_history_entries(self):
         entries = []
         project_root = Path(__file__).resolve().parents[2]
+        configured_root = Path(
+            str(getattr(self._config, "record_path", "recordings")))
+        if not configured_root.is_absolute():
+            configured_root = project_root / configured_root
         roots = [
+            configured_root,
+            configured_root / "output",
+            configured_root / "sessions",
             project_root / "recordings/sessions",
             project_root / "records/sessions",
             project_root / "records/output",

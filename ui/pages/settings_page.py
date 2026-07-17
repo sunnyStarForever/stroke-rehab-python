@@ -3,6 +3,8 @@ Settings page — device configuration and system preferences.
 Replaces app/dialogs/DeviceSettingsDialog.cpp + RecordingSettingsDialog.cpp.
 """
 
+import threading
+
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
 )
@@ -20,6 +22,7 @@ from rehab_engine._stub import PipelineConfig
 from rehab_engine.config_loader import save_pipeline_config
 from rehab_engine.course import CourseRepository
 from rehab_engine.diagnostics import run_diagnostics
+from rehab_engine.emg import EmgBluetoothScanner
 from ..theme import COLORS, PAGE_STYLE, pill_style
 
 
@@ -32,6 +35,7 @@ _DEPTH_RESOLUTIONS = ["640x480", "320x240", "1280x720"]
 # of substituting mock frames.
 _FPS_VALUES = ["30"]
 _EMG_MODES = ["disabled", "mock", "real"]
+_EMG_BACKENDS = ["bluez", "serial"]
 
 
 class SettingsPage(ScrollArea):
@@ -40,14 +44,19 @@ class SettingsPage(ScrollArea):
     course_changed = pyqtSignal(str)
     debug_changed = pyqtSignal(bool)
     settings_applied = pyqtSignal(str)
+    ble_scan_finished = pyqtSignal(object)
+    log_requested = pyqtSignal()
+    performance_requested = pyqtSignal()
 
     def __init__(self, config: PipelineConfig, parent=None):
         super().__init__(parent)
         self._config = config
         self._course_repo = CourseRepository()
         self._course_repo.load()
+        self._ble_devices = {}
 
         self._init_ui()
+        self.ble_scan_finished.connect(self._finish_ble_scan)
         self._load_config()
 
     def _init_ui(self):
@@ -152,6 +161,15 @@ class SettingsPage(ScrollArea):
         course_grid = QGridLayout()
         course_grid.setHorizontalSpacing(14)
         self._patient_name = LineEdit()
+        self._patient_id = LineEdit()
+        self._patient_id.setPlaceholderText("P0001")
+        self._patient_gender = ComboBox()
+        self._patient_gender.addItems(["", "男", "女", "其他"])
+        self._patient_age = SpinBox()
+        self._patient_age.setRange(0, 120)
+        self._patient_age.setSpecialValueText("未填写")
+        self._patient_diagnosis = LineEdit()
+        self._patient_diagnosis.setPlaceholderText("例如：卒中后上肢康复")
         self._patient_name.setPlaceholderText("可选，用于区分训练报告")
         self._debug_switch = SwitchButton("显示性能调试信息")
         course_grid.addWidget(BodyLabel("训练对象"), 0, 0)
@@ -160,6 +178,14 @@ class SettingsPage(ScrollArea):
         course_grid.addWidget(self._course_combo, 1, 1)
         course_grid.addWidget(self._debug_switch, 2, 1)
         course_grid.setColumnStretch(1, 1)
+        course_grid.addWidget(BodyLabel("患者编号"), 3, 0)
+        course_grid.addWidget(self._patient_id, 3, 1)
+        course_grid.addWidget(BodyLabel("性别"), 4, 0)
+        course_grid.addWidget(self._patient_gender, 4, 1)
+        course_grid.addWidget(BodyLabel("年龄"), 5, 0)
+        course_grid.addWidget(self._patient_age, 5, 1)
+        course_grid.addWidget(BodyLabel("诊断/训练说明"), 6, 0)
+        course_grid.addWidget(self._patient_diagnosis, 6, 1)
         course_layout.addLayout(course_grid)
 
         course_info = CaptionLabel(
@@ -187,14 +213,28 @@ class SettingsPage(ScrollArea):
         self._emg_enabled.setText("启用 EMG")
         self._emg_mode = ComboBox()
         self._emg_mode.addItems(_EMG_MODES)
+        self._emg_backend = ComboBox()
+        self._emg_backend.addItems(_EMG_BACKENDS)
         self._emg_serial = LineEdit()
         self._emg_serial.setText("/dev/rfcomm0")
         emg_row1.addWidget(self._emg_enabled)
         emg_row1.addWidget(BodyLabel("模式"))
         emg_row1.addWidget(self._emg_mode)
+        emg_row1.addWidget(BodyLabel("后端"))
+        emg_row1.addWidget(self._emg_backend)
         emg_row1.addWidget(BodyLabel("串口"))
         emg_row1.addWidget(self._emg_serial, 1)
         emg_layout.addLayout(emg_row1)
+
+        emg_ble_row = QHBoxLayout()
+        self._emg_ble_device = EditableComboBox()
+        self._emg_ble_device.setPlaceholderText("BLE 名称或 MAC 地址")
+        self._btn_scan_ble = PushButton("扫描 BLE")
+        self._btn_scan_ble.clicked.connect(self._scan_ble)
+        emg_ble_row.addWidget(BodyLabel("BLE 设备"))
+        emg_ble_row.addWidget(self._emg_ble_device, 1)
+        emg_ble_row.addWidget(self._btn_scan_ble)
+        emg_layout.addLayout(emg_ble_row)
 
         self._advanced_toggle = SwitchButton("显示高级链路参数")
         self._advanced_toggle.setChecked(False)
@@ -232,6 +272,12 @@ class SettingsPage(ScrollArea):
         self._btn_test.setMinimumSize(110, 38)
         self._btn_test.clicked.connect(self._test_devices)
         btn_row.addWidget(self._btn_test)
+        self._btn_logs = PushButton("运行日志")
+        self._btn_logs.clicked.connect(self.log_requested)
+        btn_row.addWidget(self._btn_logs)
+        self._btn_performance = PushButton("性能监控")
+        self._btn_performance.clicked.connect(self.performance_requested)
+        btn_row.addWidget(self._btn_performance)
         self._btn_apply = PrimaryPushButton("应用设置")
         self._btn_apply.setMinimumSize(128, 38)
         self._btn_apply.clicked.connect(self._apply)
@@ -256,11 +302,17 @@ class SettingsPage(ScrollArea):
 
         self._emg_enabled.setChecked(c.emg.enabled)
         self._emg_mode.setCurrentText(c.emg.mode)
+        self._emg_backend.setCurrentText(c.emg.capture_backend)
         self._emg_serial.setText(c.emg.serial_device)
+        self._emg_ble_device.setCurrentText(c.emg.ble_address)
         self._emg_rpmsg_ctrl.setText(c.emg.rpmsg_ctrl_device)
         self._emg_rpmsg_data.setText(c.emg.rpmsg_data_device)
         self._emg_endpoint.setText(c.emg.rpmsg_endpoint_name)
         self._patient_name.setText(c.patient_name)
+        self._patient_id.setText(c.patient_id)
+        self._patient_gender.setCurrentText(c.patient_gender)
+        self._patient_age.setValue(c.patient_age)
+        self._patient_diagnosis.setText(c.patient_diagnosis)
         self._debug_switch.setChecked(c.ui_debug_enabled)
         if c.selected_course_id in self._course_ids:
             self._course_combo.setCurrentIndex(
@@ -287,12 +339,19 @@ class SettingsPage(ScrollArea):
 
         c.emg.enabled = self._emg_enabled.isChecked()
         c.emg.mode = self._emg_mode.currentText()
+        c.emg.capture_backend = self._emg_backend.currentText()
         c.emg.serial_device = self._emg_serial.text().strip()
+        selected_ble = self._emg_ble_device.currentText().strip()
+        c.emg.ble_address = self._ble_devices.get(selected_ble, selected_ble)
         c.emg.rpmsg_ctrl_device = self._emg_rpmsg_ctrl.text().strip()
         c.emg.rpmsg_data_device = self._emg_rpmsg_data.text().strip()
         c.emg.rpmsg_endpoint_name = self._emg_endpoint.text().strip()
 
         c.patient_name = self._patient_name.text().strip()
+        c.patient_id = self._patient_id.text().strip()
+        c.patient_gender = self._patient_gender.currentText().strip()
+        c.patient_age = self._patient_age.value()
+        c.patient_diagnosis = self._patient_diagnosis.text().strip()
         c.ui_debug_enabled = self._debug_switch.isChecked()
         index = self._course_combo.currentIndex()
         if 0 <= index < len(self._course_ids):
@@ -314,6 +373,44 @@ class SettingsPage(ScrollArea):
 
         InfoBar.success("设置已保存", f"配置已写入 {config_path.name}，下次训练生效。",
                         position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
+
+    def _scan_ble(self):
+        self._btn_scan_ble.setEnabled(False)
+        self._btn_scan_ble.setText("扫描中…")
+
+        def worker():
+            self.ble_scan_finished.emit(EmgBluetoothScanner().scan(4))
+
+        threading.Thread(target=worker, name="settings-ble-scan", daemon=True).start()
+
+    def _finish_ble_scan(self, result):
+        self._btn_scan_ble.setEnabled(True)
+        self._btn_scan_ble.setText("扫描 BLE")
+        if not result.ok:
+            InfoBar.error(
+                "BLE 扫描失败", result.message, duration=5000,
+                position=InfoBarPosition.TOP_RIGHT, parent=self,
+            )
+            return
+        current = self._emg_ble_device.currentText().strip()
+        self._ble_devices = {}
+        self._emg_ble_device.clear()
+        for device in result.devices:
+            label = f"{device.name or 'Unknown'} [{device.address}] ({device.rssi} dBm)"
+            self._ble_devices[label] = device.address
+            self._emg_ble_device.addItem(label)
+        if current:
+            self._emg_ble_device.setCurrentText(current)
+        if result.devices:
+            InfoBar.success(
+                "BLE 扫描完成", f"发现 {len(result.devices)} 个设备",
+                position=InfoBarPosition.TOP_RIGHT, parent=self,
+            )
+        else:
+            InfoBar.warning(
+                "BLE 扫描完成", "未发现设备，请检查蓝牙适配器和设备广播状态",
+                position=InfoBarPosition.TOP_RIGHT, parent=self,
+            )
 
     def _test_devices(self):
         """Run the same diagnostics used at startup and summarize the result."""

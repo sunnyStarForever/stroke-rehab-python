@@ -1,0 +1,23 @@
+# Astra Pro calibration used by the Python RGB-D registration path.
+depth_intrinsics:
+  fx: 575.6880036620
+  fy: 574.7119407061
+  cx: 325.4024113511
+  cy: 260.7079185709
+  width: 640
+  height: 480
+
+rgb_intrinsics:
+  fx: 592.9658896761
+  fy: 591.5817915349
+  cx: 319.7753764305
+  cy: 252.1370296722
+  width: 640
+  height: 480
+
+depth_to_rgb_extrinsics:
+  R: [0.9996653082, -0.0254059656, 0.0048793904,
+      0.0253962908, 0.9996753917, 0.0020346243,
+      -0.0049294981, -0.0019100249, 0.9999860258]
+  T: [26.4757200251, 3.0243672900, -2.7811226629]
+  translation_unit: "mm"
