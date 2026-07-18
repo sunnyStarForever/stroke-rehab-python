@@ -277,7 +277,7 @@ class TrainingPage(QWidget):
         if not self._current_course or not self._current_course.actions:
             errors.append("未选择有效训练课程")
         try:
-            save_root = Path(self._config.record_path) / "sessions"
+            save_root = self._record_sessions_dir()
             save_root.mkdir(parents=True, exist_ok=True)
             probe = save_root / ".write_test"
             probe.write_text("ok", encoding="utf-8")
@@ -295,6 +295,13 @@ class TrainingPage(QWidget):
                 (self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30)):
             errors.append("真实 RGB 与 Depth 相机必须同时设置为 30 FPS")
         return errors, warnings
+
+    def _record_sessions_dir(self) -> Path:
+        """Resolve relative recording paths against the Python project root."""
+        record_root = Path(self._config.record_path).expanduser()
+        if not record_root.is_absolute():
+            record_root = Path(__file__).resolve().parents[2] / record_root
+        return record_root / "sessions"
 
     # ---- UI Construction ----
 
@@ -371,15 +378,21 @@ class TrainingPage(QWidget):
         tag_row.addLayout(preview_titles)
         tag_row.addStretch()
 
-        for tag, kind in [("RGB", "primary"), ("深度", "neutral"), ("骨骼", "success")]:
-            lbl = CaptionLabel(tag)
-            lbl.setStyleSheet(pill_style(kind))
-            tag_row.addWidget(lbl)
+        self._preview_mode_buttons = {}
+        for mode, tag in [("rgb", "RGB"), ("depth", "深度"), ("skeleton", "骨骼")]:
+            button = PushButton(tag, self)
+            button.setCheckable(True)
+            button.setFixedHeight(30)
+            button.clicked.connect(
+                lambda checked=False, selected=mode: self._set_preview_mode(selected))
+            self._preview_mode_buttons[mode] = button
+            tag_row.addWidget(button)
         preview_layout.addLayout(tag_row)
 
         self._preview = PreviewWidget(self)
         self._preview.setMinimumSize(680, 360)
         self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._set_preview_mode("skeleton")
         preview_layout.addWidget(self._preview, 1)
 
         # -- Side panel --
@@ -557,7 +570,15 @@ class TrainingPage(QWidget):
 
     # ---- Button handlers ----
 
+    def _set_preview_mode(self, mode: str):
+        self._preview.set_view_mode(mode)
+        for name, button in self._preview_mode_buttons.items():
+            button.setChecked(name == mode)
+
     def _on_start(self):
+        if self._state not in (TrainingState.IDLE, TrainingState.FINISHED):
+            self._append_feedback("训练已在启动或运行中，请勿重复点击开始。")
+            return
         errors, warnings = self._preflight_checks()
         if errors:
             message = "；".join(errors)
@@ -619,7 +640,7 @@ class TrainingPage(QWidget):
             return
         try:
             self._session_dir = self._pipeline.start_recording(
-                str(Path(self._config.record_path) / "sessions"))
+                str(self._record_sessions_dir()))
         except OSError as exc:
             self._append_feedback(f"录制启动失败：{exc}")
             InfoBar.error("录制启动失败", str(exc),

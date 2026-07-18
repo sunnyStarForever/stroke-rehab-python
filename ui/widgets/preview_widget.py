@@ -51,6 +51,7 @@ class PreviewWidget(QWidget):
         self.setPalette(p)
 
         self._frame: Optional[PreviewFrame] = None
+        self._view_mode = "skeleton"
         self._show_depth = True
         self._show_skeleton = True
         self._show_joint_index = False
@@ -82,6 +83,13 @@ class PreviewWidget(QWidget):
     def set_engine_mode(self, mode: str):
         """Set engine mode display: 'STUB' or 'FULL'."""
         self._engine_mode = mode
+        self.update()
+
+    def set_view_mode(self, mode: str):
+        """Select an exclusive preview: RGB, depth, or RGB with skeleton."""
+        if mode not in {"rgb", "depth", "skeleton"}:
+            raise ValueError(f"Unsupported preview mode: {mode}")
+        self._view_mode = mode
         self.update()
 
     def set_show_depth(self, v: bool):
@@ -139,7 +147,7 @@ class PreviewWidget(QWidget):
 
     # ---- Depth overlay ----
 
-    def _draw_depth_overlay(self, painter: QPainter, draw_rect):
+    def _draw_depth_overlay(self, painter: QPainter, draw_rect, opacity: float = 0.45):
         import numpy as np
         import cv2
         depth = self._frame.depth_image
@@ -160,7 +168,7 @@ class PreviewWidget(QWidget):
             h2, w2, _ = colored_rgb.shape
             qimg = QImage(colored_rgb.data.tobytes(), w2, h2, w2 * 3, QImage.Format_RGB888)
             target_rect = draw_rect
-            painter.setOpacity(0.45)
+            painter.setOpacity(opacity)
             painter.drawImage(target_rect, qimg)
             painter.setOpacity(1.0)
         except Exception:
@@ -190,18 +198,21 @@ class PreviewWidget(QWidget):
             int(src_w * scale), int(src_h * scale),
         )
 
-        # ── Layer 1: RGB background (always draw if available) ──
-        if self._frame.rgb_image is not None:
+        if self._view_mode == "depth":
+            painter.fillRect(draw_rect, QColor(26, 30, 34))
+            if self._frame.depth_image is not None:
+                self._draw_depth_overlay(painter, draw_rect, opacity=1.0)
+            else:
+                painter.setPen(QColor(210, 215, 222))
+                painter.setFont(QFont("Segoe UI", 15, QFont.Bold))
+                painter.drawText(draw_rect, Qt.AlignCenter, "等待深度数据…")
+        elif self._frame.rgb_image is not None:
             self._draw_rgb_background(painter)
         else:
             painter.fillRect(draw_rect, QColor(26, 30, 34))
 
-        # ── Layer 2: depth overlay (always draw if available) ──
-        if self._frame.depth_image is not None:
-            self._draw_depth_overlay(painter, draw_rect)
-
-        # ── Layer 3: skeleton (only if we have valid pose) ──
-        if self._show_skeleton and self._frame.has_valid_2d:
+        if (self._view_mode == "skeleton" and self._show_skeleton
+                and self._frame.has_valid_2d):
             self._draw_skeleton(painter, draw_rect)
 
         # ── HUD layers ──

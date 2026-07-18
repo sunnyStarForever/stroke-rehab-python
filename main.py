@@ -8,12 +8,33 @@ If you don't see these diagnostics, the app may be crashing before reaching main
 
 import sys
 import os
+import platform
 from pathlib import Path
 
 # Ensure python_version/ is on sys.path for imports
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
+
+
+def _acquire_single_instance_lock():
+    """Prevent two Linux GUI instances from competing for the cameras."""
+    if platform.system() != "Linux":
+        return True, None
+
+    import fcntl
+
+    lock_path = Path("/tmp") / f"stroke-rehab-{os.getuid()}.lock"
+    lock_file = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return False, None
+
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return True, lock_file
 
 
 def _startup_diagnostics():
@@ -35,7 +56,10 @@ def _startup_diagnostics():
 
 
 def main():
-    import platform
+    lock_acquired, instance_lock = _acquire_single_instance_lock()
+    if not lock_acquired:
+        print("[startup] 程序已在运行，请先关闭现有窗口后再启动。", flush=True)
+        return
 
     # ---- Platform-specific early fixes ----
     if platform.system() == "Linux":
@@ -60,7 +84,10 @@ def main():
     window = StrokeRehabWindow(diagnostics=diag)
     window.show()
 
-    sys.exit(app.exec_())
+    exit_code = app.exec_()
+    # Keep the lock file referenced until the Qt event loop has fully stopped.
+    _ = instance_lock
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
