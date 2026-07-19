@@ -1059,6 +1059,7 @@ class TrainingPage(QWidget):
         """Runs on the pipeline worker; submit only valid active-training frames."""
         bridge = self._score_bridge
         if (self._state != TrainingState.TRAINING
+                or not frame.depth_is_hardware
                 or not frame.has_valid_3d or len(frame.joints_3d) < 22):
             return
         self._frame_index += 1

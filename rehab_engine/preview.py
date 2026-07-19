@@ -97,6 +97,7 @@ class PreviewFrame:
 
     # Depth image data (full mode: decoded 16-bit PNG for overlay, mm scale)
     depth_image: Any = None
+    depth_is_hardware: bool = False
 
     # Bone connections for skeleton drawing (index pairs into joints_2d)
     bones: List[Tuple[int, int]] = field(default_factory=list)
@@ -175,6 +176,7 @@ class PreviewComposer:
                rgb_image=None,
                # Real depth image (numpy 16-bit array, full mode)
                depth_image=None,
+               depth_is_hardware: bool = False,
                ) -> None:
         """Submit new frame data. Called from the pipeline worker thread."""
         frame = PreviewFrame()
@@ -200,9 +202,9 @@ class PreviewComposer:
             frame.has_valid_2d = any(j.valid for j in frame.joints_2d)
 
         for source, target in [
-            (joints_3d, frame.joints_3d),
-            (raw_joints_3d, frame.raw_joints_3d),
-            (ema_joints_3d, frame.ema_joints_3d),
+            (joints_3d if depth_is_hardware else None, frame.joints_3d),
+            (raw_joints_3d if depth_is_hardware else None, frame.raw_joints_3d),
+            (ema_joints_3d if depth_is_hardware else None, frame.ema_joints_3d),
         ]:
             if source:
                 for i, j in enumerate(source):
@@ -212,7 +214,8 @@ class PreviewComposer:
                         valid=j[4] if len(j) > 4 else False,
                         name=_REHAB22_JOINT_NAMES[i] if i < 22 else "")
                     target.append(jd)
-        frame.has_valid_3d = any(j.valid for j in frame.joints_3d)
+        frame.has_valid_3d = bool(depth_is_hardware) and any(
+            j.valid for j in frame.joints_3d)
 
         frame.rgb_fps = rgb_fps
         frame.depth_fps = depth_fps
@@ -240,7 +243,8 @@ class PreviewComposer:
 
         frame.mirror = mirror
         frame.rgb_image = rgb_image
-        frame.depth_image = depth_image
+        frame.depth_image = depth_image if depth_is_hardware else None
+        frame.depth_is_hardware = bool(depth_is_hardware)
 
         with self._lock:
             self._latest = frame

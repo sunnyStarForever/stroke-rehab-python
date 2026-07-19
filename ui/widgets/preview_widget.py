@@ -200,12 +200,14 @@ class PreviewWidget(QWidget):
 
         if self._view_mode == "depth":
             painter.fillRect(draw_rect, QColor(26, 30, 34))
-            if self._frame.depth_image is not None:
+            if (self._frame.depth_image is not None
+                    and self._frame.depth_is_hardware):
                 self._draw_depth_overlay(painter, draw_rect, opacity=1.0)
             else:
                 painter.setPen(QColor(210, 215, 222))
                 painter.setFont(QFont("Segoe UI", 15, QFont.Bold))
-                painter.drawText(draw_rect, Qt.AlignCenter, "等待深度数据…")
+                painter.drawText(
+                    draw_rect, Qt.AlignCenter, "未检测到真实深度数据")
         elif self._frame.rgb_image is not None:
             self._draw_rgb_background(painter)
         else:

@@ -75,11 +75,21 @@ composer.submit(
 
 frame = composer.latest_frame()
 assert frame is not None and len(frame.joints_2d) == 22
+assert frame.depth_is_hardware is False
+assert frame.depth_image is None and not frame.joints_3d and not frame.has_valid_3d
 assert frame.pair_id == 12 and frame.rgb_frame_id == 20 and frame.depth_frame_id == 21
 assert frame.host_ts_ns == 1_000_000_000 and frame.pose_interval == 6
 assert frame.bbox_mode == "detect"
 assert frame.mirror
 print("  PreviewComposer: OK")
+
+trusted_composer = PreviewComposer()
+trusted_composer.submit(
+    joints_3d=joints_3d, depth_image=[[1000]], depth_is_hardware=True)
+trusted_frame = trusted_composer.latest_frame()
+assert trusted_frame.depth_is_hardware is True
+assert trusted_frame.depth_image == [[1000]]
+assert len(trusted_frame.joints_3d) == 22 and trusted_frame.has_valid_3d
 
 # ---- 4. Recorder ----
 print("\n[4] Recorder")
@@ -133,6 +143,9 @@ time.sleep(1.0)
 stats = pipeline.performance_stats()
 pipeline.stop()
 assert len(frames) > 0
+assert all(frame.depth_is_hardware is False for frame in frames)
+assert all(frame.depth_image is None for frame in frames)
+assert all(not frame.joints_3d for frame in frames)
 assert {"yolo_ms", "pose_ms", "record_write_ms"}.issubset(stats)
 print(f"  Frames: {len(frames)}, pair_fps={stats['pair_fps']:.1f}, processed={stats['processed']}")
 print("  SensorPipeline start/stop: OK")
@@ -152,7 +165,9 @@ rec_csv = os.path.join(session_dir, "skeleton_3d.csv")
 assert os.path.exists(rec_csv)
 with open(rec_csv) as f:
     lines = f.readlines()
-assert len(lines) > 1
+assert len(lines) == 1
+assert rec_stats["frames"] == 0
+assert rec_stats["depth_frames"] == 0
 print(f"  Recorded: {rec_stats['frames']} frames, CSV: {len(lines)-1} rows")
 print("  Pipeline recording: OK")
 

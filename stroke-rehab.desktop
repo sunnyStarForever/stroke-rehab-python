@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=卒中康复训练
+Comment=启动飞腾派真实 RGB-D 康复训练应用
+Exec=/home/user/stroke-rehab-runtime/python_version/run_board.sh
+Path=/home/user/stroke-rehab-runtime/python_version
+Icon=applications-science
+Terminal=false
+Categories=Science;
+StartupNotify=true

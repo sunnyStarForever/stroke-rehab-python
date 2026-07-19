@@ -300,6 +300,7 @@ static void registerCaptureBindings(py::module_& m) {
       .def("stop", &DepthCaptureOpenNI::stop,
            py::call_guard<py::gil_scoped_release>())
       .def("is_running", &DepthCaptureOpenNI::isRunning)
+      .def("real_depth_active", &DepthCaptureOpenNI::realDepthActive)
       .def("hardware_d2c_active", &DepthCaptureOpenNI::hardwareD2CActive);
 }
 

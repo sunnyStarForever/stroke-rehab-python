@@ -836,6 +836,7 @@ class SensorPipeline:
             emg_status, emg_rms, emg_fatigue = self._tick_emg(
                 int(pair.get("ts", 0))
             )
+            depth_is_hardware = not bool(pair.get("mock"))
 
             if pair.get("mock"):
                 depth_unit_to_meter = 0.001
@@ -852,6 +853,15 @@ class SensorPipeline:
                 pose_2d, pose_3d, bbox, pose_ms, yolo_ms = \
                     self._infer_pose_full(
                         jpeg, depth_image, pose_interval, depth_unit_to_meter)
+
+            # Stub/synthetic depth remains useful for exercising the RGB/UI
+            # loop, but it must never reach any depth-dependent consumer.
+            if not depth_is_hardware:
+                depth_raw = None
+                depth_image = None
+                pose_3d = []
+                self._last_raw_j3d = []
+                self._last_ema_j3d = []
 
             if self._pair_recorder.stats().recording and all(
                 image is not None for image in (rgb_image, depth_raw, depth_image)
@@ -872,7 +882,8 @@ class SensorPipeline:
 
             record_write_ms = 0.0
             if self._recording and not self._recording_paused:
-                if self._recording_options.record_skeleton:
+                if (depth_is_hardware
+                        and self._recording_options.record_skeleton):
                     self._record_skeleton(pose_3d, int(pair.get("ts", 0)))
                 record_write_ms = self._video_recorder.record(rgb_image, depth_image)
             with self._perf_lock:
@@ -916,7 +927,8 @@ class SensorPipeline:
                 depth_frames=video_stats.depth_frames,
                 emg_status=emg_status, emg_rms=emg_rms,
                 emg_fatigue=emg_fatigue,
-                rgb_image=rgb_image, depth_image=depth_image)
+                rgb_image=rgb_image, depth_image=depth_image,
+                depth_is_hardware=depth_is_hardware)
 
             self._update_performance()
 

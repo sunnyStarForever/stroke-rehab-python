@@ -23,10 +23,10 @@ class DepthCaptureOpenNI {
 
   bool isRunning() const { return running_.load(); }
   bool hardwareD2CActive() const { return hardwareD2CActive_.load(); }
+  bool realDepthActive() const { return realDepthActive_.load(); }
 
  private:
   void run();
-  void runFallback();
 
   DeviceConfig config_;
   FrameCallback callback_;
@@ -34,6 +34,7 @@ class DepthCaptureOpenNI {
 
   std::atomic<bool> running_{false};
   std::atomic<bool> hardwareD2CActive_{false};
+  std::atomic<bool> realDepthActive_{false};
   TimestampNormalizer tsNormalizer_;
   std::thread worker_;
 };

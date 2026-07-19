@@ -55,6 +55,23 @@ def _startup_diagnostics():
     return diag
 
 
+def _exit_after_qt(exit_code: int) -> None:
+    """Avoid the broken PyQt/QFluentWidgets finalizer on the Linux board.
+
+    Camera, scoring, recording and voice resources are released by the normal
+    window shutdown before the Qt event loop returns.  The board's PyQt stack
+    can otherwise abort during interpreter finalization with PyThreadState_Get.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    if platform.system() == "Linux":
+        os._exit(int(exit_code))
+    raise SystemExit(int(exit_code))
+
+
 def main():
     lock_acquired, instance_lock = _acquire_single_instance_lock()
     if not lock_acquired:
@@ -87,7 +104,7 @@ def main():
     exit_code = app.exec_()
     # Keep the lock file referenced until the Qt event loop has fully stopped.
     _ = instance_lock
-    sys.exit(exit_code)
+    _exit_after_qt(exit_code)
 
 
 if __name__ == "__main__":

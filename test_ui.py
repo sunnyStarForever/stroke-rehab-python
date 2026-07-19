@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+os.environ.setdefault("STROKE_VOICE_ENABLED", "false")
 
 if os.name != "nt" and not os.environ.get("DISPLAY"):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -66,8 +67,17 @@ print("\n[4] QApplication launch test")
 
 # Test pages instantiate
 cfg = PipelineConfig()
+cfg.voice.enabled = False
 tp = TrainingPage(cfg)  # No parent — standalone test
 print("  TrainingPage instantiated: OK")
+for mode in ("rgb", "depth", "skeleton"):
+    tp._preview_mode_buttons[mode].click()
+    assert tp._preview._view_mode == mode
+    assert tp._preview_mode_buttons[mode].isChecked()
+    assert sum(
+        button.isChecked() for button in tp._preview_mode_buttons.values()
+    ) == 1
+print("  RGB/depth/skeleton preview switching: OK")
 
 rp = ReportsPage()
 print("  ReportsPage instantiated: OK")

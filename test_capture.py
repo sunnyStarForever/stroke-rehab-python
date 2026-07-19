@@ -94,9 +94,20 @@ class _Rgb:
     def stop(self):
         self.stopped = True
 
+    def is_running(self):
+        return self.start_ok and not self.stopped
+
 
 class _Depth(_Rgb):
     instances = []
+    attested = True
+    driver_running = True
+
+    def real_depth_active(self):
+        return self.attested
+
+    def is_running(self):
+        return self.driver_running and not self.stopped
 
     def hardware_d2c_active(self):
         return True
@@ -108,11 +119,26 @@ class _Core:
     DepthCaptureOpenNI = _Depth
 
 
+class _LegacyDepth(_Rgb):
+    instances = []
+
+    def hardware_d2c_active(self):
+        return False
+
+
+class _LegacyCore(_Core):
+    DepthCaptureOpenNI = _LegacyDepth
+
+
 class NativeBackendTests(unittest.TestCase):
     def setUp(self):
         _Rgb.instances.clear()
         _Depth.instances.clear()
+        _LegacyDepth.instances.clear()
         _Rgb.start_ok = _Depth.start_ok = True
+        _LegacyDepth.start_ok = True
+        _Depth.attested = True
+        _Depth.driver_running = True
 
     def test_separate_native_drivers_feed_python_synchronizer(self):
         backend = NativeRgbDepthBackend(
@@ -145,6 +171,20 @@ class NativeBackendTests(unittest.TestCase):
         self.assertFalse(backend.start(lambda pair: None))
         self.assertTrue(_Rgb.instances[0].stopped)
         self.assertTrue(_Depth.instances[0].stopped)
+
+    def test_false_hardware_attestation_is_rejected(self):
+        _Depth.attested = False
+        _Depth.driver_running = False
+        backend = NativeRgbDepthBackend(_Core, DeviceConfig(), SyncConfig())
+        self.assertFalse(backend.start(lambda pair: None))
+        self.assertTrue(_Rgb.instances[0].stopped)
+        self.assertTrue(_Depth.instances[0].stopped)
+
+    def test_legacy_depth_driver_without_attestation_is_rejected(self):
+        backend = NativeRgbDepthBackend(_LegacyCore, DeviceConfig(), SyncConfig())
+        self.assertFalse(backend.start(lambda pair: None))
+        self.assertTrue(_Rgb.instances[0].stopped)
+        self.assertTrue(_LegacyDepth.instances[0].stopped)
 
 
 if __name__ == "__main__":

@@ -98,7 +98,7 @@ class PipelineWorkflowTests(unittest.TestCase):
         pipeline._infer_pose_full(encoded.tobytes(), None, 6)
         self.assertEqual(estimator.calls, 2)
 
-    def test_record_pairs_debug_switch_saves_index_and_three_pngs(self):
+    def test_record_pairs_debug_rejects_untrusted_stub_depth(self):
         config = PipelineConfig()
         config.record_pairs = True
         config.device.rgb_width = 64
@@ -116,10 +116,10 @@ class PipelineWorkflowTests(unittest.TestCase):
             sessions = [path for path in Path(tmp).iterdir() if path.is_dir()]
             self.assertEqual(len(sessions), 1)
             rows = (sessions[0] / "pairs.csv").read_text(encoding="utf-8").splitlines()
-            self.assertGreater(len(rows), 1)
-            self.assertTrue(list(sessions[0].glob("pair_*_rgb.png")))
-            self.assertTrue(list(sessions[0].glob("pair_*_depth_raw_u16.png")))
-            self.assertTrue(list(sessions[0].glob("pair_*_depth_aligned_u16.png")))
+            self.assertEqual(len(rows), 1)
+            self.assertFalse(list(sessions[0].glob("pair_*_rgb.png")))
+            self.assertFalse(list(sessions[0].glob("pair_*_depth_raw_u16.png")))
+            self.assertFalse(list(sessions[0].glob("pair_*_depth_aligned_u16.png")))
 
     def test_async_stop_returns_immediately_and_waits_for_cleanup(self):
         pipeline = SensorPipeline(PipelineConfig())
@@ -151,12 +151,15 @@ class PipelineWorkflowTests(unittest.TestCase):
             session = pipeline.start_recording(tmp)
             time.sleep(0.25)
             self.assertTrue(pipeline.pause_recording())
-            paused_frames = pipeline.recording_stats()["frames"]
+            time.sleep(0.10)
+            paused_frames = pipeline.recording_stats()["rgb_frames"]
             time.sleep(0.20)
-            self.assertEqual(pipeline.recording_stats()["frames"], paused_frames)
+            self.assertEqual(pipeline.recording_stats()["rgb_frames"], paused_frames)
             self.assertTrue(pipeline.resume_recording())
             time.sleep(0.20)
-            self.assertGreater(pipeline.recording_stats()["frames"], paused_frames)
+            self.assertGreater(pipeline.recording_stats()["rgb_frames"], paused_frames)
+            self.assertEqual(pipeline.recording_stats()["frames"], 0)
+            self.assertEqual(pipeline.recording_stats()["depth_frames"], 0)
             pipeline.stop_recording()
             pipeline.stop()
             self.assertTrue((Path(session) / "skeleton_3d.csv").exists())
@@ -167,7 +170,7 @@ class PipelineWorkflowTests(unittest.TestCase):
             self.assertGreater(meta["saved_rgb_frames"], 0)
             self.assertEqual(Path(session).parent.parent.name, "output")
 
-    def test_optional_depth_video_uses_original_false_color_artifact(self):
+    def test_optional_depth_video_rejects_untrusted_stub_depth(self):
         config = PipelineConfig()
         config.device.rgb_width = 320
         config.device.rgb_height = 240
@@ -182,9 +185,10 @@ class PipelineWorkflowTests(unittest.TestCase):
             time.sleep(0.20)
             pipeline.stop_recording()
             pipeline.stop()
-            self.assertGreater((session / "depth.avi").stat().st_size, 0)
+            self.assertTrue((session / "depth.avi").exists())
             meta = json.loads((session / "meta.json").read_text(encoding="utf-8"))
-            self.assertGreater(meta["saved_depth_frames"], 0)
+            self.assertEqual(meta["saved_depth_frames"], 0)
+            self.assertEqual(meta["saved_skeleton_frames"], 0)
 
     def test_session_report_is_generated_from_recording(self):
         config = PipelineConfig()

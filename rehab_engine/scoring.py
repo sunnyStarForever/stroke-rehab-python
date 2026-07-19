@@ -17,6 +17,7 @@ import csv
 import subprocess
 import sys
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -225,7 +226,7 @@ class ScoreBridge:
     Same wire protocol as the C++ ScoreBridge.
     """
 
-    def __init__(self):
+    def __init__(self, ready_timeout_seconds: Optional[float] = None):
         self._process: Optional[subprocess.Popen] = None
         self._action_id: str = ""
         self._skeleton_fps: float = 20.0
@@ -236,6 +237,14 @@ class ScoreBridge:
         self._io_lock = threading.Lock()
         self._cancel_start = threading.Event()
         self._ready_event = threading.Event()
+        self._stderr_tail = deque(maxlen=8)
+        if ready_timeout_seconds is None:
+            try:
+                ready_timeout_seconds = float(
+                    os.environ.get("STROKE_SCORE_READY_TIMEOUT_SECONDS", "20"))
+            except ValueError:
+                ready_timeout_seconds = 20.0
+        self._ready_timeout_seconds = max(1.0, min(120.0, ready_timeout_seconds))
 
         # Callbacks
         self.on_score_updated: Optional[Callable[[ScoreResult], None]] = None
@@ -250,6 +259,7 @@ class ScoreBridge:
         self.stop()
         self._cancel_start.clear()
         self._ready_event.clear()
+        self._stderr_tail.clear()
 
         engine_dir = _find_scoring_engine()
         if engine_dir is None:
@@ -291,8 +301,13 @@ class ScoreBridge:
             target=self._read_stderr, args=(proc,), name="score-stderr", daemon=True)
         self._reader_thread.start()
 
-        if not self._ready_event.wait(timeout=5.0) or proc.poll() is not None:
-            self._emit_error("score_server exited or timed out before ready handshake")
+        if (not self._ready_event.wait(timeout=self._ready_timeout_seconds)
+                or proc.poll() is not None):
+            detail = " | ".join(self._stderr_tail)
+            message = "score_server exited or timed out before ready handshake"
+            if detail:
+                message += f": {detail}"
+            self._emit_error(message)
             self.stop()
             return False
 
@@ -428,11 +443,13 @@ class ScoreBridge:
         if proc and proc.stderr:
             for line in proc.stderr:
                 with self._state_lock:
-                    active = self._running and self._process is proc
+                    active = (self._process is proc
+                              and not self._cancel_start.is_set())
                 if not active:
                     break
                 message = line.strip()
                 if message:
+                    self._stderr_tail.append(message)
                     logger.warn(f"[ScoreBridge stderr] {message}")
 
     def _emit_error(self, message: str) -> None:

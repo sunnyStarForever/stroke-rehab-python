@@ -8,6 +8,7 @@ The synchronizer mirrors ``core/sync/SyncManager.cpp``.
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -275,15 +276,29 @@ class NativeRgbDepthBackend:
         if self._status_callback and hasattr(self._rgb, "set_on_status"):
             self._rgb.set_on_status(self._status_callback)
 
-        self._running = True
+        # Do not accept callbacks until the native depth driver has explicitly
+        # attested that a real hardware stream is active.  This also prevents
+        # a legacy module from leaking synthetic startup frames before it is
+        # rejected below.
+        self._running = False
         rgb_ok = self._rgb.start(native_config, self._on_rgb)
-        depth_ok = self._depth.start(native_config, self._on_depth)
+        depth_started = self._depth.start(native_config, self._on_depth)
+        depth_ok = False
+        if depth_started and hasattr(self._depth, "real_depth_active"):
+            deadline = time.monotonic() + 5.0
+            while (not self._depth.real_depth_active()
+                   and self._depth.is_running()
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            depth_ok = bool(self._depth.real_depth_active())
         if not rgb_ok or not depth_ok:
             self._emit(
-                f"Native capture start failed: rgb={bool(rgb_ok)} depth={bool(depth_ok)}"
+                "Native capture start failed: "
+                f"rgb={bool(rgb_ok)} real_depth={bool(depth_ok)}"
             )
             self.stop()
             return False
+        self._running = True
         self._emit("Native RGB/Depth drivers started; Python timestamp sync active")
         return True
 

@@ -107,17 +107,17 @@ bool DepthCaptureOpenNI::start(const DeviceConfig& config,
   callback_ = std::move(callback);
   running_.store(true);
   hardwareD2CActive_.store(false);
+  realDepthActive_.store(false);
   worker_ = std::thread(&DepthCaptureOpenNI::run, this);
   return true;
 }
 
 void DepthCaptureOpenNI::stop() {
-  if (!running_.exchange(false)) {
-    return;
-  }
+  running_.store(false);
   if (worker_.joinable()) {
     worker_.join();
   }
+  realDepthActive_.store(false);
 }
 
 void DepthCaptureOpenNI::setQueueDropCounter(
@@ -136,8 +136,8 @@ void DepthCaptureOpenNI::run() {
   if (OpenNI::initialize() != STATUS_OK) {
     Logger::warn(std::string("OpenNI2 init failed: ") +
                  OpenNI::getExtendedError() +
-                 ". fallback to synthetic depth stream.");
-    runFallback();
+                 ". real depth is unavailable; synthetic fallback disabled.");
+    running_.store(false);
     return;
   }
 
@@ -148,9 +148,9 @@ void DepthCaptureOpenNI::run() {
   if (device.open(uri) != STATUS_OK) {
     Logger::warn(std::string("OpenNI2 device open failed: ") +
                  OpenNI::getExtendedError() +
-                 ". fallback to synthetic depth stream.");
+                 ". real depth is unavailable; synthetic fallback disabled.");
     OpenNI::shutdown();
-    runFallback();
+    running_.store(false);
     return;
   }
 
@@ -158,11 +158,11 @@ void DepthCaptureOpenNI::run() {
   if (depthStream.create(device, SENSOR_DEPTH) != STATUS_OK) {
     Logger::warn(std::string("OpenNI2 depth stream create failed: ") +
                  OpenNI::getExtendedError() +
-                 ". fallback to synthetic depth stream.");
+                 ". real depth is unavailable; synthetic fallback disabled.");
     depthStream.destroy();
     device.close();
     OpenNI::shutdown();
-    runFallback();
+    running_.store(false);
     return;
   }
 
@@ -230,7 +230,7 @@ void DepthCaptureOpenNI::run() {
   if (depthStream.start() != STATUS_OK) {
     Logger::warn(std::string("OpenNI2 depth stream start failed: ") +
                  OpenNI::getExtendedError() +
-                 ". fallback to synthetic depth stream.");
+                 ". real depth is unavailable; synthetic fallback disabled.");
     if (colorStreamStarted) {
       colorStream.stop();
     }
@@ -240,9 +240,11 @@ void DepthCaptureOpenNI::run() {
     depthStream.destroy();
     device.close();
     OpenNI::shutdown();
-    runFallback();
+    running_.store(false);
     return;
   }
+
+  realDepthActive_.store(true);
 
   const VideoMode actualMode = depthStream.getVideoMode();
   const std::string modeName =
@@ -399,48 +401,13 @@ void DepthCaptureOpenNI::run() {
   }
   device.close();
   OpenNI::shutdown();
+  realDepthActive_.store(false);
 #else
-  Logger::warn("Built without OpenNI2, fallback to synthetic depth stream.");
-  runFallback();
+  Logger::warn(
+      "Built without OpenNI2; real depth is unavailable and synthetic "
+      "fallback is disabled.");
+  running_.store(false);
 #endif
-}
-
-void DepthCaptureOpenNI::runFallback() {
-  if (config_.enableCpuAffinity) {
-    bindCurrentThreadToCpu(config_.depthCaptureCpu, "depth_capture");
-  }
-
-  uint64_t frameId = 0;
-  const int width = config_.depthWidth > 0 ? config_.depthWidth : 640;
-  const int height = config_.depthHeight > 0 ? config_.depthHeight : 480;
-  const int fps = config_.depthFps > 0 ? config_.depthFps : 30;
-  const int frameIntervalMs = std::max(1, 1000 / fps);
-
-  while (running_.load()) {
-    cv::Mat depth(height, width, CV_16UC1);
-    for (int y = 0; y < height; ++y) {
-      uint16_t* row = depth.ptr<uint16_t>(y);
-      for (int x = 0; x < width; ++x) {
-        row[x] = static_cast<uint16_t>((x + y + frameId) % 4000 + 500);
-      }
-    }
-
-    FrameEnvelope envelope;
-    envelope.source = FrameSource::Depth;
-    tsNormalizer_.stamp(envelope, monotonicRawNowNs(), 0);
-    envelope.frameId = frameId++;
-    envelope.width = width;
-    envelope.height = height;
-    envelope.image = std::move(depth);
-    envelope.depthUnitToMeter = 0.001f;
-    envelope.pixelFormatName = "DEPTH_1_MM";
-
-    if (callback_) {
-      callback_(std::move(envelope));
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(frameIntervalMs));
-  }
 }
 
 }  // namespace rehab

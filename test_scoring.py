@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from rehab_engine.course import Course, CourseAction, CourseRunner, RunnerState
 from rehab_engine.scoring import (
@@ -123,6 +124,15 @@ class ActionArtifactTests(unittest.TestCase):
 
 
 class ScoreBridgeIntegrationTests(unittest.TestCase):
+    def test_startup_stderr_is_kept_before_ready_handshake(self):
+        bridge = ScoreBridge(ready_timeout_seconds=20.0)
+        proc = SimpleNamespace(stderr=iter(["loading model\n"]))
+        bridge._process = proc
+        with patch("rehab_engine.scoring.logger.warn") as warn:
+            bridge._read_stderr(proc)
+        self.assertEqual(list(bridge._stderr_tail), ["loading model"])
+        warn.assert_called_once_with("[ScoreBridge stderr] loading model")
+
     def test_shipped_server_is_found_and_async_frame_response_arrives(self):
         self.assertIsNotNone(_find_scoring_engine())
         bridge = ScoreBridge()
