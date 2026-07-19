@@ -7,11 +7,15 @@
  */
 
 #include <pybind11/functional.h>
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -222,28 +226,68 @@ static void registerLoggerBindings(py::module_& m) {
 // ============================================================================
 #ifndef STROKE_ENGINE_STUB
 
-// C++ capture threads call back into Python with JPEG-encoded RGB frames.
-// This avoids binding cv::Mat / FrameEnvelope — no OpenCV Python needed on the C++ side.
-// Python callback signature: callback(
-//     jpeg_bytes: bytes, width: int, height: int,
-//     ts_ns: int, frame_id: int, device_ts_us: int,
-//     depth_unit_to_meter: float, pixel_format: str, source: str
-// )
-using JpegFrameCallback = std::function<void(
-    py::bytes, int, int, uint64_t, uint64_t, uint64_t, float,
-    std::string, std::string)>;
+// Capture callbacks transfer Python-owned C-contiguous arrays. The one memcpy
+// decouples their lifetime from V4L2/OpenNI buffers before those are reused.
+static py::array copyFrameToArray(const FrameEnvelope& env) {
+  if (env.source == FrameSource::Rgb) {
+    if (env.image.type() != CV_8UC3) {
+      throw std::runtime_error("RGB callback requires CV_8UC3 BGR image");
+    }
+    py::array_t<uint8_t> output({env.height, env.width, 3});
+    auto* dst = output.mutable_data();
+    const std::size_t rowBytes = static_cast<std::size_t>(env.width) * 3U;
+    for (int row = 0; row < env.height; ++row) {
+      std::memcpy(dst + static_cast<std::size_t>(row) * rowBytes,
+                  env.image.ptr(row), rowBytes);
+    }
+    return output;
+  }
+  if (env.image.type() != CV_16UC1) {
+    throw std::runtime_error("Depth callback requires CV_16UC1 image");
+  }
+  py::array_t<uint16_t> output({env.height, env.width});
+  auto* dst = reinterpret_cast<uint8_t*>(output.mutable_data());
+  const std::size_t rowBytes = static_cast<std::size_t>(env.width) *
+                               sizeof(uint16_t);
+  for (int row = 0; row < env.height; ++row) {
+    std::memcpy(dst + static_cast<std::size_t>(row) * rowBytes,
+                env.image.ptr(row), rowBytes);
+  }
+  return output;
+}
 
-static JpegFrameCallback wrapJpegCallback(py::object obj) {
-  if (obj.is_none()) return nullptr;
-  auto fn = obj.cast<py::function>();
-  return [fn](py::bytes jpeg, int w, int h, uint64_t ts, uint64_t fid,
-              uint64_t deviceTsUs, float depthUnitToMeter,
-              std::string pixelFormat, std::string src) {
-    py::gil_scoped_acquire gil;
-    try {
-      fn(jpeg, w, h, ts, fid, deviceTsUs, depthUnitToMeter, pixelFormat, src);
-    } catch (py::error_already_set&) {}
-  };
+static void dispatchArrayFrame(const py::function& fn, FrameEnvelope env,
+                               const char* source) {
+  py::gil_scoped_acquire gil;
+  try {
+    py::array image = copyFrameToArray(env);
+    fn(image, env.width, env.height, env.syncTsNs, env.frameId,
+       env.deviceTsUs, env.depthUnitToMeter, env.pixelFormatName, source,
+       env.arrivalTsNs, env.deviceTimeUnit, env.clockQuality,
+       env.clockReason, env.clockResetCount);
+  } catch (py::error_already_set& error) {
+    error.discard_as_unraisable(source);
+  }
+}
+
+static cv::Mat bgrArrayView(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast>& image) {
+  const auto info = image.request();
+  if (info.ndim != 3 || info.shape[2] != 3) {
+    throw std::invalid_argument("BGR array must have shape (height, width, 3)");
+  }
+  return cv::Mat(static_cast<int>(info.shape[0]),
+                 static_cast<int>(info.shape[1]), CV_8UC3, info.ptr);
+}
+
+static cv::Mat depthArrayView(
+    py::array_t<uint16_t, py::array::c_style | py::array::forcecast> image) {
+  py::buffer_info info = image.request();
+  if (info.ndim != 2) {
+    throw std::invalid_argument("Depth array must have shape (height, width)");
+  }
+  return cv::Mat(static_cast<int>(info.shape[0]),
+                 static_cast<int>(info.shape[1]), CV_16UC1, info.ptr);
 }
 
 static void registerCaptureBindings(py::module_& m) {
@@ -252,18 +296,12 @@ static void registerCaptureBindings(py::module_& m) {
       .def("start",
            [](RgbCaptureV4L2& self, const DeviceConfig& config,
               py::object callback) {
-             auto pyCb = wrapJpegCallback(callback);
+             if (callback.is_none()) return self.start(config, nullptr);
+             auto pyCb = callback.cast<py::function>();
              return self.start(config,
                  [pyCb](FrameEnvelope env) {
-                   if (!pyCb || env.image.empty()) return;
-                   // JPEG encode: quality 85 balances bandwidth and CPU
-                   std::vector<uchar> buf;
-                   std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
-                   cv::imencode(".jpg", env.image, buf, params);
-                   py::bytes jpeg(reinterpret_cast<const char*>(buf.data()), buf.size());
-                   pyCb(jpeg, env.width, env.height, env.hostTsNs, env.frameId,
-                        env.deviceTsUs, env.depthUnitToMeter,
-                        env.pixelFormatName, "rgb");
+                   if (env.image.empty()) return;
+                   dispatchArrayFrame(pyCb, std::move(env), "rgb");
                  });
            },
            py::arg("config"), py::arg("frame_callback"))
@@ -282,18 +320,12 @@ static void registerCaptureBindings(py::module_& m) {
       .def("start",
            [](DepthCaptureOpenNI& self, const DeviceConfig& config,
               py::object callback) {
-             auto pyCb = wrapJpegCallback(callback);
+             if (callback.is_none()) return self.start(config, nullptr);
+             auto pyCb = callback.cast<py::function>();
              return self.start(config,
                  [pyCb](FrameEnvelope env) {
-                   if (!pyCb || env.image.empty()) return;
-                   // Depth is 16-bit mm — encode as 16-bit PNG to avoid loss
-                   std::vector<uchar> buf;
-                   std::vector<int> params = {cv::IMWRITE_PNG_COMPRESSION, 1};
-                   cv::imencode(".png", env.image, buf, params);
-                   py::bytes png(reinterpret_cast<const char*>(buf.data()), buf.size());
-                   pyCb(png, env.width, env.height, env.hostTsNs, env.frameId,
-                        env.deviceTsUs, env.depthUnitToMeter,
-                        env.pixelFormatName, "depth");
+                   if (env.image.empty()) return;
+                   dispatchArrayFrame(pyCb, std::move(env), "depth");
                  });
            },
            py::arg("config"), py::arg("frame_callback"))
@@ -334,16 +366,22 @@ static void registerSyncBindings(py::module_& m) {
 namespace {
 
 using SyncedPairCb = std::function<void(
-    py::bytes, py::bytes, int, int, int, int, uint64_t, uint64_t, int64_t)>;
+    FrameEnvelope, std::optional<FrameEnvelope>, int64_t)>;
 
 static SyncedPairCb makeSyncedPairCb(py::object obj) {
   if (obj.is_none()) return nullptr;
   auto fn = obj.cast<py::function>();
-  return [fn](py::bytes jpeg, py::bytes png,
-              int rw, int rh, int dw, int dh,
-              uint64_t rts, uint64_t dts, int64_t delta) {
+  return [fn](FrameEnvelope rgb, std::optional<FrameEnvelope> depth,
+              int64_t delta) {
     py::gil_scoped_acquire gil;
-    try { fn(jpeg, png, rw, rh, dw, dh, rts, dts, delta); }
+    try {
+      py::array rgbArray = copyFrameToArray(rgb);
+      py::object depthArray = py::none();
+      if (depth) depthArray = copyFrameToArray(*depth);
+      fn(rgbArray, depthArray, rgb.width, rgb.height,
+         depth ? depth->width : 0, depth ? depth->height : 0,
+         rgb.syncTsNs, depth ? depth->syncTsNs : 0, delta);
+    }
     catch (py::error_already_set&) {}
   };
 }
@@ -377,33 +415,18 @@ class SyncedCapture {
     if (!rgbCapture_->start(config, [this, pyCb](FrameEnvelope rgbEnv) {
           if (!rgbEnv.valid()) return;
 
-          std::vector<uchar> jpegBuf;
-          cv::imencode(".jpg", rgbEnv.image, jpegBuf,
-                       {cv::IMWRITE_JPEG_QUALITY, 85});
-
           // ── Attach latest depth frame (best-effort) ──
-          std::vector<uchar> pngBuf;
-          int dw = 0, dh = 0;
-          uint64_t dts = 0;
+          std::optional<FrameEnvelope> depth;
           int64_t delta = 0;
           {
             std::lock_guard<std::mutex> lock(depthMutex_);
             if (depthCached_ && depthCached_->valid()) {
-              cv::imencode(".png", depthCached_->image, pngBuf,
-                           {cv::IMWRITE_PNG_COMPRESSION, 1});
-              dw = depthCached_->width;
-              dh = depthCached_->height;
-              dts = depthCached_->hostTsNs;
-              delta = static_cast<int64_t>(rgbEnv.hostTsNs)
-                    - static_cast<int64_t>(depthCached_->hostTsNs);
+              depth = *depthCached_;
+              delta = static_cast<int64_t>(rgbEnv.syncTsNs)
+                    - static_cast<int64_t>(depthCached_->syncTsNs);
             }
           }
-
-          pyCb(py::bytes(reinterpret_cast<const char*>(jpegBuf.data()), jpegBuf.size()),
-               py::bytes(reinterpret_cast<const char*>(pngBuf.data()), pngBuf.size()),
-               rgbEnv.width, rgbEnv.height,
-               dw, dh,
-               rgbEnv.hostTsNs, dts, delta);
+          pyCb(std::move(rgbEnv), std::move(depth), delta);
         })) {
       Logger::warn("SyncedCapture: RGB camera start failed");
     }
@@ -522,28 +545,16 @@ static void registerPoseBindings(py::module_& m) {
            py::arg("conf_threshold") = 0.35f,
            py::arg("nms_threshold") = 0.45f)
       .def("is_initialized", &PersonDetectorOrt::isInitialized)
-      // ── P0: ONNX inference from JPEG bytes ──
-      .def("detect_jpeg",
-           [](PersonDetectorOrt& self, py::bytes jpeg) -> std::vector<BoundingBox2D> {
-             std::string buf = jpeg;
-             std::vector<uchar> vec(buf.begin(), buf.end());
-             cv::Mat bgr = cv::imdecode(vec, cv::IMREAD_COLOR);
-             if (bgr.empty()) return {};
-             return self.detect(bgr);
-           },
-           py::arg("jpeg_bytes"))
-      .def("detect_largest_person_jpeg",
-           [](PersonDetectorOrt& self, py::bytes jpeg) -> py::object {
-             std::string buf = jpeg;
-             std::vector<uchar> vec(buf.begin(), buf.end());
-             cv::Mat bgr = cv::imdecode(vec, cv::IMREAD_COLOR);
-             if (bgr.empty()) return py::none();
+      .def("detect_largest_person_bgr",
+           [](PersonDetectorOrt& self,
+              py::array_t<uint8_t, py::array::c_style |
+                                      py::array::forcecast> image) -> py::object {
+             cv::Mat bgr = bgrArrayView(image);
              auto box = self.detectLargestPerson(bgr);
              if (!box.valid) return py::none();
              return py::cast(box);
            },
-           py::arg("jpeg_bytes"),
-           "Detect the largest person in a JPEG frame. Returns BoundingBox2D or None.");
+           py::arg("bgr"));
 
   py::class_<PoseInferenceResult>(m, "PoseInferenceResult")
       .def(py::init<>())
@@ -559,21 +570,13 @@ static void registerPoseBindings(py::module_& m) {
       .def(py::init<>())
       .def("initialize", &PoseEstimatorRTMPoseOrt::initialize, py::arg("config"))
       .def("is_initialized", &PoseEstimatorRTMPoseOrt::isInitialized)
-      // ── P0: ONNX inference from JPEG bytes ──
-      // YOLO detector must be set via setBoundingBoxProvider BEFORE calling infer.
-      .def("infer_jpeg",
-           [](PoseEstimatorRTMPoseOrt& self, py::bytes jpeg) -> PoseInferenceResult {
-             std::string buf = jpeg;
-             std::vector<uchar> vec(buf.begin(), buf.end());
-             cv::Mat bgr = cv::imdecode(vec, cv::IMREAD_COLOR);
-             if (bgr.empty()) {
-               PoseInferenceResult empty;
-               return empty;
-             }
-             return self.infer(bgr);
+      .def("infer_bgr",
+           [](PoseEstimatorRTMPoseOrt& self,
+              py::array_t<uint8_t, py::array::c_style |
+                                      py::array::forcecast> image) {
+             return self.infer(bgrArrayView(image));
            },
-           py::arg("jpeg_bytes"),
-           "Run RTMPose inference on a JPEG frame. BoundingBoxProvider must be set first.")
+           py::arg("bgr"))
       .def("set_bounding_box_provider_fallback",
            [](PoseEstimatorRTMPoseOrt& self, BoundingBox2D box) {
              // Create a simple fallback provider from a fixed box
@@ -590,7 +593,7 @@ static void registerPoseBindings(py::module_& m) {
              self.setBoundingBoxProvider(std::make_shared<FixedBoxProvider>(box));
            },
            py::arg("box"),
-           "Set a fixed ROI box. Call BEFORE infer_jpeg().");
+           "Set a fixed ROI box. Call before infer_bgr().");
 
   py::class_<Halpe26ToRehab22Mapper>(m, "Halpe26ToRehab22Mapper")
       .def(py::init<>())
@@ -600,24 +603,19 @@ static void registerPoseBindings(py::module_& m) {
 
   py::class_<DepthSampler>(m, "DepthSampler")
       .def(py::init<>())
-      // ── P0: PNG depth → 3D depth samples ──
-      .def("sample_png",
-           [](DepthSampler& self, py::bytes png,
+      .def("sample_array",
+           [](DepthSampler& self,
+              py::array_t<uint16_t, py::array::c_style |
+                                           py::array::forcecast> depth,
               const Rehab22Skeleton2D& joints2d,
               float depthUnitToMeter, int windowSize) -> std::array<float, 22> {
-             std::string buf = png;
-             std::vector<uchar> vec(buf.begin(), buf.end());
-             cv::Mat depth = cv::imdecode(vec, cv::IMREAD_UNCHANGED);
-             if (depth.empty() || depth.type() != CV_16UC1) {
-               std::array<float, 22> zero{};
-               return zero;
-             }
-             return self.sample(depth, joints2d, depthUnitToMeter, windowSize);
+             return self.sample(depthArrayView(depth), joints2d,
+                                depthUnitToMeter, windowSize);
            },
-           py::arg("png_bytes"), py::arg("joints_2d"),
+           py::arg("depth"), py::arg("joints_2d"),
            py::arg("depth_unit_to_meter") = 0.001f,
            py::arg("window_size") = 7,
-           "Sample depth at Rehab22 joint positions from a 16-bit PNG. Returns 22 depth values in meters.");
+           "Sample a uint16 depth array at Rehab22 joint positions.");
 
   py::class_<JointProjector3D>(m, "JointProjector3D")
       .def(py::init<>())

@@ -165,6 +165,18 @@ def load_pipeline_config(
                 if hasattr(config.voice, k):
                     setattr(config.voice, k, v)
 
+        if "performance" in ydata:
+            perf = ydata["performance"]
+            for key, value in perf.items():
+                if hasattr(config.device, key):
+                    setattr(config.device, key, value)
+
+        if "recording" in ydata:
+            recording = ydata["recording"]
+            for key, value in recording.items():
+                if hasattr(config, key):
+                    setattr(config, key, value)
+
     # --- Load emg.yaml ---
     emg_path = root / emg_yaml
     if emg_path.exists():

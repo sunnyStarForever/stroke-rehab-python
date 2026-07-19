@@ -7,10 +7,13 @@ Pure Python, uses csv module.
 from __future__ import annotations
 
 import csv
+import concurrent.futures
 import json
 import os
+import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,10 +55,37 @@ class VideoRecorderStats:
     rgb_path: str = ""
     depth_path: str = ""
     last_write_ms: float = 0.0
+    received: int = 0
+    written: int = 0
+    dropped: int = 0
+    failed: int = 0
+    stop_dropped: int = 0
+    queue_depth: int = 0
+    queue_high_watermark: int = 0
+    write_fps: float = 0.0
+    write_avg_ms: float = 0.0
+    write_p95_ms: float = 0.0
+    metadata_path: str = ""
+    last_error: str = ""
+
+
+@dataclass(frozen=True)
+class RecordingFrame:
+    """Read-only references to one canonical synchronized RGB-D pair."""
+
+    bgr_image: Any
+    depth_image: Any
+    sync_ts_ns: int
+    rgb_frame_id: int
+    depth_frame_id: int
+    depth_unit_to_meter: float = 0.001
+    align_mode: str = "hardware"
 
 
 class RgbDepthVideoRecorder:
-    """OpenCV video writers matching the original RGB/depth recording path."""
+    """Bounded asynchronous RGB-D encoder, independent of the pose worker."""
+
+    _STOP = object()
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -68,6 +98,22 @@ class RgbDepthVideoRecorder:
         self._depth_path = ""
         self._last_write_ms = 0.0
         self._size = (0, 0)
+        self._queue: Optional[queue.Queue] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ready = threading.Event()
+        self._abort = threading.Event()
+        self._accepting = False
+        self._record_rgb = True
+        self._record_depth = False
+        self._fps = 30.0
+        self._received = self._written = self._dropped = self._failed = 0
+        self._stop_dropped = self._queue_high_watermark = 0
+        self._write_samples = deque(maxlen=512)
+        self._write_timestamps = deque(maxlen=512)
+        self._metadata_path = ""
+        self._last_error = ""
+        self._depth_transform = None
+        self._encode_pool = None
 
     def start(
         self,
@@ -77,87 +123,254 @@ class RgbDepthVideoRecorder:
         height: int,
         record_rgb: bool = True,
         record_depth: bool = False,
+        queue_capacity: int = 90,
+        ready_timeout_sec: float = 5.0,
+        depth_transform: Optional[Callable[[Any, float], Any]] = None,
     ) -> bool:
         self.stop()
-        try:
-            import cv2
-        except ImportError:
-            return not (record_rgb or record_depth)
         root = Path(session_dir)
         root.mkdir(parents=True, exist_ok=True)
-        size = (max(1, int(width)), max(1, int(height)))
-        rate = float(max(1, int(fps)))
-        rgb_writer = depth_writer = None
-        if record_rgb:
-            self._rgb_path = str(root / "rgb.mp4")
-            rgb_writer = cv2.VideoWriter(
-                self._rgb_path, cv2.VideoWriter_fourcc(*"mp4v"), rate, size, True
-            )
-            if not rgb_writer.isOpened():
-                rgb_writer.release()
-                self._rgb_path = ""
-                return False
-        if record_depth:
-            self._depth_path = str(root / "depth.avi")
-            depth_writer = cv2.VideoWriter(
-                self._depth_path, cv2.VideoWriter_fourcc(*"MJPG"), rate, size, True
-            )
-            if not depth_writer.isOpened():
-                depth_writer.release()
-                if rgb_writer is not None:
-                    rgb_writer.release()
-                self._rgb_path = self._depth_path = ""
-                return False
         with self._lock:
-            self._rgb_writer = rgb_writer
-            self._depth_writer = depth_writer
-            self._recording = True
+            self._size = (max(1, int(width)), max(1, int(height)))
+            self._fps = float(max(1, int(fps)))
+            self._record_rgb = bool(record_rgb)
+            self._record_depth = bool(record_depth)
+            self._rgb_path = str(root / "rgb.mp4") if record_rgb else ""
+            self._depth_path = str(root / "depth.avi") if record_depth else ""
+            self._metadata_path = str(root / "video_frames.csv")
+            self._queue = queue.Queue(maxsize=max(1, int(queue_capacity)))
+            self._received = self._written = self._dropped = self._failed = 0
+            self._stop_dropped = self._queue_high_watermark = 0
             self._rgb_frames = self._depth_frames = 0
             self._last_write_ms = 0.0
-            self._size = size
-        return True
+            self._write_samples.clear()
+            self._write_timestamps.clear()
+            self._last_error = ""
+            self._depth_transform = depth_transform
+            self._accepting = True
+            self._recording = False
+            self._ready.clear()
+            self._abort.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="rgbd-video-recorder", daemon=True)
+            self._thread.start()
+        if not self._ready.wait(max(0.1, float(ready_timeout_sec))):
+            self._last_error = "recording thread startup timed out"
+            self.stop()
+            return False
+        with self._lock:
+            return self._recording
 
-    def stop(self) -> None:
+    def stop(self, drain_timeout_sec: float = 5.0) -> None:
+        with self._lock:
+            self._accepting = False
+            work_queue = self._queue
+            thread = self._thread
+        if work_queue is not None and thread is not None and thread.is_alive():
+            deadline = time.monotonic() + max(0.0, float(drain_timeout_sec))
+            while thread.is_alive():
+                try:
+                    work_queue.put(self._STOP, timeout=0.05)
+                    break
+                except queue.Full:
+                    if time.monotonic() >= deadline:
+                        self._abort.set()
+                        self._discard_pending(work_queue)
+                        try:
+                            work_queue.put_nowait(self._STOP)
+                        except queue.Full:
+                            pass
+                        break
+            thread.join(timeout=max(0.1, deadline - time.monotonic() + 0.5))
         with self._lock:
             self._recording = False
-            for writer in (self._rgb_writer, self._depth_writer):
-                if writer is not None:
-                    writer.release()
-            self._rgb_writer = self._depth_writer = None
+            self._thread = None
+            self._queue = None
+
+    def submit(self, frame: RecordingFrame) -> bool:
+        with self._lock:
+            if not self._accepting or self._queue is None:
+                return False
+            work_queue = self._queue
+            self._received += 1
+        try:
+            work_queue.put_nowait(frame)
+        except queue.Full:
+            try:
+                work_queue.get_nowait()
+                work_queue.task_done()
+                with self._lock:
+                    self._dropped += 1
+            except queue.Empty:
+                pass
+            try:
+                work_queue.put_nowait(frame)
+            except queue.Full:
+                with self._lock:
+                    self._dropped += 1
+                return False
+        with self._lock:
+            self._queue_high_watermark = max(
+                self._queue_high_watermark, work_queue.qsize())
+        return True
 
     def record(self, rgb_image=None, depth_image=None) -> float:
-        started = time.perf_counter()
-        with self._lock:
-            if not self._recording:
-                return 0.0
+        """Deprecated compatibility shim; encoding remains asynchronous."""
+        self.submit(RecordingFrame(rgb_image, depth_image, time.monotonic_ns(), 0, 0))
+        return 0.0
+
+    def _run(self) -> None:
+        metadata_file = None
+        try:
             import cv2
-            if self._rgb_writer is not None and rgb_image is not None:
-                frame = rgb_image
-                if frame.shape[1::-1] != self._size:
-                    frame = cv2.resize(frame, self._size, interpolation=cv2.INTER_LINEAR)
-                # Pipeline preview images are RGB; OpenCV VideoWriter expects BGR.
-                if getattr(frame, "ndim", 0) == 3 and frame.shape[2] == 3:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                self._rgb_writer.write(frame)
-                self._rgb_frames += 1
-            if self._depth_writer is not None and depth_image is not None:
-                depth = cv2.resize(depth_image, self._size, interpolation=cv2.INTER_NEAREST)
-                valid = depth > 0
-                max_depth = float(depth[valid].max()) if valid.any() else 0.0
-                if max_depth > 0.0:
-                    depth8 = (depth.astype("float32") * (255.0 / max_depth)).clip(0, 255).astype("uint8")
-                    depth8[~valid] = 0
-                    colored = cv2.applyColorMap(depth8, cv2.COLORMAP_JET)
-                else:
-                    import numpy as np
-                    colored = np.zeros((self._size[1], self._size[0], 3), dtype=np.uint8)
-                self._depth_writer.write(colored)
-                self._depth_frames += 1
-            self._last_write_ms = (time.perf_counter() - started) * 1000.0
-            return self._last_write_ms
+            rgb_writer = depth_writer = None
+            if self._record_rgb:
+                rgb_writer = cv2.VideoWriter(
+                    self._rgb_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                    self._fps, self._size, True)
+                if not rgb_writer.isOpened():
+                    raise OSError(f"cannot open RGB video: {self._rgb_path}")
+            if self._record_depth:
+                depth_writer = cv2.VideoWriter(
+                    self._depth_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                    self._fps, self._size, True)
+                if not depth_writer.isOpened():
+                    raise OSError(f"cannot open depth video: {self._depth_path}")
+            metadata_file = open(self._metadata_path, "w", newline="", encoding="utf-8")
+            metadata = csv.writer(metadata_file)
+            metadata.writerow((
+                "written_index", "sync_ts_ns", "rgb_frame_id", "depth_frame_id",
+                "depth_unit_to_meter", "align_mode", "write_ms"))
+            with self._lock:
+                self._rgb_writer = rgb_writer
+                self._depth_writer = depth_writer
+                self._recording = True
+                if rgb_writer is not None and depth_writer is not None:
+                    self._encode_pool = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=2, thread_name_prefix="rgbd-encode")
+            self._ready.set()
+            while True:
+                work_queue = self._queue
+                if work_queue is None:
+                    break
+                item = work_queue.get()
+                try:
+                    if item is self._STOP:
+                        break
+                    if self._abort.is_set():
+                        with self._lock:
+                            self._stop_dropped += 1
+                        continue
+                    write_ms = self._write_frame(item, cv2)
+                    with self._lock:
+                        self._written += 1
+                        written_index = self._written
+                    metadata.writerow((
+                        written_index, item.sync_ts_ns, item.rgb_frame_id,
+                        item.depth_frame_id, item.depth_unit_to_meter,
+                        item.align_mode, f"{write_ms:.3f}"))
+                    if written_index % 30 == 0:
+                        metadata_file.flush()
+                except Exception as exc:
+                    with self._lock:
+                        self._failed += 1
+                        self._last_error = str(exc)
+                finally:
+                    work_queue.task_done()
+        except Exception as exc:
+            with self._lock:
+                self._failed += 1
+                self._last_error = str(exc)
+        finally:
+            self._ready.set()
+            if metadata_file is not None:
+                metadata_file.flush()
+                metadata_file.close()
+            with self._lock:
+                encode_pool = self._encode_pool
+                self._encode_pool = None
+            if encode_pool is not None:
+                encode_pool.shutdown(wait=True, cancel_futures=False)
+            with self._lock:
+                for writer in (self._rgb_writer, self._depth_writer):
+                    if writer is not None:
+                        writer.release()
+                self._rgb_writer = self._depth_writer = None
+                self._recording = False
+                self._accepting = False
+
+    def _write_frame(self, item: RecordingFrame, cv2) -> float:
+        started = time.perf_counter()
+        jobs = []
+        if self._encode_pool is not None:
+            if self._rgb_writer is not None and item.bgr_image is not None:
+                jobs.append(self._encode_pool.submit(self._write_rgb, item.bgr_image, cv2))
+            if self._depth_writer is not None and item.depth_image is not None:
+                jobs.append(self._encode_pool.submit(
+                    self._write_depth, item.depth_image,
+                    item.depth_unit_to_meter, cv2))
+            for job in jobs:
+                job.result()
+        else:
+            if self._rgb_writer is not None and item.bgr_image is not None:
+                self._write_rgb(item.bgr_image, cv2)
+            if self._depth_writer is not None and item.depth_image is not None:
+                self._write_depth(item.depth_image, item.depth_unit_to_meter, cv2)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        now = time.monotonic()
+        with self._lock:
+            self._last_write_ms = elapsed_ms
+            self._write_samples.append(elapsed_ms)
+            self._write_timestamps.append(now)
+        return elapsed_ms
+
+    def _write_rgb(self, image, cv2) -> None:
+        if self._rgb_writer is not None:
+            rgb = image
+            if rgb.shape[1::-1] != self._size:
+                rgb = cv2.resize(rgb, self._size, interpolation=cv2.INTER_LINEAR)
+            self._rgb_writer.write(rgb)
+            self._rgb_frames += 1
+
+    def _write_depth(self, image, depth_unit_to_meter: float, cv2) -> None:
+        if self._depth_writer is not None:
+            depth_source = image
+            if self._depth_transform is not None:
+                depth_source = self._depth_transform(
+                    depth_source, depth_unit_to_meter)
+            depth = cv2.resize(depth_source, self._size, interpolation=cv2.INTER_NEAREST)
+            valid = depth > 0
+            max_depth = float(depth[valid].max()) if valid.any() else 0.0
+            if max_depth > 0.0:
+                depth8 = (depth.astype("float32") * (255.0 / max_depth)).clip(0, 255).astype("uint8")
+                depth8[~valid] = 0
+                colored = cv2.applyColorMap(depth8, cv2.COLORMAP_JET)
+            else:
+                import numpy as np
+                colored = np.zeros((self._size[1], self._size[0], 3), dtype=np.uint8)
+            self._depth_writer.write(colored)
+            self._depth_frames += 1
+
+    def _discard_pending(self, work_queue: queue.Queue) -> None:
+        while True:
+            try:
+                item = work_queue.get_nowait()
+            except queue.Empty:
+                return
+            if item is not self._STOP:
+                with self._lock:
+                    self._stop_dropped += 1
+            work_queue.task_done()
 
     def stats(self) -> VideoRecorderStats:
         with self._lock:
+            values = list(self._write_samples)
+            ordered = sorted(values)
+            p95 = ordered[min(len(ordered) - 1, int((len(ordered) - 1) * 0.95 + 0.999999))] if ordered else 0.0
+            write_fps = 0.0
+            if len(self._write_timestamps) >= 2:
+                span = self._write_timestamps[-1] - self._write_timestamps[0]
+                write_fps = (len(self._write_timestamps) - 1) / span if span > 0 else 0.0
             return VideoRecorderStats(
                 self._recording,
                 self._rgb_frames,
@@ -165,6 +378,18 @@ class RgbDepthVideoRecorder:
                 self._rgb_path,
                 self._depth_path,
                 self._last_write_ms,
+                self._received,
+                self._written,
+                self._dropped,
+                self._failed,
+                self._stop_dropped,
+                self._queue.qsize() if self._queue is not None else 0,
+                self._queue_high_watermark,
+                write_fps,
+                sum(values) / len(values) if values else 0.0,
+                p95,
+                self._metadata_path,
+                self._last_error,
             )
 
 
@@ -182,6 +407,11 @@ class PairDebugRecorder:
     HEADER = (
         "pair_id", "rgb_frame_id", "depth_frame_id", "rgb_host_ts_ns",
         "depth_host_ts_ns", "rgb_device_ts_us", "depth_device_ts_us",
+        "rgb_arrival_ts_ns", "depth_arrival_ts_ns",
+        "rgb_sync_ts_ns", "depth_sync_ts_ns",
+        "rgb_clock_quality", "depth_clock_quality",
+        "rgb_clock_reason", "depth_clock_reason",
+        "rgb_clock_reset_count", "depth_clock_reset_count",
         "delta_ns", "align_mode", "rgb_file", "depth_raw_file",
         "depth_aligned_file",
     )
@@ -231,6 +461,16 @@ class PairDebugRecorder:
         depth_host_ts_ns: int,
         rgb_device_ts_us: int = 0,
         depth_device_ts_us: int = 0,
+        rgb_arrival_ts_ns: int = 0,
+        depth_arrival_ts_ns: int = 0,
+        rgb_sync_ts_ns: int = 0,
+        depth_sync_ts_ns: int = 0,
+        rgb_clock_quality: str = "host_fallback",
+        depth_clock_quality: str = "host_fallback",
+        rgb_clock_reason: str = "",
+        depth_clock_reason: str = "",
+        rgb_clock_reset_count: int = 0,
+        depth_clock_reset_count: int = 0,
         delta_ns: int = 0,
         align_mode: str = "software",
     ) -> bool:
@@ -246,8 +486,7 @@ class PairDebugRecorder:
                 "depth_aligned_file": f"{base}_depth_aligned_u16.png",
             }
             try:
-                rgb_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-                if not cv2.imwrite(str(self._session_dir / names["rgb_file"]), rgb_bgr):
+                if not cv2.imwrite(str(self._session_dir / names["rgb_file"]), rgb_image):
                     raise OSError("RGB PNG write failed")
                 if not cv2.imwrite(str(self._session_dir / names["depth_raw_file"]), depth_raw):
                     raise OSError("raw depth PNG write failed")
@@ -261,6 +500,16 @@ class PairDebugRecorder:
                     "depth_host_ts_ns": depth_host_ts_ns,
                     "rgb_device_ts_us": rgb_device_ts_us,
                     "depth_device_ts_us": depth_device_ts_us,
+                    "rgb_arrival_ts_ns": rgb_arrival_ts_ns,
+                    "depth_arrival_ts_ns": depth_arrival_ts_ns,
+                    "rgb_sync_ts_ns": rgb_sync_ts_ns,
+                    "depth_sync_ts_ns": depth_sync_ts_ns,
+                    "rgb_clock_quality": rgb_clock_quality,
+                    "depth_clock_quality": depth_clock_quality,
+                    "rgb_clock_reason": rgb_clock_reason,
+                    "depth_clock_reason": depth_clock_reason,
+                    "rgb_clock_reset_count": rgb_clock_reset_count,
+                    "depth_clock_reset_count": depth_clock_reset_count,
                     "delta_ns": delta_ns,
                     "align_mode": align_mode,
                     **names,

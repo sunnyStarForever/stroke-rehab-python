@@ -19,6 +19,7 @@ import os as _os
 import queue
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +49,9 @@ else:
     )
 
 from .preview import PreviewComposer, PreviewFrame
-from .recorder import PairDebugRecorder, RgbDepthVideoRecorder, Skeleton3DRecorder
+from .recorder import (
+    PairDebugRecorder, RecordingFrame, RgbDepthVideoRecorder, Skeleton3DRecorder,
+)
 from .emg import EmgManager
 from .inference import (
     AdaptiveRoiTracker,
@@ -66,18 +69,6 @@ from .pose3d import (
     SkeletonSmoother as PythonSkeletonSmoother,
     make_rehab22_joints,
 )
-
-
-def _decode_jpeg_to_rgb(jpeg: bytes) -> Any:
-    if np is None:
-        return None
-    try:
-        import cv2
-        arr = np.frombuffer(jpeg, dtype=np.uint8)
-        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if bgr is not None else None
-    except Exception:
-        return None
 
 
 @dataclass(frozen=True)
@@ -151,14 +142,18 @@ class SensorPipeline:
         self._last_perf_time = time.monotonic()
         self._rgb_fps = 0.0
         self._depth_fps = 0.0
-        self._pair_fps = 0.0
+        self._sync_fps = 0.0
+        self._worker_fps = 0.0
         self._pose_fps = 0.0
         self._last_yolo_ms = 0.0
         self._last_pose_ms = 0.0
         self._last_record_write_ms = 0.0
+        self._pose_ms_samples = deque(maxlen=300)
+        self._yolo_ms_samples = deque(maxlen=300)
         self._rgb_since_last = 0
         self._depth_since_last = 0
-        self._pair_since_last = 0
+        self._sync_since_last = 0
+        self._worker_since_last = 0
         self._pose_since_last = 0
 
         self._on_frame: Optional[Callable] = None
@@ -402,10 +397,14 @@ class SensorPipeline:
         with self._perf_lock:
             self._pair_id = self._processed = self._dropped = 0
             self._rgb_count = self._depth_count = self._pose_count = 0
-            self._rgb_fps = self._depth_fps = self._pair_fps = self._pose_fps = 0.0
+            self._rgb_fps = self._depth_fps = self._sync_fps = 0.0
+            self._worker_fps = self._pose_fps = 0.0
             self._rgb_since_last = self._depth_since_last = 0
-            self._pair_since_last = self._pose_since_last = 0
+            self._sync_since_last = self._worker_since_last = 0
+            self._pose_since_last = 0
             self._last_perf_time = time.monotonic()
+            self._pose_ms_samples.clear()
+            self._yolo_ms_samples.clear()
 
     # ── Recording ─────────────────────────────────────────────────
 
@@ -430,6 +429,16 @@ class SensorPipeline:
                 if not (day_dir / f"session_{index:03d}").exists()
             )
             session_dir.mkdir(parents=True, exist_ok=True)
+            depth_transform = None
+            if options.record_depth and not self._hardware_d2c_active:
+                recorder_aligner = SoftwareRegistrationAligner(
+                    load_registration_calibration(self._calibration_path()))
+                rgb_size = (
+                    self._config.device.rgb_width,
+                    self._config.device.rgb_height,
+                )
+                depth_transform = lambda depth, unit: recorder_aligner.align(
+                    depth, rgb_size, unit)
             video_ok = self._video_recorder.start(
                 str(session_dir),
                 self._config.device.rgb_fps,
@@ -437,6 +446,8 @@ class SensorPipeline:
                 self._config.device.rgb_height,
                 options.record_rgb,
                 options.record_depth,
+                queue_capacity=self._config.recording_queue_capacity,
+                depth_transform=depth_transform,
             )
             if not video_ok:
                 raise OSError(f"Cannot open video recording files in {session_dir}")
@@ -472,7 +483,7 @@ class SensorPipeline:
             self._recording = False; self._recording_paused = False
             self._emg.stop_recording()
             self._recorder.stop()
-            self._video_recorder.stop()
+            self._video_recorder.stop(self._config.recording_drain_timeout_sec)
             self._write_recording_meta(datetime.now().astimezone().isoformat())
             self._emit_status(f"Recording stopped: {self._session_dir}")
 
@@ -496,7 +507,17 @@ class SensorPipeline:
                 "frames": s.frames, "rows": s.rows, "skipped": s.skipped_frames,
                 "rgb_frames": video.rgb_frames, "depth_frames": video.depth_frames,
                 "rgb_path": video.rgb_path, "depth_path": video.depth_path,
-                "last_write_ms": video.last_write_ms}
+                "last_write_ms": video.last_write_ms,
+                "received": video.received, "written": video.written,
+                "dropped": video.dropped, "failed": video.failed,
+                "stop_dropped": video.stop_dropped,
+                "queue_depth": video.queue_depth,
+                "queue_high_watermark": video.queue_high_watermark,
+                "write_fps": video.write_fps,
+                "write_avg_ms": video.write_avg_ms,
+                "write_p95_ms": video.write_p95_ms,
+                "metadata_path": video.metadata_path,
+                "last_error": video.last_error}
 
     def _write_recording_meta(self, end_time: str) -> None:
         if not self._session_dir:
@@ -530,6 +551,15 @@ class SensorPipeline:
             "saved_skeleton_frames": skeleton.frames,
             "saved_rgb_frames": video.rgb_frames,
             "saved_depth_frames": video.depth_frames,
+            "recording_declared_fps": self._config.device.rgb_fps,
+            "recording_actual_fps": video.write_fps,
+            "recording_received": video.received,
+            "recording_written": video.written,
+            "recording_dropped": video.dropped,
+            "recording_failed": video.failed,
+            "recording_stop_dropped": video.stop_dropped,
+            "recording_queue_high_watermark": video.queue_high_watermark,
+            "recording_final_state": "stopped" if end_time else "recording",
         }
         try:
             (Path(self._session_dir) / "meta.json").write_text(
@@ -540,8 +570,11 @@ class SensorPipeline:
 
     def performance_stats(self):
         with self._perf_lock:
-            stats = {"rgb_fps": self._rgb_fps, "depth_fps": self._depth_fps,
-                    "pair_fps": self._pair_fps, "pose_fps": self._pose_fps,
+            stats = {"raw_rgb_fps": self._rgb_fps, "raw_depth_fps": self._depth_fps,
+                    "sync_fps": self._sync_fps,
+                    "worker_fps": self._worker_fps,
+                    "pair_fps": self._worker_fps, "pose_fps": self._pose_fps,
+                    "rgb_fps": self._rgb_fps, "depth_fps": self._depth_fps,
                     "yolo_ms": self._last_yolo_ms,
                     "pose_ms": self._last_pose_ms,
                     "record_write_ms": self._last_record_write_ms,
@@ -551,22 +584,66 @@ class SensorPipeline:
                     "target_fps": 30.0,
                     "rgb_30fps_ok": 27.0 <= self._rgb_fps <= 33.5,
                     "depth_30fps_ok": 27.0 <= self._depth_fps <= 33.5,
-                    "pair_30fps_ok": 27.0 <= self._pair_fps <= 33.5,
+                    "sync_30fps_ok": 27.0 <= self._sync_fps <= 33.5,
+                    "pair_30fps_ok": 27.0 <= self._worker_fps <= 33.5,
                     "camera_status": self._camera_status,
                     "stopping": self._stopping.is_set()}
             pair_recording = self._pair_recorder.stats()
+            video = self._video_recorder.stats()
+            pose_values = list(self._pose_ms_samples)
+            yolo_values = list(self._yolo_ms_samples)
+
+            def p95(values):
+                ordered = sorted(values)
+                if not ordered:
+                    return 0.0
+                return ordered[min(
+                    len(ordered) - 1,
+                    int((len(ordered) - 1) * 0.95 + 0.999999),
+                )]
+
             stats.update({
                 "debug_pairs_recording": pair_recording.recording,
                 "debug_pairs_saved": pair_recording.pairs,
                 "debug_pairs_dir": pair_recording.session_dir,
+                "pose_avg_ms": sum(pose_values) / len(pose_values) if pose_values else 0.0,
+                "pose_p95_ms": p95(pose_values),
+                "yolo_avg_ms": sum(yolo_values) / len(yolo_values) if yolo_values else 0.0,
+                "yolo_p95_ms": p95(yolo_values),
+                "record_write_ms": video.write_avg_ms,
+                "record_write_avg_ms": video.write_avg_ms,
+                "record_write_p95_ms": video.write_p95_ms,
+                "recording_queue_depth": video.queue_depth,
+                "recording_queue_high_watermark": video.queue_high_watermark,
+                "recording_received": video.received,
+                "recording_written": video.written,
+                "recording_dropped": video.dropped,
+                "recording_failed": video.failed,
+                "recording_write_fps": video.write_fps,
             })
             if self._capture_backend is not None:
                 sync = self._capture_backend.sync_stats()
+                capture_perf = self._capture_backend.performance_stats()
                 stats.update({
                     "sync_matched": sync.matched,
                     "sync_threshold_misses": sync.threshold_misses,
                     "sync_rgb_trimmed": sync.rgb_trimmed,
                     "sync_depth_trimmed": sync.depth_trimmed,
+                    "raw_rgb_fps": capture_perf["raw_rgb_fps"],
+                    "raw_depth_fps": capture_perf["raw_depth_fps"],
+                    "rgb_fps": capture_perf["raw_rgb_fps"],
+                    "depth_fps": capture_perf["raw_depth_fps"],
+                    "sync_fps": capture_perf["sync_fps"],
+                    "rgb_callback_p95_ms": capture_perf["rgb_callback_p95_ms"],
+                    "depth_callback_p95_ms": capture_perf["depth_callback_p95_ms"],
+                    "rgb_callback_state": capture_perf["rgb_callback_state"],
+                    "depth_callback_state": capture_perf["depth_callback_state"],
+                    "rgb_callback_avg_ms": capture_perf["rgb_callback_avg_ms"],
+                    "depth_callback_avg_ms": capture_perf["depth_callback_avg_ms"],
+                    "rgb_callback_max_ms": capture_perf["rgb_callback_max_ms"],
+                    "depth_callback_max_ms": capture_perf["depth_callback_max_ms"],
+                    "clock_quality_counts": capture_perf["clock_quality_counts"],
+                    "clock_states": capture_perf["clock_states"],
                 })
             return stats
 
@@ -578,10 +655,25 @@ class SensorPipeline:
 
     def _mock_capture_loop(self):
         interval = 1.0 / max(1, self._config.device.rgb_fps)
+        frame_id = 0
         while self._running.is_set():
-            self._enqueue_pair({"ts": time.monotonic_ns(), "mock": True})
+            timestamp_ns = time.monotonic_ns()
+            if (self._config.async_video_recording
+                    and self._recording and not self._recording_paused):
+                bgr_image, _untrusted_depth = self._synthetic_images()
+                self._video_recorder.submit(RecordingFrame(
+                    bgr_image=bgr_image,
+                    depth_image=None,
+                    sync_ts_ns=timestamp_ns,
+                    rgb_frame_id=frame_id,
+                    depth_frame_id=frame_id,
+                    align_mode="stub-untrusted",
+                ))
+            self._enqueue_pair({"ts": timestamp_ns, "mock": True})
             self._rgb_count += 1; self._depth_count += 1
             self._rgb_since_last += 1; self._depth_since_last += 1
+            self._sync_since_last += 1
+            frame_id += 1
             time.sleep(interval)
 
     # ── ONNX pose model init ──────────────────────────────────────
@@ -744,14 +836,12 @@ class SensorPipeline:
             def _on_pair(pair):
                 if not self._accept_frames.is_set():
                     return
-                self._rgb_count += 1; self._rgb_since_last += 1
-                self._depth_count += 1; self._depth_since_last += 1
-                self._enqueue_pair({
-                        "ts": pair.rgb.host_ts_ns, "mock": False,
-                        "jpeg": pair.rgb.payload,
+                pair_data = {
+                        "ts": pair.rgb.sync_ts_ns, "mock": False,
+                        "bgr_image": pair.rgb.image,
                         "width": pair.rgb.width,
                         "height": pair.rgb.height,
-                        "depth_png": pair.depth.payload,
+                        "depth_image": pair.depth.image,
                         "depth_width": pair.depth.width,
                         "depth_height": pair.depth.height,
                         "delta_ns": pair.delta_ns,
@@ -759,13 +849,36 @@ class SensorPipeline:
                         "depth_frame_id": pair.depth.frame_id,
                         "rgb_host_ts_ns": pair.rgb.host_ts_ns,
                         "depth_host_ts_ns": pair.depth.host_ts_ns,
+                        "rgb_arrival_ts_ns": pair.rgb.arrival_ts_ns,
+                        "depth_arrival_ts_ns": pair.depth.arrival_ts_ns,
+                        "rgb_sync_ts_ns": pair.rgb.sync_ts_ns,
+                        "depth_sync_ts_ns": pair.depth.sync_ts_ns,
                         "rgb_device_ts_us": pair.rgb.device_ts_us,
                         "depth_device_ts_us": pair.depth.device_ts_us,
                         "depth_unit_to_meter": pair.depth.depth_unit_to_meter,
                         "rgb_pixel_format_name": pair.rgb.pixel_format_name,
                         "depth_pixel_format_name": pair.depth.pixel_format_name,
+                        "rgb_clock_quality": pair.rgb.clock_quality,
+                        "depth_clock_quality": pair.depth.clock_quality,
+                        "rgb_clock_reason": pair.rgb.clock_reason,
+                        "depth_clock_reason": pair.depth.clock_reason,
+                        "rgb_clock_reset_count": pair.rgb.clock_reset_count,
+                        "depth_clock_reset_count": pair.depth.clock_reset_count,
                         "source": "python-sync",
-                    })
+                    }
+                if (self._config.async_video_recording
+                        and self._recording and not self._recording_paused):
+                    self._video_recorder.submit(RecordingFrame(
+                        bgr_image=pair.rgb.image,
+                        depth_image=pair.depth.image,
+                        sync_ts_ns=pair.rgb.sync_ts_ns,
+                        rgb_frame_id=pair.rgb.frame_id,
+                        depth_frame_id=pair.depth.frame_id,
+                        depth_unit_to_meter=pair.depth.depth_unit_to_meter,
+                        align_mode=(
+                            "hardware" if self._hardware_d2c_active else "software"),
+                    ))
+                self._enqueue_pair(pair_data)
 
             if not self._capture_backend.start(_on_pair):
                 raise RuntimeError("Native RGB/Depth backend failed to start")
@@ -815,6 +928,9 @@ class SensorPipeline:
         self._hardware_d2c_active = False
 
     def _on_camera_status(self, status: str):
+        if status.startswith("[PERF]"):
+            logger.performance(status)
+            return
         logger.info(f"[Camera] {status}")
         self._emit_status(f"[Camera] {status}")
 
@@ -832,7 +948,7 @@ class SensorPipeline:
             try: pair = self._pair_queue.get(timeout=0.1)
             except queue.Empty: continue
 
-            self._processed += 1; self._pair_since_last += 1; self._pair_id += 1
+            self._processed += 1; self._worker_since_last += 1; self._pair_id += 1
             emg_status, emg_rms, emg_fatigue = self._tick_emg(
                 int(pair.get("ts", 0))
             )
@@ -842,17 +958,24 @@ class SensorPipeline:
                 depth_unit_to_meter = 0.001
                 pose_2d, pose_3d, bbox = self._synthetic_pose_full()
                 rgb_image, depth_image = self._synthetic_images()
+                bgr_image = rgb_image
                 depth_raw = depth_image
                 pose_ms = 0.0; yolo_ms = 0.0
             else:
                 depth_unit_to_meter = float(pair.get("depth_unit_to_meter", 0.001))
-                jpeg = pair.get("jpeg"); depth_png = pair.get("depth_png")
-                rgb_image = _decode_jpeg_to_rgb(jpeg) if jpeg else None
-                depth_raw = self._decode_depth_png(depth_png)
+                bgr_image = pair.get("bgr_image")
+                depth_raw = pair.get("depth_image")
+                rgb_image = None
+                if bgr_image is not None:
+                    try:
+                        import cv2
+                        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+                    except Exception:
+                        rgb_image = None
                 depth_image = self._align_depth(depth_raw, depth_unit_to_meter)
                 pose_2d, pose_3d, bbox, pose_ms, yolo_ms = \
                     self._infer_pose_full(
-                        jpeg, depth_image, pose_interval, depth_unit_to_meter)
+                        bgr_image, depth_image, pose_interval, depth_unit_to_meter)
 
             # Stub/synthetic depth remains useful for exercising the RGB/UI
             # loop, but it must never reach any depth-dependent consumer.
@@ -864,10 +987,10 @@ class SensorPipeline:
                 self._last_ema_j3d = []
 
             if self._pair_recorder.stats().recording and all(
-                image is not None for image in (rgb_image, depth_raw, depth_image)
+                image is not None for image in (bgr_image, depth_raw, depth_image)
             ):
                 self._pair_recorder.record(
-                    rgb_image=rgb_image,
+                    rgb_image=bgr_image,
                     depth_raw=depth_raw,
                     depth_aligned=depth_image,
                     rgb_frame_id=int(pair.get("frame_id", self._pair_id)),
@@ -876,21 +999,45 @@ class SensorPipeline:
                     depth_host_ts_ns=int(pair.get("depth_host_ts_ns", pair.get("ts", 0))),
                     rgb_device_ts_us=int(pair.get("rgb_device_ts_us", 0)),
                     depth_device_ts_us=int(pair.get("depth_device_ts_us", 0)),
+                    rgb_arrival_ts_ns=int(pair.get("rgb_arrival_ts_ns", 0)),
+                    depth_arrival_ts_ns=int(pair.get("depth_arrival_ts_ns", 0)),
+                    rgb_sync_ts_ns=int(pair.get("rgb_sync_ts_ns", pair.get("ts", 0))),
+                    depth_sync_ts_ns=int(pair.get("depth_sync_ts_ns", pair.get("ts", 0))),
+                    rgb_clock_quality=str(pair.get("rgb_clock_quality", "host_fallback")),
+                    depth_clock_quality=str(pair.get("depth_clock_quality", "host_fallback")),
+                    rgb_clock_reason=str(pair.get("rgb_clock_reason", "")),
+                    depth_clock_reason=str(pair.get("depth_clock_reason", "")),
+                    rgb_clock_reset_count=int(pair.get("rgb_clock_reset_count", 0)),
+                    depth_clock_reset_count=int(pair.get("depth_clock_reset_count", 0)),
                     delta_ns=int(pair.get("delta_ns", 0)),
                     align_mode="hardware" if self._hardware_d2c_active else "software",
                 )
 
-            record_write_ms = 0.0
             if self._recording and not self._recording_paused:
+                if not self._config.async_video_recording:
+                    self._video_recorder.submit(RecordingFrame(
+                        bgr_image=bgr_image,
+                        depth_image=depth_image,
+                        sync_ts_ns=int(pair.get("ts", 0)),
+                        rgb_frame_id=int(pair.get("frame_id", self._pair_id)),
+                        depth_frame_id=int(pair.get("depth_frame_id", self._pair_id)),
+                        depth_unit_to_meter=depth_unit_to_meter,
+                        align_mode=(
+                            "hardware" if self._hardware_d2c_active else "software"),
+                    ))
                 if (depth_is_hardware
                         and self._recording_options.record_skeleton):
                     self._record_skeleton(pose_3d, int(pair.get("ts", 0)))
-                record_write_ms = self._video_recorder.record(rgb_image, depth_image)
+            video_stats = self._video_recorder.stats()
+            record_write_ms = video_stats.write_avg_ms
             with self._perf_lock:
                 self._last_yolo_ms = yolo_ms
-                self._last_pose_ms = pose_ms
+                if pose_ms > 0.0:
+                    self._last_pose_ms = pose_ms
+                    self._pose_ms_samples.append(pose_ms)
+                if yolo_ms > 0.0:
+                    self._yolo_ms_samples.append(yolo_ms)
                 self._last_record_write_ms = record_write_ms
-            video_stats = self._video_recorder.stats()
             raw_j3d = [
                 (point.x, point.y, point.z, point.score, point.valid)
                 for point in self._last_raw_j3d
@@ -900,6 +1047,7 @@ class SensorPipeline:
                 for point in self._last_ema_j3d
             ]
 
+            perf_snapshot = self.performance_stats()
             self._preview.submit(
                 pair_id=self._pair_id,
                 rgb_frame_id=int(pair.get("frame_id", self._pair_id)),
@@ -912,8 +1060,11 @@ class SensorPipeline:
                 pose_interval=pose_interval,
                 joints_2d_raw=pose_2d, joints_3d=pose_3d,
                 raw_joints_3d=raw_j3d, ema_joints_3d=ema_j3d,
-                rgb_fps=self._rgb_fps, depth_fps=self._depth_fps,
-                pair_fps=self._pair_fps, pose_fps=self._pose_fps,
+                raw_rgb_fps=perf_snapshot.get("raw_rgb_fps", 0.0),
+                raw_depth_fps=perf_snapshot.get("raw_depth_fps", 0.0),
+                sync_fps=perf_snapshot.get("sync_fps", 0.0),
+                worker_fps=self._worker_fps, pair_fps=self._worker_fps,
+                pose_fps=self._pose_fps,
                 yolo_ms=yolo_ms, pose_ms=pose_ms,
                 record_write_ms=record_write_ms,
                 queue_length=self._pair_queue.qsize(),
@@ -998,10 +1149,10 @@ class SensorPipeline:
     # ── Full ONNX pose inference ──────────────────────────────────
 
     def _infer_pose_full(
-        self, jpeg, depth_image, pose_interval, depth_unit_to_meter: float = 0.001
+        self, bgr, depth_image, pose_interval, depth_unit_to_meter: float = 0.001
     ):
         # If pose is disabled or models aren't ready, return last cached skeleton
-        if jpeg is None or not self._pose_models_ready:
+        if bgr is None or not self._pose_models_ready:
             return self._last_j2d, self._last_j3d, self._last_bbox, 0.0, 0.0
 
         self._frame_counter += 1
@@ -1025,10 +1176,6 @@ class SensorPipeline:
 
         try:
             if self._python_inference:
-                import cv2
-                bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                if bgr is None:
-                    raise ValueError("cannot decode RGB JPEG for Python inference")
                 t0 = time.monotonic()
                 box = (
                     self._roi_tracker.get_primary_box(bgr)
@@ -1058,7 +1205,7 @@ class SensorPipeline:
             else:
                 t0 = time.monotonic()
                 box = (
-                    self._person_detector.detect_largest_person_jpeg(jpeg)
+                    self._person_detector.detect_largest_person_bgr(bgr)
                     if self._person_detector
                     else None
                 )
@@ -1069,7 +1216,7 @@ class SensorPipeline:
                     bb.x = box.x; bb.y = box.y; bb.w = box.w; bb.h = box.h
                     bb.valid = box.valid; bb.score = box.score
                     self._pose_estimator.set_bounding_box_provider_fallback(bb)
-                result = self._pose_estimator.infer_jpeg(jpeg)
+                result = self._pose_estimator.infer_bgr(bgr)
                 pose_ms = (time.monotonic() - t1) * 1000.0
                 if result is None or not result.model_loaded:
                     return self._last_j2d, self._last_j3d, self._last_bbox, pose_ms, yolo_ms
@@ -1149,14 +1296,6 @@ class SensorPipeline:
         ]
 
     # ── Helpers ───────────────────────────────────────────────────
-
-    @staticmethod
-    def _decode_depth_png(png):
-        if png is None or np is None: return None
-        try:
-            import cv2
-            return cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-        except Exception: return None
 
     def _tick_emg(self, host_ts_ns: int = 0):
         status = self._emg.runtime_status()
@@ -1253,10 +1392,12 @@ class SensorPipeline:
             with self._perf_lock:
                 self._rgb_fps = self._rgb_since_last / elapsed
                 self._depth_fps = self._depth_since_last / elapsed
-                self._pair_fps = self._pair_since_last / elapsed
+                self._sync_fps = self._sync_since_last / elapsed
+                self._worker_fps = self._worker_since_last / elapsed
                 self._pose_fps = self._pose_since_last / elapsed
                 self._rgb_since_last = 0; self._depth_since_last = 0
-                self._pair_since_last = 0; self._pose_since_last = 0
+                self._sync_since_last = 0; self._worker_since_last = 0
+                self._pose_since_last = 0
                 self._last_perf_time = now
 
     def _emit_status(self, message: str):

@@ -58,8 +58,12 @@ class PreviewFrame:
     has_valid_3d: bool = False
 
     # FPS / performance
-    rgb_fps: float = 0.0
-    depth_fps: float = 0.0
+    raw_rgb_fps: float = 0.0
+    raw_depth_fps: float = 0.0
+    sync_fps: float = 0.0
+    worker_fps: float = 0.0
+    rgb_fps: float = 0.0  # compatibility alias for raw_rgb_fps
+    depth_fps: float = 0.0  # compatibility alias for raw_depth_fps
     pair_fps: float = 0.0
     pose_fps: float = 0.0
     yolo_ms: float = 0.0
@@ -149,6 +153,10 @@ class PreviewComposer:
                raw_joints_3d: Optional[List[Tuple[float, float, float, float, bool]]] = None,
                ema_joints_3d: Optional[List[Tuple[float, float, float, float, bool]]] = None,
                # Performance
+               raw_rgb_fps: float = 0.0,
+               raw_depth_fps: float = 0.0,
+               sync_fps: float = 0.0,
+               worker_fps: float = 0.0,
                rgb_fps: float = 0.0,
                depth_fps: float = 0.0,
                pair_fps: float = 0.0,
@@ -217,9 +225,13 @@ class PreviewComposer:
         frame.has_valid_3d = bool(depth_is_hardware) and any(
             j.valid for j in frame.joints_3d)
 
-        frame.rgb_fps = rgb_fps
-        frame.depth_fps = depth_fps
-        frame.pair_fps = pair_fps
+        frame.raw_rgb_fps = raw_rgb_fps or rgb_fps
+        frame.raw_depth_fps = raw_depth_fps or depth_fps
+        frame.sync_fps = sync_fps
+        frame.worker_fps = worker_fps or pair_fps
+        frame.rgb_fps = frame.raw_rgb_fps
+        frame.depth_fps = frame.raw_depth_fps
+        frame.pair_fps = frame.worker_fps
         frame.pose_fps = pose_fps
         frame.yolo_ms = yolo_ms
         frame.pose_ms = pose_ms

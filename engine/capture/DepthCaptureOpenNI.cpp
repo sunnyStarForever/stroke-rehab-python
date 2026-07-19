@@ -105,6 +105,7 @@ bool DepthCaptureOpenNI::start(const DeviceConfig& config,
 
   config_ = config;
   callback_ = std::move(callback);
+  tsNormalizer_.reset();
   running_.store(true);
   hardwareD2CActive_.store(false);
   realDepthActive_.store(false);
@@ -257,7 +258,6 @@ void DepthCaptureOpenNI::run() {
 
   uint64_t frameId = 0;
   uint64_t lastLogNs = monotonicRawNowNs();
-  uint64_t lastWarnNs = 0;
   uint64_t lastHostTsNs = 0;
   uint64_t lastDeviceTsUs = 0;
   uint64_t framesSinceLog = 0;
@@ -265,6 +265,7 @@ void DepthCaptureOpenNI::run() {
   double sumReadMs = 0.0;
   double sumCopyMs = 0.0;
   double sumCbMs = 0.0;
+  double maxCbMs = 0.0;
   double sumHostDeltaMs = 0.0;
   double sumOpenNiDeltaMs = 0.0;
   uint64_t deltaCount = 0;
@@ -305,13 +306,23 @@ void DepthCaptureOpenNI::run() {
 
     FrameEnvelope envelope;
     envelope.source = FrameSource::Depth;
-    tsNormalizer_.stamp(envelope, hostTsNs, deviceTsUs);
+    tsNormalizer_.stampDeviceMicroseconds(envelope, hostTsNs, deviceTsUs);
     envelope.frameId = frameId++;
     envelope.width = frame.getWidth();
     envelope.height = frame.getHeight();
     envelope.image = std::move(depthCopy);
     envelope.depthUnitToMeter = unitToMeter;
     envelope.pixelFormatName = framePixelFormatName;
+
+    if (envelope.frameId == 0) {
+      std::ostringstream trace;
+      trace << "[DEPTH TS] device_us=" << deviceTsUs
+            << " arrival_ns=" << hostTsNs
+            << " sync_ns=" << envelope.syncTsNs
+            << " quality=" << envelope.clockQuality
+            << " unit=" << framePixelFormatName;
+      Logger::info(trace.str());
+    }
 
     if ((envelope.frameId % 30ULL) == 0ULL) {
       lastZeroRate = sampledZeroRatePercent(envelope.image, 16);
@@ -323,20 +334,11 @@ void DepthCaptureOpenNI::run() {
     }
     const uint64_t cbEndNs = monotonicRawNowNs();
     const double cbMs = nsToMs(cbEndNs - cbStartNs);
-    if (cbMs > 2.0 && (lastWarnNs == 0 ||
-                       cbEndNs - lastWarnNs >= 1000000000ULL)) {
-      std::ostringstream warn;
-      warn << std::fixed << std::setprecision(2)
-           << "[DEPTH WARN] callback too slow, should only push latest queue: "
-           << "cost=" << cbMs << " ms";
-      Logger::warn(warn.str());
-      lastWarnNs = cbEndNs;
-    }
-
     sumWaitMs += nsToMs(waitEndNs - waitStartNs);
     sumReadMs += nsToMs(readEndNs - readStartNs);
     sumCopyMs += nsToMs(copyEndNs - copyStartNs);
     sumCbMs += cbMs;
+    maxCbMs = std::max(maxCbMs, cbMs);
     ++framesSinceLog;
 
     if (lastHostTsNs > 0 && hostTsNs > lastHostTsNs) {
@@ -373,6 +375,7 @@ void DepthCaptureOpenNI::run() {
           << "ms read=" << (sumReadMs / denom)
           << "ms copy=" << (sumCopyMs / denom)
           << "ms cb=" << (sumCbMs / denom)
+          << "ms cb_max=" << maxCbMs
           << "ms queue_drop=" << queueDrop
           << " openni_ts_delta=" << (sumOpenNiDeltaMs / deltaDenom)
           << "ms host_delta=" << (sumHostDeltaMs / deltaDenom)
@@ -385,6 +388,7 @@ void DepthCaptureOpenNI::run() {
       sumReadMs = 0.0;
       sumCopyMs = 0.0;
       sumCbMs = 0.0;
+      maxCbMs = 0.0;
       sumHostDeltaMs = 0.0;
       sumOpenNiDeltaMs = 0.0;
       deltaCount = 0;

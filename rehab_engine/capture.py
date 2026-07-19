@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Deque, Dict, Generic, Optional, TypeVar
 
+from .performance import CallbackPerformanceMonitor
+
 
 class FrameSource(str, Enum):
     RGB = "rgb"
@@ -23,19 +25,30 @@ class FrameSource(str, Enum):
 @dataclass(frozen=True)
 class FrameEnvelope:
     source: FrameSource
-    payload: bytes
+    image: Any
     width: int
     height: int
-    host_ts_ns: int
+    sync_ts_ns: int
+    arrival_ts_ns: int = 0
     device_ts_us: int = 0
     frame_id: int = 0
-    encoding: str = ""
     depth_unit_to_meter: float = 0.001
     pixel_format_name: str = ""
+    device_time_unit: str = "us"
+    clock_quality: str = "host_fallback"
+    clock_reason: str = ""
+    clock_reset_count: int = 0
+
+    @property
+    def host_ts_ns(self) -> int:
+        """Compatibility alias; synchronization uses ``sync_ts_ns``."""
+        return self.arrival_ts_ns or self.sync_ts_ns
 
     @property
     def valid(self) -> bool:
-        return self.width > 0 and self.height > 0 and bool(self.payload)
+        size = getattr(self.image, "size", None)
+        has_data = bool(size) if size is not None else bool(self.image)
+        return self.width > 0 and self.height > 0 and has_data
 
 
 @dataclass(frozen=True)
@@ -60,19 +73,23 @@ class SyncStats:
 class TimestampNormalizer:
     @staticmethod
     def stamp(
-        frame: FrameEnvelope, host_ts_ns: int, device_ts_us: int = 0
+        frame: FrameEnvelope, arrival_ts_ns: int, device_ts_us: int = 0
     ) -> FrameEnvelope:
         return FrameEnvelope(
             source=frame.source,
-            payload=frame.payload,
+            image=frame.image,
             width=frame.width,
             height=frame.height,
-            host_ts_ns=host_ts_ns,
+            sync_ts_ns=arrival_ts_ns,
+            arrival_ts_ns=arrival_ts_ns,
             device_ts_us=device_ts_us,
             frame_id=frame.frame_id,
-            encoding=frame.encoding,
             depth_unit_to_meter=frame.depth_unit_to_meter,
             pixel_format_name=frame.pixel_format_name,
+            device_time_unit=frame.device_time_unit,
+            clock_quality="host_fallback",
+            clock_reason="python_stamp",
+            clock_reset_count=frame.clock_reset_count,
         )
 
 
@@ -121,17 +138,17 @@ class FrameSynchronizer:
         anchor = anchor_queue[-1]
         best_index = min(
             range(len(other_queue)),
-            key=lambda index: abs(anchor.host_ts_ns - other_queue[index].host_ts_ns),
+            key=lambda index: abs(anchor.sync_ts_ns - other_queue[index].sync_ts_ns),
         )
         other = other_queue[best_index]
-        if abs(anchor.host_ts_ns - other.host_ts_ns) > self.match_threshold_ns:
+        if abs(anchor.sync_ts_ns - other.sync_ts_ns) > self.match_threshold_ns:
             self._threshold_misses += 1
             return None
         del other_queue[best_index]
         anchor_queue.pop()
         rgb, depth = (anchor, other) if incoming is FrameSource.RGB else (other, anchor)
         self._matched += 1
-        return SyncedFramePair(rgb, depth, rgb.host_ts_ns - depth.host_ts_ns)
+        return SyncedFramePair(rgb, depth, rgb.sync_ts_ns - depth.sync_ts_ns)
 
     def _trim(self, queue: Deque[FrameEnvelope], source: FrameSource) -> None:
         while len(queue) > self.queue_size:
@@ -257,6 +274,26 @@ class NativeRgbDepthBackend:
         self._depth = None
         self._running = False
         self._status_callback: Optional[Callable[[str], None]] = None
+        self._started_at = 0.0
+        self._rgb_callback_ms: Deque[float] = deque(maxlen=512)
+        self._depth_callback_ms: Deque[float] = deque(maxlen=512)
+        self._sync_arrivals: Deque[float] = deque()
+        self._perf_monitor = CallbackPerformanceMonitor(
+            window_seconds=getattr(device_config, "callback_perf_window_sec", 5.0),
+            min_samples=getattr(device_config, "callback_perf_min_samples", 30),
+            normal_p95_ms=getattr(device_config, "callback_normal_p95_ms", 8.0),
+            warn_p95_ms=getattr(device_config, "callback_warn_p95_ms", 10.0),
+            critical_p95_ms=getattr(device_config, "callback_critical_p95_ms", 25.0),
+            warn_sustain_seconds=getattr(device_config, "callback_warn_sustain_sec", 5.0),
+            low_fps_sustain_seconds=getattr(device_config, "callback_low_fps_sustain_sec", 3.0),
+            recovery_seconds=getattr(device_config, "callback_recovery_sec", 5.0),
+            target_fps={
+                "rgb": float(getattr(device_config, "rgb_fps", 30)),
+                "depth": float(getattr(device_config, "depth_fps", 30)),
+            },
+        )
+        self._clock_state: Dict[FrameSource, tuple[str, str, int]] = {}
+        self._clock_quality_counts: Dict[str, int] = {}
 
     @property
     def is_running(self) -> bool:
@@ -269,7 +306,22 @@ class NativeRgbDepthBackend:
         if self._running:
             return True
         self._sync.reset()
-        self._sync.set_on_pair_ready(pair_callback)
+        self._rgb_callback_ms.clear()
+        self._depth_callback_ms.clear()
+        self._sync_arrivals.clear()
+        self._perf_monitor.reset()
+        self._clock_state.clear()
+        self._clock_quality_counts.clear()
+        def observed_pair_callback(pair: SyncedFramePair) -> None:
+            now = time.monotonic()
+            self._sync_arrivals.append(now)
+            cutoff = now - max(0.1, float(getattr(
+                self._device_config, "callback_perf_window_sec", 5.0)))
+            while self._sync_arrivals and self._sync_arrivals[0] < cutoff:
+                self._sync_arrivals.popleft()
+            pair_callback(pair)
+
+        self._sync.set_on_pair_ready(observed_pair_callback)
         native_config = _native_device_config(self._core, self._device_config)
         self._rgb = self._core.RgbCaptureV4L2()
         self._depth = self._core.DepthCaptureOpenNI()
@@ -299,6 +351,7 @@ class NativeRgbDepthBackend:
             self.stop()
             return False
         self._running = True
+        self._started_at = time.monotonic()
         self._emit("Native RGB/Depth drivers started; Python timestamp sync active")
         return True
 
@@ -317,49 +370,164 @@ class NativeRgbDepthBackend:
         if errors:
             raise RuntimeError("; ".join(errors))
 
-    def _on_rgb(self, payload, width, height, ts_ns, frame_id, *extra) -> None:
+    def _on_rgb(
+        self, image, width, height, sync_ts_ns, frame_id,
+        device_ts_us=0, _depth_unit=0.001, pixel_format="", _source="rgb",
+        arrival_ts_ns=0, device_time_unit="us", clock_quality="host_fallback",
+        clock_reason="", clock_reset_count=0,
+    ) -> None:
         if self._running:
-            device_ts_us = int(extra[0]) if len(extra) >= 2 else 0
-            pixel_format = str(extra[2]) if len(extra) >= 4 else ""
+            if not self._valid_native_array(FrameSource.RGB, image, width, height):
+                return
+            observed_at = time.monotonic()
+            self._perf_monitor.observe_arrival("rgb", observed_at)
+            started = time.perf_counter()
+            self._observe_clock(
+                FrameSource.RGB, str(clock_quality), str(clock_reason),
+                int(clock_reset_count))
             self._sync.push_frame(
                 FrameEnvelope(
-                    FrameSource.RGB,
-                    bytes(payload),
-                    width,
-                    height,
-                    ts_ns,
+                    source=FrameSource.RGB,
+                    image=image,
+                    width=int(width),
+                    height=int(height),
+                    sync_ts_ns=int(sync_ts_ns),
+                    arrival_ts_ns=int(arrival_ts_ns or sync_ts_ns),
                     device_ts_us=device_ts_us,
                     frame_id=frame_id,
-                    encoding="jpeg",
-                    pixel_format_name=pixel_format,
+                    pixel_format_name=str(pixel_format),
+                    device_time_unit=str(device_time_unit),
+                    clock_quality=str(clock_quality),
+                    clock_reason=str(clock_reason),
+                    clock_reset_count=int(clock_reset_count),
                 )
             )
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            self._rgb_callback_ms.append(duration_ms)
+            event = self._perf_monitor.observe_callback("rgb", duration_ms, observed_at)
+            if event is not None:
+                self._emit(event.log_message())
 
-    def _on_depth(self, payload, width, height, ts_ns, frame_id, *extra) -> None:
+    def _on_depth(
+        self, image, width, height, sync_ts_ns, frame_id,
+        device_ts_us=0, depth_unit=0.001, pixel_format="", _source="depth",
+        arrival_ts_ns=0, device_time_unit="us", clock_quality="host_fallback",
+        clock_reason="", clock_reset_count=0,
+    ) -> None:
         if self._running:
-            device_ts_us = int(extra[0]) if len(extra) >= 2 else 0
-            depth_unit = float(extra[1]) if len(extra) >= 4 else 0.001
-            pixel_format = str(extra[2]) if len(extra) >= 4 else ""
+            if not self._valid_native_array(FrameSource.DEPTH, image, width, height):
+                return
+            observed_at = time.monotonic()
+            self._perf_monitor.observe_arrival("depth", observed_at)
+            started = time.perf_counter()
+            self._observe_clock(
+                FrameSource.DEPTH, str(clock_quality), str(clock_reason),
+                int(clock_reset_count))
             self._sync.push_frame(
                 FrameEnvelope(
-                    FrameSource.DEPTH,
-                    bytes(payload),
-                    width,
-                    height,
-                    ts_ns,
+                    source=FrameSource.DEPTH,
+                    image=image,
+                    width=int(width),
+                    height=int(height),
+                    sync_ts_ns=int(sync_ts_ns),
+                    arrival_ts_ns=int(arrival_ts_ns or sync_ts_ns),
                     device_ts_us=device_ts_us,
                     frame_id=frame_id,
-                    encoding="png16",
                     depth_unit_to_meter=depth_unit,
-                    pixel_format_name=pixel_format,
+                    pixel_format_name=str(pixel_format),
+                    device_time_unit=str(device_time_unit),
+                    clock_quality=str(clock_quality),
+                    clock_reason=str(clock_reason),
+                    clock_reset_count=int(clock_reset_count),
                 )
             )
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            self._depth_callback_ms.append(duration_ms)
+            event = self._perf_monitor.observe_callback("depth", duration_ms, observed_at)
+            if event is not None:
+                self._emit(event.log_message())
 
     def hardware_d2c_active(self) -> bool:
         return bool(self._depth and self._depth.hardware_d2c_active())
 
     def sync_stats(self) -> SyncStats:
         return self._sync.stats()
+
+    def performance_stats(self) -> Dict[str, Any]:
+        elapsed = max(0.0, time.monotonic() - self._started_at) if self._started_at else 0.0
+        stats = self._sync.stats()
+
+        now = time.monotonic()
+        for source in ("rgb", "depth"):
+            event = self._perf_monitor.evaluate(source, now)
+            if event is not None:
+                self._emit(event.log_message())
+        rgb_perf = self._perf_monitor.snapshot("rgb", now)
+        depth_perf = self._perf_monitor.snapshot("depth", now)
+        sync_fps = 0.0
+        if len(self._sync_arrivals) >= 2:
+            span = self._sync_arrivals[-1] - self._sync_arrivals[0]
+            sync_fps = (len(self._sync_arrivals) - 1) / span if span > 0 else 0.0
+
+        return {
+            "elapsed_seconds": elapsed,
+            "raw_rgb_fps": rgb_perf.raw_fps,
+            "raw_depth_fps": depth_perf.raw_fps,
+            "sync_fps": sync_fps,
+            "rgb_callback_state": rgb_perf.state,
+            "depth_callback_state": depth_perf.state,
+            "rgb_callback_avg_ms": rgb_perf.callback_avg_ms,
+            "depth_callback_avg_ms": depth_perf.callback_avg_ms,
+            "rgb_callback_p50_ms": rgb_perf.callback_p50_ms,
+            "depth_callback_p50_ms": depth_perf.callback_p50_ms,
+            "rgb_callback_p95_ms": rgb_perf.callback_p95_ms,
+            "depth_callback_p95_ms": depth_perf.callback_p95_ms,
+            "rgb_callback_max_ms": rgb_perf.callback_max_ms,
+            "depth_callback_max_ms": depth_perf.callback_max_ms,
+            "clock_quality_counts": dict(self._clock_quality_counts),
+            "clock_states": {
+                source.value: {
+                    "quality": state[0], "reason": state[1],
+                    "reset_count": state[2],
+                }
+                for source, state in self._clock_state.items()
+            },
+        }
+
+    def _observe_clock(
+        self, source: FrameSource, quality: str, reason: str, reset_count: int
+    ) -> None:
+        key = f"{source.value}:{quality}"
+        self._clock_quality_counts[key] = self._clock_quality_counts.get(key, 0) + 1
+        state = (quality, reason, reset_count)
+        if self._clock_state.get(source) == state:
+            return
+        self._clock_state[source] = state
+        detail = f" reason={reason}" if reason else ""
+        self._emit(
+            f"Clock {source.value}: quality={quality} resets={reset_count}{detail}")
+
+    def _valid_native_array(
+        self, source: FrameSource, image: Any, width: int, height: int
+    ) -> bool:
+        expected_shape = (
+            (int(height), int(width), 3)
+            if source is FrameSource.RGB else (int(height), int(width))
+        )
+        expected_dtype = "uint8" if source is FrameSource.RGB else "uint16"
+        valid = (
+            getattr(image, "shape", None) == expected_shape
+            and str(getattr(image, "dtype", "")) == expected_dtype
+            and bool(getattr(getattr(image, "flags", None), "c_contiguous", False))
+        )
+        if not valid:
+            self._emit(
+                f"Rejected {source.value} callback array: "
+                f"shape={getattr(image, 'shape', None)} "
+                f"dtype={getattr(image, 'dtype', None)} expected={expected_shape}/{expected_dtype}")
+        elif hasattr(image, "setflags"):
+            image.setflags(write=False)
+        return valid
 
     def _emit(self, message: str) -> None:
         if self._status_callback:

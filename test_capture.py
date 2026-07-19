@@ -1,4 +1,8 @@
+import gc
 import unittest
+import weakref
+
+import numpy as np
 
 from rehab_engine import DeviceConfig, SyncConfig
 from rehab_engine.capture import (
@@ -12,7 +16,10 @@ from rehab_engine.capture import (
 
 
 def _frame(source, timestamp, frame_id=0):
-    return FrameEnvelope(source, b"data", 640, 480, timestamp, frame_id=frame_id)
+    shape = (2, 3, 3) if source is FrameSource.RGB else (2, 3)
+    dtype = np.uint8 if source is FrameSource.RGB else np.uint16
+    return FrameEnvelope(source, np.ones(shape, dtype=dtype), 3, 2, timestamp,
+                         arrival_ts_ns=timestamp + 10, frame_id=frame_id)
 
 
 class FrameSynchronizerTests(unittest.TestCase):
@@ -63,11 +70,22 @@ class QueueAndTimestampTests(unittest.TestCase):
         self.assertEqual(queue.pop_latest(0), 2)
         self.assertEqual((queue.pushed, queue.popped, queue.dropped), (2, 1, 1))
 
-    def test_timestamp_normalizer_preserves_payload_and_device_time(self):
+    def test_timestamp_normalizer_preserves_image_and_device_time(self):
         frame = _frame(FrameSource.RGB, 1, 7)
         stamped = TimestampNormalizer.stamp(frame, 99, 123)
         self.assertEqual((stamped.host_ts_ns, stamped.device_ts_us), (99, 123))
-        self.assertEqual((stamped.payload, stamped.frame_id), (b"data", 7))
+        self.assertIs(stamped.image, frame.image)
+        self.assertEqual(stamped.frame_id, 7)
+
+    def test_latest_queue_releases_replaced_array(self):
+        queue = LatestFrameQueue()
+        image = np.ones((2, 2, 3), dtype=np.uint8)
+        reference = weakref.ref(image)
+        queue.push(image)
+        del image
+        queue.push(np.zeros((2, 2, 3), dtype=np.uint8))
+        gc.collect()
+        self.assertIsNone(reference())
 
 
 class _NativeConfig:
@@ -148,14 +166,24 @@ class NativeBackendTests(unittest.TestCase):
         self.assertTrue(backend.start(pairs.append))
         depth = _Depth.instances[0]
         rgb = _Rgb.instances[0]
+        depth_image = np.array([[0, 10000, 65535]], dtype=np.uint16)
+        rgb_image = np.zeros((1, 3, 3), dtype=np.uint8)
         depth.callback(
-            b"png", 640, 480, 100, 8,
-            1234, 0.0001, "DEPTH_100_UM", "depth",
+            depth_image, 3, 1, 100, 8, 1234, 0.0001,
+            "DEPTH_100_UM", "depth", 130, "us", "normalized_device", "", 0,
         )
-        rgb.callback(b"jpg", 640, 480, 105, 9, 0, 1.0, "MJPG", "rgb")
+        rgb.callback(
+            rgb_image, 3, 1, 105, 9, 0, 1.0, "MJPG", "rgb", 135,
+            "ns", "native_monotonic", "", 0,
+        )
         self.assertEqual(len(pairs), 1)
         self.assertEqual(pairs[0].delta_ns, 5)
-        self.assertEqual(pairs[0].rgb.payload, b"jpg")
+        self.assertIs(pairs[0].rgb.image, rgb_image)
+        self.assertEqual(pairs[0].rgb.image.dtype, np.uint8)
+        self.assertTrue(pairs[0].rgb.image.flags.c_contiguous)
+        self.assertFalse(pairs[0].rgb.image.flags.writeable)
+        self.assertEqual(pairs[0].depth.image.dtype, np.uint16)
+        self.assertEqual(pairs[0].depth.image.tolist(), [[0, 10000, 65535]])
         self.assertEqual(pairs[0].depth.device_ts_us, 1234)
         self.assertEqual(pairs[0].depth.depth_unit_to_meter, 0.0001)
         self.assertEqual(pairs[0].depth.pixel_format_name, "DEPTH_100_UM")
@@ -171,6 +199,24 @@ class NativeBackendTests(unittest.TestCase):
         self.assertFalse(backend.start(lambda pair: None))
         self.assertTrue(_Rgb.instances[0].stopped)
         self.assertTrue(_Depth.instances[0].stopped)
+
+    def test_invalid_native_array_contract_is_rejected(self):
+        backend = NativeRgbDepthBackend(_Core, DeviceConfig(), SyncConfig())
+        pairs = []
+        self.assertTrue(backend.start(pairs.append))
+        depth = _Depth.instances[0]
+        rgb = _Rgb.instances[0]
+        depth.callback(
+            np.ones((2, 2), dtype=np.uint16), 2, 2, 100, 1,
+            1000, 0.001, "DEPTH_1_MM", "depth", 100,
+            "us", "normalized_device", "", 0)
+        rgb.callback(
+            np.ones((2, 2, 3), dtype=np.uint16), 2, 2, 100, 1,
+            0, 1.0, "MJPG", "rgb", 100,
+            "us", "native_monotonic", "", 0)
+        self.assertEqual(pairs, [])
+        self.assertEqual(backend.sync_stats().rgb_pushed, 0)
+        backend.stop()
 
     def test_false_hardware_attestation_is_rejected(self):
         _Depth.attested = False

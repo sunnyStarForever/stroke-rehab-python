@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -64,6 +65,39 @@ class CourseRunnerWorkflowTests(unittest.TestCase):
 
 
 class PipelineWorkflowTests(unittest.TestCase):
+    def test_worker_reuses_bgr_and_converts_preview_once(self):
+        config = PipelineConfig()
+        pipeline = SensorPipeline(config)
+        pipeline._stub_mode = False
+        pipeline._pose_models_ready = False
+        pipeline._align_depth = lambda image, _unit: image
+        delivered = threading.Event()
+        pipeline.set_on_frame(lambda _frame: delivered.set())
+        bgr = np.zeros((8, 10, 3), dtype=np.uint8)
+        depth = np.ones((8, 10), dtype=np.uint16)
+        pair = {
+            "ts": 100, "mock": False, "bgr_image": bgr,
+            "depth_image": depth, "width": 10, "height": 8,
+            "depth_width": 10, "depth_height": 8,
+        }
+        conversions = []
+        original = cv2.cvtColor
+
+        def counted(image, code, *args, **kwargs):
+            if code == cv2.COLOR_BGR2RGB:
+                conversions.append(code)
+            return original(image, code, *args, **kwargs)
+
+        pipeline._running.set()
+        worker = threading.Thread(target=pipeline._worker_loop, daemon=True)
+        with mock.patch("cv2.cvtColor", side_effect=counted):
+            worker.start()
+            pipeline._enqueue_pair(pair)
+            self.assertTrue(delivered.wait(2.0))
+            pipeline._running.clear()
+            worker.join(1.0)
+        self.assertEqual(len(conversions), 1)
+
     def test_pair_queue_discards_oldest_and_pose_runs_on_first_frame(self):
         config = PipelineConfig()
         config.pose.max_pair_queue = 2
@@ -88,14 +122,13 @@ class PipelineWorkflowTests(unittest.TestCase):
         pipeline._pose_models_ready = True
         pipeline._python_inference = True
         pipeline._pose_estimator = estimator
-        ok, encoded = cv2.imencode(".jpg", np.zeros((240, 320, 3), dtype=np.uint8))
-        self.assertTrue(ok)
-        pipeline._infer_pose_full(encoded.tobytes(), None, 6)
+        bgr = np.zeros((240, 320, 3), dtype=np.uint8)
+        pipeline._infer_pose_full(bgr, None, 6)
         self.assertEqual(estimator.calls, 1)
-        pipeline._infer_pose_full(encoded.tobytes(), None, 6)
+        pipeline._infer_pose_full(bgr, None, 6)
         self.assertEqual(estimator.calls, 1)
         config.pose.enable_pose_reuse = False
-        pipeline._infer_pose_full(encoded.tobytes(), None, 6)
+        pipeline._infer_pose_full(bgr, None, 6)
         self.assertEqual(estimator.calls, 2)
 
     def test_record_pairs_debug_rejects_untrusted_stub_depth(self):

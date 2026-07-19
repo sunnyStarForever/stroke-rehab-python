@@ -82,14 +82,25 @@ class LogDialog(QDialog):
 
 class PerformanceDialog(QDialog):
     _FIELDS = (
-        ("rgb_fps", "RGB FPS", "{:.1f}"),
-        ("depth_fps", "Depth FPS", "{:.1f}"),
-        ("pair_fps", "同步 Pair FPS", "{:.1f}"),
-        ("pose_fps", "Pose FPS", "{:.1f}"),
+        ("raw_rgb_fps", "原始 RGB 帧率", "{:.1f} fps"),
+        ("raw_depth_fps", "原始深度帧率", "{:.1f} fps"),
+        ("sync_fps", "同步配对帧率", "{:.1f} fps"),
+        ("worker_fps", "Worker 处理帧率", "{:.1f} fps"),
+        ("pose_fps", "姿态推理帧率", "{:.1f} fps"),
+        ("rgb_callback_state", "RGB callback 状态", "{}"),
+        ("depth_callback_state", "Depth callback 状态", "{}"),
+        ("rgb_callback_avg_ms", "RGB callback 平均耗时", "{:.1f} ms"),
+        ("rgb_callback_p95_ms", "RGB callback P95", "{:.1f} ms"),
+        ("rgb_callback_max_ms", "RGB callback 最大耗时", "{:.1f} ms"),
+        ("depth_callback_avg_ms", "Depth callback 平均耗时", "{:.1f} ms"),
+        ("depth_callback_p95_ms", "Depth callback P95", "{:.1f} ms"),
+        ("depth_callback_max_ms", "Depth callback 最大耗时", "{:.1f} ms"),
         ("yolo_ms", "YOLO 耗时", "{:.1f} ms"),
         ("pose_ms", "Pose 耗时", "{:.1f} ms"),
-        ("queue_length", "队列长度", "{}"),
-        ("dropped_pairs", "丢帧数", "{}"),
+        ("queue_length", "Worker 队列长度", "{}"),
+        ("dropped_pairs", "Worker 累计丢帧", "{}"),
+        ("recording_queue_depth", "录制队列水位", "{}"),
+        ("recording_dropped", "录制累计丢帧", "{}"),
         ("record_write_ms", "录制写盘耗时", "{:.1f} ms"),
     )
 

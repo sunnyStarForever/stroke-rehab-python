@@ -26,6 +26,7 @@ from qfluentwidgets import (
 from rehab_engine.config_loader import load_pipeline_config, save_pipeline_config
 from rehab_engine import logger
 from rehab_engine.diagnostics import Diagnostics, run_diagnostics
+from rehab_engine.event_routing import UserNotificationGate
 
 from .pages.training_page import TrainingPage
 from .pages.reports_page import ReportsPage
@@ -52,6 +53,7 @@ class StrokeRehabWindow(FluentWindow):
         self._log_entries = []
         self._log_dialog = None
         self._performance_dialog = None
+        self._notification_gate = UserNotificationGate(cooldown_seconds=30.0)
 
         self._config = load_pipeline_config()
         self.engine_log_received.connect(self._on_engine_log)
@@ -203,7 +205,10 @@ class StrokeRehabWindow(FluentWindow):
         if self._log_dialog is not None:
             self._log_dialog.append_entry(entry)
 
-        if level in ("WARN", "ERROR"):
+        if level == "INFO" and (
+                "state=NORMAL" in message or "RECOVERED" in message.upper()):
+            self._notification_gate.recover(level, message)
+        if self._notification_gate.should_notify(level, message):
             InfoBar.warning(
                 level, message[:120],
                 duration=3000,
@@ -234,7 +239,8 @@ class StrokeRehabWindow(FluentWindow):
             s = training.pipeline_stats()
             if s:
                 parts.append(
-                    f"Pair: {s['pair_fps']:.1f}fps | "
+                    f"同步: {s.get('sync_fps', 0.0):.1f}fps | "
+                    f"Worker: {s.get('worker_fps', s.get('pair_fps', 0.0)):.1f}fps | "
                     f"已处理: {s['processed']} | "
                     f"丢弃: {s['dropped_pairs']}"
                 )

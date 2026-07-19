@@ -69,6 +69,11 @@ class _FullLogger:
         if self._cb:
             self._cb("ERROR", msg)
 
+    def performance(self, msg: str):
+        print(f"[PERF] {msg}", flush=True, file=sys.stderr)
+        if self._cb:
+            self._cb("PERF", msg)
+
 
 # Configuration is always Python-owned.  This prevents loading the native
 # adapter from silently changing which runtime fields are available.

@@ -61,3 +61,18 @@ voice:
   volume: 0.9
   cooldown_seconds: 2.0
   queue_size: 12
+
+performance:
+  callback_perf_window_sec: 5.0
+  callback_perf_min_samples: 30
+  callback_normal_p95_ms: 8.0
+  callback_warn_p95_ms: 10.0
+  callback_critical_p95_ms: 25.0
+  callback_warn_sustain_sec: 5.0
+  callback_low_fps_sustain_sec: 3.0
+  callback_recovery_sec: 5.0
+
+recording:
+  async_video_recording: true
+  recording_queue_capacity: 90
+  recording_drain_timeout_sec: 5.0

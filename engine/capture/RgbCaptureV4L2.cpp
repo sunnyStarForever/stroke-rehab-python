@@ -107,6 +107,8 @@ bool RgbCaptureV4L2::start(const DeviceConfig& config, FrameCallback callback) {
 
   config_ = config;
   callback_ = std::move(callback);
+  tsNormalizer_.reset();
+  lastV4l2SyncTsNs_ = 0;
   running_.store(true);
   worker_ = std::thread(&RgbCaptureV4L2::run, this);
   return true;
@@ -294,6 +296,7 @@ void RgbCaptureV4L2::run() {
     }
 
     const uint64_t dqEndNs = monotonicRawNowNs();
+    const uint64_t monotonicAtDqNs = monotonicNowNs();
     const double dqMs = static_cast<double>(dqEndNs - dqStartNs) / 1000000.0;
 
     cv::Mat decoded;
@@ -342,17 +345,47 @@ void RgbCaptureV4L2::run() {
 
     FrameEnvelope envelope;
     envelope.source = FrameSource::Rgb;
-    const uint64_t hostMidpointNs = dqStartNs + (dqEndNs - dqStartNs) / 2ULL;
-    // V4L2 RGB 帧没有可靠跨设备统一时钟，这里只写 host_ts_ns，device_ts_us 保持 0。
-    tsNormalizer_.stamp(envelope, hostMidpointNs, 0);
+    const uint64_t arrivalTsNs = dqEndNs;
+    const uint64_t v4l2TsNs = static_cast<uint64_t>(buf.timestamp.tv_sec) *
+        1000000000ULL + static_cast<uint64_t>(buf.timestamp.tv_usec) * 1000ULL;
+    const bool monotonicTimestamp =
+        (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
+        V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+    uint64_t mappedTsNs = 0;
+    if (monotonicTimestamp && v4l2TsNs > 0) {
+      const int64_t rawMinusMonotonic = static_cast<int64_t>(arrivalTsNs) -
+          static_cast<int64_t>(monotonicAtDqNs);
+      const int64_t mapped = static_cast<int64_t>(v4l2TsNs) + rawMinusMonotonic;
+      if (mapped > 0) mappedTsNs = static_cast<uint64_t>(mapped);
+    }
+    if (mappedTsNs > lastV4l2SyncTsNs_) {
+      tsNormalizer_.stampNativeMonotonic(envelope, arrivalTsNs, mappedTsNs,
+                                         v4l2TsNs / 1000ULL);
+      lastV4l2SyncTsNs_ = mappedTsNs;
+    } else {
+      tsNormalizer_.stampHostFallback(
+          envelope, arrivalTsNs, v4l2TsNs / 1000ULL,
+          monotonicTimestamp ? "v4l2_timestamp_non_monotonic" :
+                               "v4l2_timestamp_not_monotonic");
+    }
+    if (frameId == 0) {
+      std::ostringstream trace;
+      trace << "[RGB TS] flags=0x" << std::hex << buf.flags << std::dec
+            << " type=" << (monotonicTimestamp ? "monotonic" : "untrusted")
+            << " device_us=" << (v4l2TsNs / 1000ULL)
+            << " arrival_ns=" << arrivalTsNs
+            << " sync_ns=" << envelope.syncTsNs
+            << " quality=" << envelope.clockQuality;
+      emitStatus(trace.str());
+    }
     envelope.frameId = frameId++;
     envelope.width = decoded.cols;
     envelope.height = decoded.rows;
     envelope.image = decoded.clone();
     envelope.pixelFormatName = actualFormat;
 
-    inputFpsCounter.tick(hostMidpointNs);
-    outputFpsCounter.tick(hostMidpointNs);
+    inputFpsCounter.tick(arrivalTsNs);
+    outputFpsCounter.tick(arrivalTsNs);
 
     if (callback_) {
       // 上层采用 latest-only 处理策略；采集线程只交付当前帧，不在本层堆积历史帧。
@@ -441,7 +474,8 @@ void RgbCaptureV4L2::runFallback() {
     FrameEnvelope envelope;
     envelope.source = FrameSource::Rgb;
     // fallback 帧同样使用主机单调时钟，便于和模拟 Depth 帧走同一同步路径。
-    tsNormalizer_.stamp(envelope, monotonicRawNowNs(), 0);
+    tsNormalizer_.stampHostFallback(envelope, monotonicRawNowNs(), 0,
+                                    "synthetic_rgb_fallback");
     envelope.frameId = frameId++;
     envelope.width = frame.cols;
     envelope.height = frame.rows;

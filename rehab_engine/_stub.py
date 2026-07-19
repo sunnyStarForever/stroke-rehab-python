@@ -68,6 +68,14 @@ class DeviceConfig:
     enable_openni_depth_color_sync: bool = False
     latest_queue_size: int = 1
     raw_perf_log_interval_sec: float = 1.0
+    callback_perf_window_sec: float = 5.0
+    callback_perf_min_samples: int = 30
+    callback_normal_p95_ms: float = 8.0
+    callback_warn_p95_ms: float = 10.0
+    callback_critical_p95_ms: float = 25.0
+    callback_warn_sustain_sec: float = 5.0
+    callback_low_fps_sustain_sec: float = 3.0
+    callback_recovery_sec: float = 5.0
     enable_cpu_affinity: bool = True
     rgb_capture_cpu: int = 0
     depth_capture_cpu: int = 0
@@ -206,6 +214,9 @@ class PipelineConfig:
     calibration_file: str = ""
     record_pairs: bool = False
     record_path: str = "recordings"
+    async_video_recording: bool = True
+    recording_queue_capacity: int = 90
+    recording_drain_timeout_sec: float = 5.0
     selected_course_id: str = ""
     patient_name: str = ""
     patient_id: str = "P0001"

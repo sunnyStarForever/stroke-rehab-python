@@ -2,6 +2,9 @@
 
 基于 PyQt5、QFluentWidgets 和 C++ 扩展的卒中康复训练桌面应用。系统提供实时骨骼预览、课程状态管理、动作评分、肌电状态、训练记录和 HTML 会话报告。
 
+RGB/Depth ndarray callback、归一化时间戳与目标板验收方法见
+[`docs/rgb_depth_array_transport.md`](docs/rgb_depth_array_transport.md)。
+
 ## 当前能力
 
 - 上肢、下肢康复课程选择与持久化

@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(rehab_engine LANGUAGES CXX)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -192,6 +193,13 @@ else()
   target_link_libraries(_core PRIVATE rehab_engine_core)
   if(NOT STROKE_BUILD_LEGACY_NATIVE_PIPELINE)
     target_compile_definitions(_core PRIVATE STROKE_HARDWARE_ONLY=1)
+  endif()
+
+  if(BUILD_TESTING)
+    add_executable(timestamp_normalizer_test
+      tests/timestamp_normalizer_test.cpp)
+    target_link_libraries(timestamp_normalizer_test PRIVATE rehab_engine_core)
+    add_test(NAME timestamp_normalizer_test COMMAND timestamp_normalizer_test)
   endif()
 
   message(STATUS "  HAVE_OPENNI2:      ${HAVE_OPENNI2_DEF}")

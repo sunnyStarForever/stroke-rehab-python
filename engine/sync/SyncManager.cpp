@@ -70,7 +70,7 @@ std::optional<SyncedFramePair> SyncManager::tryMatchLocked(
   int64_t bestDelta = std::numeric_limits<int64_t>::max();
   for (std::size_t i = 0; i < otherQueue.size(); ++i) {
     // 最近邻匹配：在另一队列中找 host_ts_ns 时间差最小的帧。
-    const int64_t delta = absDiffNs(anchor.hostTsNs, otherQueue[i].hostTsNs);
+    const int64_t delta = absDiffNs(anchor.syncTsNs, otherQueue[i].syncTsNs);
     if (delta < bestDelta) {
       bestDelta = delta;
       bestIndex = i;
@@ -95,8 +95,8 @@ std::optional<SyncedFramePair> SyncManager::tryMatchLocked(
     pair.rgb = std::move(matchedOther);
     pair.depth = std::move(anchor);
   }
-  pair.deltaNs = static_cast<int64_t>(pair.rgb.hostTsNs) -
-                 static_cast<int64_t>(pair.depth.hostTsNs);
+  pair.deltaNs = static_cast<int64_t>(pair.rgb.syncTsNs) -
+                 static_cast<int64_t>(pair.depth.syncTsNs);
   return pair;
 }
 

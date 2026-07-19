@@ -22,4 +22,15 @@ inline uint64_t monotonicRawNowNs() {
       std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 }
 
+inline uint64_t monotonicNowNs() {
+#ifdef __linux__
+  timespec ts{};
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
+           static_cast<uint64_t>(ts.tv_nsec);
+  }
+#endif
+  return monotonicRawNowNs();
+}
+
 }  // namespace rehab

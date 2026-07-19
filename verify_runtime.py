@@ -189,8 +189,13 @@ def main() -> int:
         fatal = [item for item in fatal if not any(term in item.name for term in hardware_terms)]
 
     sync = FrameSynchronizer(config.sync)
-    rgb = FrameEnvelope(FrameSource.RGB, b"rgb", 1, 1, 1_000_000_000)
-    depth = FrameEnvelope(FrameSource.DEPTH, b"depth", 1, 1, 1_001_000_000)
+    import numpy as np
+    rgb = FrameEnvelope(
+        FrameSource.RGB, np.zeros((1, 1, 3), dtype=np.uint8),
+        1, 1, 1_000_000_000)
+    depth = FrameEnvelope(
+        FrameSource.DEPTH, np.zeros((1, 1), dtype=np.uint16),
+        1, 1, 1_001_000_000)
     sync_ok = sync.push_frame(rgb) is None and sync.push_frame(depth) is not None
 
     checks = {

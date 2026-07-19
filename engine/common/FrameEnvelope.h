@@ -19,9 +19,17 @@ enum class FrameSource {
 
 struct FrameEnvelope {
   FrameSource source{FrameSource::Rgb};
+  // Compatibility alias for arrivalTsNs. Synchronizers use syncTsNs.
   uint64_t hostTsNs{0};
   uint64_t deviceTsUs{0};
+  uint64_t arrivalTsNs{0};
+  uint64_t syncTsNs{0};
   uint64_t frameId{0};
+
+  std::string deviceTimeUnit{"us"};
+  std::string clockQuality{"host_fallback"};
+  std::string clockReason;
+  uint64_t clockResetCount{0};
 
   int width{0};
   int height{0};
