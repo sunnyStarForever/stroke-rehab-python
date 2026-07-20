@@ -39,6 +39,21 @@ class ScoreResult:
     rhythm_score: float = 0.0
 
 
+@dataclass
+class DebugState:
+    """Debug state from the scoring engine."""
+    n_frames: int = 0
+    segment_feature_name: str = ""
+    segment_signal: list[float] = field(default_factory=list)
+    baseline: list[float] = field(default_factory=list)
+    detrended: list[float] = field(default_factory=list)
+    detrended_smooth: list[float] = field(default_factory=list)
+    detected_peaks: list[int] = field(default_factory=list)
+    prominence: float = 0.0
+    params: dict = field(default_factory=dict)
+    all_features: dict[str, list[float]] = field(default_factory=dict)
+
+
 def _find_scoring_engine() -> Optional[Path]:
     """Locate tools/scoring_engine/ relative to project root."""
     python_root = Path(__file__).resolve().parent.parent
@@ -249,6 +264,7 @@ class ScoreBridge:
         # Callbacks
         self.on_score_updated: Optional[Callable[[ScoreResult], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
+        self.on_debug_state: Optional[Callable[[dict], None]] = None
 
     def start(self, action_id: str, skeleton_fps: float = 20.0) -> bool:
         """Launch score_server.py and negotiate the initial state."""
@@ -375,6 +391,14 @@ class ScoreBridge:
             self._skeleton_fps = fps
         return ok
 
+    def request_debug_state(self) -> bool:
+        """Ask the subprocess to emit its current debug state.
+
+        The result will arrive via on_score_updated callback with
+        status == "debug_state".  The caller should inspect the raw dict.
+        """
+        return self._send_command({"cmd": "get_debug_state"})
+
     def submit_skeleton(self, frame_index: int, timestamp_ns: int,
                         joints: List[List[float]]) -> bool:
         """
@@ -436,6 +460,10 @@ class ScoreBridge:
                 self._emit_error(str(raw.get("error", raw.get("message", "评分服务返回错误"))))
                 continue
             status = str(raw.get("status", ""))
+            if status == "debug_state":
+                if self.on_debug_state:
+                    self.on_debug_state(raw.get("debug_state", raw))
+                continue
             if status and status != "ok" and self.on_score_updated:
                 self.on_score_updated(_parse_score_result(raw))
         self._ready_event.set()

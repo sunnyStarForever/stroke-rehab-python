@@ -65,6 +65,7 @@ import rehab_engine  # for rehab_engine._STUB_MODE
 from ..widgets.preview_widget import PreviewWidget
 from ..widgets.score_panel import ScorePanel
 from ..widgets.emg_panel import EmgPanel
+from ..widgets.debug_panel import DebugPanel
 from ..theme import COLORS, PAGE_STYLE, pill_style, state_badge_style
 
 
@@ -452,6 +453,11 @@ class TrainingPage(QWidget):
         self._emg_panel = EmgPanel(side)
         side_layout.addWidget(self._emg_panel)
 
+        # Debug panel (collapsible via toggle button on control bar)
+        self._debug_panel = DebugPanel(side)
+        self._debug_panel.setVisible(False)
+        side_layout.addWidget(self._debug_panel)
+
         side_layout.addStretch()
 
         main_row.addWidget(preview_card, 1)
@@ -492,6 +498,9 @@ class TrainingPage(QWidget):
         self._btn_stop = PushButton("停止")
         self._btn_report = PrimaryPushButton("结束并生成报告")
         self._btn_open_report = PushButton("查看报告")
+        self._btn_debug = PushButton("调试面板")
+        self._btn_debug.setCheckable(True)
+        self._btn_debug.setFixedHeight(30)
 
         for button in [self._btn_start, self._btn_pause, self._btn_stop,
                        self._btn_report, self._btn_open_report]:
@@ -506,11 +515,13 @@ class TrainingPage(QWidget):
         self._btn_stop.clicked.connect(self._on_stop)
         self._btn_report.clicked.connect(self._on_finish)
         self._btn_open_report.clicked.connect(self._on_open_report)
+        self._btn_debug.clicked.connect(self._on_toggle_debug)
 
         ctrl.addWidget(self._btn_start)
         ctrl.addWidget(self._btn_pause)
         ctrl.addWidget(self._btn_stop)
         ctrl.addStretch()
+        ctrl.addWidget(self._btn_debug)
         ctrl.addWidget(self._btn_report)
         ctrl.addWidget(self._btn_open_report)
         root.addWidget(ctrl_card)
@@ -901,10 +912,14 @@ class TrainingPage(QWidget):
             bridge = ScoreBridge()
             bridge.on_score_updated = self.score_received.emit
             bridge.on_error = self.score_failed.emit
+            bridge.on_debug_state = self._on_debug_state_received
             self._score_bridge = bridge
             self._score_generation += 1
             generation = self._score_generation
             self._append_feedback("正在后台启动实时评分…")
+
+            # Reset debug panel data for the new action
+            self._debug_panel.reset()
 
             def _start_scoring():
                 ok = bridge.start(action.action_id, fps)
@@ -1051,9 +1066,36 @@ class TrainingPage(QWidget):
             self._voice.speak(
                 f"完成第{count}次，评分{result.overall_score:.0f}分",
                 key=f"score_cycle_{count}", priority=7, force=True)
+        # Also feed FPS info to debug panel
+        if self._debug_panel.isVisible() and self._calibrated_scoring_fps > 0:
+            self._debug_panel.set_fps_info(
+                self._calibrated_scoring_fps, self._skeleton_fps())
 
     def _on_score_error(self, message: str):
         self._append_feedback(f"评分提示：{message}")
+
+    def _on_toggle_debug(self):
+        """Toggle the debug panel visibility and connect refresh callback."""
+        visible = not self._debug_panel.isVisible()
+        self._debug_panel.setVisible(visible)
+        self._btn_debug.setChecked(visible)
+        if visible:
+            self._debug_panel.set_refresh_callback(self._on_debug_refresh)
+            self._debug_panel.request_refresh()
+
+    def _on_debug_refresh(self):
+        """Callback from DebugPanel when user clicks 'refresh state'."""
+        bridge = self._score_bridge
+        if bridge is not None and bridge._running:
+            bridge.on_debug_state = self._on_debug_state_received
+            bridge.request_debug_state()
+        else:
+            self._append_feedback("评分服务未运行，无法获取调试状态")
+
+    def _on_debug_state_received(self, debug_state: dict):
+        """Receive debug state from ScoreBridge and forward to panel."""
+        # debug_state comes from RealtimeJointActionScorer.get_debug_state() JSON
+        self._debug_panel.set_debug_state(debug_state)
 
     def _on_pipeline_frame(self, frame: PreviewFrame):
         """Runs on the pipeline worker; submit only valid active-training frames."""
