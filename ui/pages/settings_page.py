@@ -34,7 +34,6 @@ _DEPTH_RESOLUTIONS = ["640x480", "320x240", "1280x720"]
 # If hardware cannot sustain it, the runtime reports the measured rate instead
 # of substituting mock frames.
 _FPS_VALUES = ["30"]
-_EMG_MODES = ["disabled", "mock", "real"]
 _EMG_BACKENDS = ["bluez", "serial"]
 
 
@@ -211,15 +210,11 @@ class SettingsPage(ScrollArea):
         emg_row1 = QHBoxLayout()
         self._emg_enabled = SwitchButton()
         self._emg_enabled.setText("启用 EMG")
-        self._emg_mode = ComboBox()
-        self._emg_mode.addItems(_EMG_MODES)
         self._emg_backend = ComboBox()
         self._emg_backend.addItems(_EMG_BACKENDS)
         self._emg_serial = LineEdit()
         self._emg_serial.setText("/dev/rfcomm0")
         emg_row1.addWidget(self._emg_enabled)
-        emg_row1.addWidget(BodyLabel("模式"))
-        emg_row1.addWidget(self._emg_mode)
         emg_row1.addWidget(BodyLabel("后端"))
         emg_row1.addWidget(self._emg_backend)
         emg_row1.addWidget(BodyLabel("串口"))
@@ -301,7 +296,6 @@ class SettingsPage(ScrollArea):
         self._hw_d2c.setChecked(c.device.enable_hardware_d2c)
 
         self._emg_enabled.setChecked(c.emg.enabled)
-        self._emg_mode.setCurrentText(c.emg.mode)
         self._emg_backend.setCurrentText(c.emg.capture_backend)
         self._emg_serial.setText(c.emg.serial_device)
         self._emg_ble_device.setCurrentText(c.emg.ble_address)
@@ -338,7 +332,6 @@ class SettingsPage(ScrollArea):
         c.device.enable_hardware_d2c = self._hw_d2c.isChecked()
 
         c.emg.enabled = self._emg_enabled.isChecked()
-        c.emg.mode = self._emg_mode.currentText()
         c.emg.capture_backend = self._emg_backend.currentText()
         c.emg.serial_device = self._emg_serial.text().strip()
         selected_ble = self._emg_ble_device.currentText().strip()

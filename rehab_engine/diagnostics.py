@@ -183,11 +183,8 @@ def run_diagnostics(config=None) -> Diagnostics:
 
     emg = getattr(config, "emg", None)
     emg_enabled = bool(getattr(emg, "enabled", False))
-    emg_mode = str(getattr(emg, "mode", "disabled")).lower()
-    if not emg_enabled or emg_mode == "disabled":
+    if not emg_enabled:
         diagnostics.add("EMG", "DISABLED", "配置未启用")
-    elif emg_mode == "mock":
-        diagnostics.add("EMG", "OK", "mock 模式")
     elif platform.system() != "Linux":
         diagnostics.add("EMG 真实链路", "WARN", "需要在目标 Linux 板验证 RPMsg 与采集设备")
     else:

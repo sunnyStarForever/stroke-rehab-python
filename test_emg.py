@@ -138,7 +138,6 @@ class BleGattCaptureTests(unittest.TestCase):
         _Client.instances.clear()
         self.config = EmgConfig(
             enabled=True,
-            mode="real",
             capture_backend="bluez",
             ble_service_uuid="service",
             ble_command_rx_uuid="command",
@@ -165,18 +164,15 @@ class BleGattCaptureTests(unittest.TestCase):
 
 
 class EmgManagerTests(unittest.TestCase):
-    def test_mock_mode_produces_features_and_explicit_mock_status(self):
-        manager = EmgManager(EmgConfig(enabled=True, mode="mock"))
+    def test_disabled_mode_does_not_start_capture_or_publish_features(self):
+        manager = EmgManager(EmgConfig(enabled=False))
         self.assertTrue(manager.start())
-        deadline = time.monotonic() + 1.0
-        while manager.latest_feature() is None and time.monotonic() < deadline:
-            time.sleep(0.01)
         status = manager.runtime_status()
         manager.stop()
-        self.assertEqual(status.link_state, "mock")
-        self.assertTrue(status.mock_mode)
-        self.assertGreater(status.raw_samples, 0)
-        self.assertGreater(status.feature_frames, 0)
+        self.assertEqual(status.mode, "disabled")
+        self.assertEqual(status.link_state, "disabled")
+        self.assertFalse(status.running)
+        self.assertIsNone(manager.latest_feature())
 
 
 class _FakeSerialPort:
@@ -263,7 +259,6 @@ class EmgRealPipelineTests(unittest.TestCase):
     def test_ble_samples_are_chunked_then_cpu1_features_are_published(self):
         config = EmgConfig(
             enabled=True,
-            mode="real",
             capture_backend="bluez",
             ble_command_rx_uuid="command",
             ble_status_tx_uuid="status",
@@ -351,7 +346,6 @@ class EmgFeatureAndFusionTests(unittest.TestCase):
         port = _FakeSerialPort(lines)
         config = EmgConfig(
             enabled=True,
-            mode="real",
             capture_backend="serial",
             raw_chunk_samples=25,
         )

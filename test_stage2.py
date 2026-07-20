@@ -68,8 +68,8 @@ composer.submit(
     joints_3d=joints_3d,
     rgb_fps=30.0, pair_fps=28.5,
     bbox=(100, 50, 200, 300, True, "detect"),
-    emg_status="EMG mock active",
-    emg_rms=[0.5, 0.3],
+    emg_status="EMG disabled",
+    emg_rms=[],
     mirror=True,
 )
 

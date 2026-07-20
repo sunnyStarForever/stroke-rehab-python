@@ -25,6 +25,7 @@ import os
 import json
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -33,7 +34,7 @@ from typing import Optional
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QCheckBox, QSizePolicy,
+    QLabel, QSizePolicy,
 )
 
 from qfluentwidgets import (
@@ -126,6 +127,9 @@ class TrainingPage(QWidget):
         self._fps_warning_active = False
         self._paused_from = TrainingState.IDLE
         self._displayed_action_reps = 0
+        self._scoring_submit_times = deque(maxlen=120)
+        self._last_scoring_fps_update = 0.0
+        self._calibrated_scoring_fps = 0.0
         self._session_start_time = ""
         self._current_action_dir = ""
         self._current_action_csv = ""
@@ -208,8 +212,8 @@ class TrainingPage(QWidget):
                              f"{self._config.device.rgb_width}x{self._config.device.rgb_height} "
                              f"@{self._config.device.rgb_fps}fps")
         self._append_feedback(f"✓ 配置: Depth={self._config.device.depth_width}x{self._config.device.depth_height}")
-        self._append_feedback(f"✓ 配置: EMG={'启用' if self._config.emg.enabled else '禁用'} "
-                             f"模式={self._config.emg.mode}")
+        self._append_feedback(
+            f"✓ 配置: EMG={'启用（真实采集）' if self._config.emg.enabled else '禁用'}")
 
         self._append_feedback("════════════════════")
 
@@ -289,8 +293,6 @@ class TrainingPage(QWidget):
             errors.append("未检测到 RGB 摄像头")
         elif rehab_engine._STUB_MODE:
             warnings.append("当前为 STUB 模拟模式")
-        if self._config.emg.enabled and self._config.emg.mode == "disabled":
-            warnings.append("EMG 已启用但模式为 disabled")
         if (not rehab_engine._STUB_MODE and
                 (self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30)):
             errors.append("真实 RGB 与 Depth 相机必须同时设置为 30 FPS")
@@ -488,11 +490,6 @@ class TrainingPage(QWidget):
         self._btn_start = PrimaryPushButton("开始训练")
         self._btn_pause = PushButton("暂停")
         self._btn_stop = PushButton("停止")
-        self._chk_rgb = QCheckBox("RGB 视频录制待接入")
-        self._chk_rgb.setChecked(False)
-        self._chk_rgb.setToolTip("当前 Python Pipeline 尚未提供 RGB 图像帧，仅录制 3D 骨骼数据。")
-        self._lbl_skeleton = CaptionLabel("3D骨骼CSV：强制录制")
-        self._lbl_skeleton.setStyleSheet("color: #27AE60;")
         self._btn_report = PrimaryPushButton("结束并生成报告")
         self._btn_open_report = PushButton("查看报告")
 
@@ -513,9 +510,6 @@ class TrainingPage(QWidget):
         ctrl.addWidget(self._btn_start)
         ctrl.addWidget(self._btn_pause)
         ctrl.addWidget(self._btn_stop)
-        ctrl.addSpacing(10)
-        ctrl.addWidget(self._chk_rgb)
-        ctrl.addWidget(self._lbl_skeleton)
         ctrl.addStretch()
         ctrl.addWidget(self._btn_report)
         ctrl.addWidget(self._btn_open_report)
@@ -566,7 +560,6 @@ class TrainingPage(QWidget):
         self._btn_report.setEnabled(
             s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
         self._btn_open_report.setEnabled(bool(self._session_dir))
-        self._chk_rgb.setEnabled(False)
 
     # ---- Button handlers ----
 
@@ -595,7 +588,8 @@ class TrainingPage(QWidget):
         self._append_feedback(f"RGB 设备: {self._config.device.rgb_device_path}")
         self._append_feedback(f"分辨率: {self._config.device.rgb_width}x{self._config.device.rgb_height} @ {self._config.device.rgb_fps}fps")
         self._append_feedback(f"课程: {self._current_course.course_name}")
-        self._append_feedback(f"EMG: {'启用' if self._config.emg.enabled else '禁用'} ({self._config.emg.mode})")
+        self._append_feedback(
+            f"EMG: {'启用（真实采集）' if self._config.emg.enabled else '禁用'}")
 
         self._append_feedback(f"启动训练：{self._current_course.course_name}")
 
@@ -864,6 +858,9 @@ class TrainingPage(QWidget):
 
     def _on_action_changed(self, action):
         self._displayed_action_reps = 0
+        self._scoring_submit_times.clear()
+        self._last_scoring_fps_update = 0.0
+        self._calibrated_scoring_fps = 0.0
         self._action_label.setText(f"当前动作：{action.name_cn} ({action.action_id})")
         self._info_action.setText(f"{action.name_cn}\n{action.action_id}")
         self._instruction_label.setText(
@@ -898,7 +895,7 @@ class TrainingPage(QWidget):
 
         # Start scoring for this action
         if self._pipeline.is_running:
-            fps = self._config.device.rgb_fps / max(1, self._config.pose.pose_interval)
+            fps = self._skeleton_fps()
             if self._score_bridge:
                 self._score_bridge.stop()
             bridge = ScoreBridge()
@@ -996,6 +993,9 @@ class TrainingPage(QWidget):
             self._append_feedback(f"动作 EMG 录制停止异常：{exc}")
 
     def _skeleton_fps(self) -> float:
+        actual = float(self._pipeline.performance_stats().get("worker_fps", 0.0))
+        if actual >= 0.5:
+            return actual
         return self._config.device.rgb_fps / max(1, self._config.pose.pose_interval)
 
     def _on_rest_started(self, action, rest_sec):
@@ -1064,14 +1064,28 @@ class TrainingPage(QWidget):
             return
         self._frame_index += 1
         joints = frame.joints_3d[:22]
-        if ScoringSkeletonAdapter.valid_joint_count(joints) >= 18:
+        if ScoringSkeletonAdapter.valid_joint_count(joints) >= 5:
             self._scoring_recorder.append(
                 self._frame_index, ScoringSkeletonAdapter.convert(joints))
         # ScoreBridge owns the original Rehab22 -> P-Coder coordinate transform,
         # validity gate and synthetic joint fallbacks.
         if bridge is not None:
-            bridge.submit_skeleton(
-                self._frame_index, time.monotonic_ns(), joints)
+            now_ns = time.monotonic_ns()
+            if bridge.submit_skeleton(self._frame_index, now_ns, joints):
+                now = now_ns / 1_000_000_000.0
+                self._scoring_submit_times.append(now)
+                if (len(self._scoring_submit_times) >= 10
+                        and now - self._last_scoring_fps_update >= 2.0):
+                    elapsed = now - self._scoring_submit_times[0]
+                    actual_fps = ((len(self._scoring_submit_times) - 1) / elapsed
+                                  if elapsed > 0.0 else 0.0)
+                    if (actual_fps >= 0.5
+                            and (self._calibrated_scoring_fps <= 0.0
+                                 or abs(actual_fps - self._calibrated_scoring_fps)
+                                 / self._calibrated_scoring_fps >= 0.15)):
+                        if bridge.set_fps(actual_fps):
+                            self._calibrated_scoring_fps = actual_fps
+                    self._last_scoring_fps_update = now
 
     # ---- Timer ticks ----
 

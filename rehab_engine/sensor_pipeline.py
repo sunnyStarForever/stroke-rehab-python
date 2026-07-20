@@ -271,7 +271,6 @@ class SensorPipeline:
         emg_ok = self._emg.start()
         strict_real = (
             self._config.emg.enabled
-            and str(self._config.emg.mode).lower() == "real"
             and bool(getattr(self._config.emg, "strict_real_mode", True))
         )
         if not emg_ok and strict_real:

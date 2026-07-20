@@ -177,7 +177,6 @@ class VoiceConfig:
 @dataclass
 class EmgConfig:
     enabled: bool = False
-    mode: str = "mock"  # disabled / mock / real
     capture_backend: str = "serial"  # serial / bluez
     serial_device: str = "/dev/rfcomm0"
     serial_baud_rate: int = 115200

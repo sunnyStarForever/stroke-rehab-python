@@ -367,6 +367,14 @@ class ScoreBridge:
             self._skeleton_fps = skeleton_fps
         return ok
 
+    def set_fps(self, skeleton_fps: float) -> bool:
+        """Calibrate time-based scoring thresholds without resetting state."""
+        fps = max(0.5, float(skeleton_fps))
+        ok = self._send_command({"cmd": "set_fs", "fs": fps})
+        if ok:
+            self._skeleton_fps = fps
+        return ok
+
     def submit_skeleton(self, frame_index: int, timestamp_ns: int,
                         joints: List[List[float]]) -> bool:
         """
@@ -375,7 +383,7 @@ class ScoreBridge:
         """
         if len(joints) < ScoringSkeletonAdapter.JOINT_COUNT:
             return False
-        if ScoringSkeletonAdapter.valid_joint_count(joints) < 18:
+        if ScoringSkeletonAdapter.valid_joint_count(joints) < 5:
             return False
         try:
             scoring_joints = ScoringSkeletonAdapter.convert(joints)

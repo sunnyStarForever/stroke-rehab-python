@@ -124,6 +124,35 @@ class ActionArtifactTests(unittest.TestCase):
 
 
 class ScoreBridgeIntegrationTests(unittest.TestCase):
+    def test_set_fps_updates_running_scorer_without_reset(self):
+        bridge = ScoreBridge()
+        with patch.object(bridge, "_send_command", return_value=True) as send:
+            self.assertTrue(bridge.set_fps(6.5))
+        send.assert_called_once_with({"cmd": "set_fs", "fs": 6.5})
+        self.assertEqual(bridge._skeleton_fps, 6.5)
+
+    def test_submit_accepts_five_valid_joints(self):
+        bridge = ScoreBridge()
+        bridge._running = True
+        bridge._process = object()
+        joints = [
+            [float(i + 1), float(i + 2), float(i + 3), i < 5]
+            for i in range(22)
+        ]
+        with patch.object(bridge, "_send_command", return_value=True) as send:
+            self.assertTrue(bridge.submit_skeleton(1, 123456789, joints))
+        send.assert_called_once()
+
+    def test_submit_rejects_fewer_than_five_valid_joints(self):
+        bridge = ScoreBridge()
+        joints = [
+            [float(i + 1), float(i + 2), float(i + 3), i < 4]
+            for i in range(22)
+        ]
+        with patch.object(bridge, "_send_command", return_value=True) as send:
+            self.assertFalse(bridge.submit_skeleton(1, 123456789, joints))
+        send.assert_not_called()
+
     def test_startup_stderr_is_kept_before_ready_handshake(self):
         bridge = ScoreBridge(ready_timeout_seconds=20.0)
         proc = SimpleNamespace(stderr=iter(["loading model\n"]))

@@ -101,10 +101,8 @@ def _run_capture_smoke(config, duration_seconds: float) -> tuple[bool, dict]:
 
 def _run_emg_smoke(config, duration_seconds: float) -> tuple[bool, dict]:
     """Prove the configured real EMG capture and CPU1 feature path end to end."""
-    if not config.emg.enabled or str(config.emg.mode).lower() != "real":
-        return False, {
-            "error": "EMG must be configured with enabled=true and mode=real"
-        }
+    if not config.emg.enabled:
+        return False, {"error": "EMG must be configured with enabled=true"}
     from rehab_engine.emg import EmgManager
 
     manager = EmgManager(config.emg)

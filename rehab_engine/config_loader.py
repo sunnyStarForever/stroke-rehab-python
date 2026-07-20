@@ -235,8 +235,6 @@ def _env_override(config: PipelineConfig) -> None:
     """Apply STROKE_* environment variable overrides."""
     if os.environ.get("STROKE_EMG_ENABLED"):
         config.emg.enabled = os.environ["STROKE_EMG_ENABLED"] in ("1", "true", "True")
-    if os.environ.get("STROKE_EMG_MODE"):
-        config.emg.mode = os.environ["STROKE_EMG_MODE"]
     if os.environ.get("STROKE_EMG_CAPTURE_BACKEND"):
         config.emg.capture_backend = os.environ["STROKE_EMG_CAPTURE_BACKEND"]
     if os.environ.get("STROKE_EMG_SERIAL_DEVICE"):

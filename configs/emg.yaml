@@ -1,5 +1,4 @@
 enabled: false
-mode: "mock"
 capture_backend: "bluez"
 serial_device: "/dev/rfcomm0"
 serial_baud_rate: 460800

@@ -107,7 +107,6 @@ struct DebugConfig {
 
 struct EmgConfig {
   bool enabled{false};
-  std::string mode{"mock"};              // disabled/mock/real
   std::string captureBackend{"serial"};  // serial/bluez
   std::string serialDevice{"/dev/rfcomm0"};
   int serialBaudRate{115200};

@@ -165,7 +165,6 @@ static void registerConfigBindings(py::module_& m) {
   py::class_<EmgConfig>(m, "EmgConfig")
       .def(py::init<>())
       .def_readwrite("enabled", &EmgConfig::enabled)
-      .def_readwrite("mode", &EmgConfig::mode)
       .def_readwrite("capture_backend", &EmgConfig::captureBackend)
       .def_readwrite("serial_device", &EmgConfig::serialDevice)
       .def_readwrite("serial_baud_rate", &EmgConfig::serialBaudRate)

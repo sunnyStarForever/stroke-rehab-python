@@ -289,7 +289,6 @@ class BleSequenceResult:
 class EmgRuntimeStatus:
     enabled: bool = False
     running: bool = False
-    mock_mode: bool = False
     ble_connected: bool = False
     rpmsg_connected: bool = False
     recording: bool = False
@@ -550,12 +549,29 @@ class EmgRpmsgClient:
 
             self._ctrl_fd = os.open(ctrl_path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
             name = endpoint.encode("ascii", "strict")[:31].ljust(32, b"\x00")
-            endpoint_info = struct.pack("<32sII", name, self.RPMSG_ADDR_ANY, self.RPMSG_ADDR_ANY)
+            endpoint_info = struct.pack("<32sII", name, self.RPMSG_ADDR_ANY, 0)
             fcntl.ioctl(self._ctrl_fd, self.RPMSG_CREATE_EPT_IOCTL, endpoint_info)
-            self._data_fd = os.open(
-                data_path,
-                os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
-            )
+
+            # /dev/rpmsg0 由内核动态创建，udev 设置用户组和权限需要一点时间。
+            deadline = time.monotonic() + 2.0
+            last_error: Optional[OSError] = None
+
+            while time.monotonic() < deadline:
+                try:
+                    self._data_fd = os.open(
+                        data_path,
+                        os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+                    )
+                    last_error = None
+                    break
+                except (FileNotFoundError, PermissionError) as exc:
+                    last_error = exc
+                    time.sleep(0.02)
+
+            if self._data_fd < 0:
+                if last_error is not None:
+                    raise last_error
+                raise FileNotFoundError(f"RPMsg data device did not appear: {data_path}")
         except (OSError, ValueError, UnicodeError) as exc:
             self._emit(f"EMG RPMsg connect failed: {exc}")
             self.close()
@@ -987,7 +1003,7 @@ class SerialEmgCapture:
 
 
 class EmgManager:
-    """Own EMG mode lifecycle and expose one status/feature API to Python UI."""
+    """Own the disabled/real EMG lifecycle and expose one status/feature API."""
 
     def __init__(
         self,
@@ -1009,15 +1025,13 @@ class EmgManager:
         self._fusion = EmgFusionBuffer()
         self._status = EmgRuntimeStatus(
             enabled=bool(getattr(config, "enabled", False)),
-            mode=str(getattr(config, "mode", "disabled")),
+            mode="real" if bool(getattr(config, "enabled", False)) else "disabled",
             capture_backend=str(getattr(config, "capture_backend", "serial")),
         )
         self._lock = threading.Lock()
         self._running = threading.Event()
-        self._mock_thread: Optional[threading.Thread] = None
         self._feature_callback: Optional[Callable[[EmgFeatureFrame], None]] = None
         self._status_callback: Optional[Callable[[EmgRuntimeStatus], None]] = None
-        self._mock_seq = 0
         self._pending_values: List[int] = []
         self._pending_ts_ns = 0
         self._pending_seq = 0
@@ -1030,33 +1044,19 @@ class EmgManager:
 
     def start(self) -> bool:
         enabled = bool(getattr(self._config, "enabled", False))
-        mode = str(getattr(self._config, "mode", "disabled")).lower()
         with self._lock:
             self._status = EmgRuntimeStatus(
                 enabled=enabled,
                 running=False,
-                mode=mode if enabled else "disabled",
+                mode="real" if enabled else "disabled",
                 link_state="disabled",
                 capture_backend=str(getattr(self._config, "capture_backend", "serial")),
             )
-        if not enabled or mode == "disabled":
+        if not enabled:
             self._emit_status("EMG disabled")
             return True
         self._running.set()
         self._fusion.clear()
-        if mode == "mock":
-            with self._lock:
-                self._status.running = True
-                self._status.mock_mode = True
-                self._status.ble_connected = True
-                self._status.link_state = "mock"
-            self._mock_thread = threading.Thread(
-                target=self._mock_loop, name="emg-mock", daemon=True
-            )
-            self._mock_thread.start()
-            self._emit_status("EMG mock backend started")
-            return True
-
         backend = str(getattr(self._config, "capture_backend", "serial")).lower()
         if not self._rpmsg.connect():
             self._running.clear()
@@ -1084,9 +1084,6 @@ class EmgManager:
         self._ble.stop()
         self._serial.stop()
         self._rpmsg.close()
-        if self._mock_thread and self._mock_thread is not threading.current_thread():
-            self._mock_thread.join(timeout=1.0)
-        self._mock_thread = None
         with self._lock:
             self._status.running = False
             self._status.ble_connected = False
@@ -1096,7 +1093,7 @@ class EmgManager:
 
     def start_recording(self, action_dir: str) -> bool:
         self._recorder.set_link_context(
-            str(getattr(self._config, "mode", "disabled")),
+            "real" if bool(getattr(self._config, "enabled", False)) else "disabled",
             str(getattr(self._config, "capture_backend", "serial")),
             bool(getattr(self._config, "strict_real_mode", True)),
         )
@@ -1120,7 +1117,7 @@ class EmgManager:
     def runtime_status(self) -> EmgRuntimeStatus:
         with self._lock:
             status = replace(self._status)
-        status.ble_connected = status.mock_mode or self._ble.is_connected or self._serial.is_connected
+        status.ble_connected = self._ble.is_connected or self._serial.is_connected
         status.rpmsg_connected = self._rpmsg.is_connected
         status.invalid_payloads = self._ble.invalid_payloads
         status.dropped_packets = self._ble.dropped_packets
@@ -1165,38 +1162,12 @@ class EmgManager:
             self._status.ble_connected = False
         self._emit_status("EMG BLE disconnected")
 
-    def _mock_loop(self) -> None:
-        interval = 0.02
-        while self._running.is_set():
-            now = time.monotonic_ns()
-            phase = time.monotonic()
-            values = (
-                int(900 + 420 * abs(math.sin(phase * 2.1))),
-                int(760 + 360 * abs(math.sin(phase * 1.8 + 0.7))),
-            )
-            raw = EmgRawSample(now, self._mock_seq, 0, values)
-            self._mock_seq = (self._mock_seq + 1) & 0xFFFFFFFF
-            self._handle_raw_sample(raw)
-            features = tuple(
-                EmgChannelFeature(
-                    channel=index,
-                    rms=float(abs(value)),
-                    zcr=0.04,
-                    cv=0.12,
-                    fatigue_index=0.18,
-                    state=EmgMuscleState.SMOOTH_FLEX,
-                )
-                for index, value in enumerate(values)
-            )
-            self._publish_feature(EmgFeatureFrame(now, raw.packet_seq, 1000, features))
-            time.sleep(interval)
-
     def _handle_raw_sample(self, sample: EmgRawSample) -> None:
         chunk = None
         self._recorder.record_raw_sample(sample)
         with self._lock:
             self._status.raw_samples += 1
-            if not self._status.mock_mode and self._rpmsg.is_connected:
+            if self._rpmsg.is_connected:
                 channel_count = max(
                     1, min(EmgRpmsgProtocol.MAX_CHANNELS, int(getattr(self._config, "channel_count", 2)))
                 )

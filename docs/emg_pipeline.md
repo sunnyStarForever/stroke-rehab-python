@@ -1,6 +1,6 @@
 # Python 肌电采集与 CPU1 部署
 
-Python 应用层现在统一管理 EMG 的 mock/real 模式、BLE 或串口采集、原始数据组块、RPMsg v2 通信、CPU1 特征返回、运行状态和训练录制。原 C++ 代码中的协议约束被保留，但不再要求 C++ 管理主流程。
+Python 应用层统一管理 EMG 的关闭/真实采集状态、BLE 或串口采集、原始数据组块、RPMsg v2 通信、CPU1 特征返回、运行状态和训练录制。肌电未启用时不创建采集数据；启用后只允许真实硬件链路。原 C++ 代码中的协议约束被保留，但不再要求 C++ 管理主流程。
 
 ## 实时数据路径
 
@@ -47,7 +47,7 @@ EMG,<uint32 seq>,<int32 ch0>,<int32 ch1>
 
 ## RPMsg v2
 
-Python 在 Linux 上通过 rpmsg-char 创建 endpoint，并保持原协议的 28 字节头、config/raw/feature 消息类型和边界检查。real 模式默认要求 RPMsg 与采集端都启动成功；`strict_real_mode: true` 时不会静默伪装成 mock 数据。
+Python 在 Linux 上通过 rpmsg-char 创建 endpoint，并保持原协议的 28 字节头、config/raw/feature 消息类型和边界检查。启用肌电后默认要求 RPMsg 与采集端都启动成功；`strict_real_mode: true` 时启动失败会直接报告错误，不会生成模拟数据。
 
 CPU1/remoteproc 必须先启动，并生成配置中的控制与数据设备，例如：
 
@@ -63,7 +63,6 @@ BLE：
 
 ```yaml
 enabled: true
-mode: "real"
 capture_backend: "bluez"
 ble_address: ""
 strict_real_mode: true
@@ -73,14 +72,13 @@ strict_real_mode: true
 
 ```yaml
 enabled: true
-mode: "real"
 capture_backend: "serial"
 serial_device: "/dev/rfcomm0"
 serial_baud_rate: 460800
 strict_real_mode: true
 ```
 
-完整参数见 `configs/emg.yaml`。环境变量 `STROKE_EMG_MODE`、`STROKE_EMG_CAPTURE_BACKEND`、`STROKE_EMG_SERIAL_DEVICE`、`STROKE_EMG_BLE_ADDRESS` 和 `STROKE_EMG_STRICT_REAL` 可覆盖常用部署项。
+完整参数见 `configs/emg.yaml`。环境变量 `STROKE_EMG_ENABLED`、`STROKE_EMG_CAPTURE_BACKEND`、`STROKE_EMG_SERIAL_DEVICE`、`STROKE_EMG_BLE_ADDRESS` 和 `STROKE_EMG_STRICT_REAL` 可覆盖常用部署项。
 
 ## 验证
 
