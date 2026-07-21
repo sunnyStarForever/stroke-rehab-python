@@ -60,6 +60,8 @@ class EmgChannelFeature:
     cv: float = 0.0
     fatigue_index: float = 0.0
     state: EmgMuscleState = EmgMuscleState.REST
+    valid: bool = True
+    envelope_mean: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -367,20 +369,38 @@ class EmgBleNotifyParser:
         self._last_sequence = None
 
 
+@dataclass(frozen=True)
+class EmgRpmsgError:
+    seq: int
+    host_ts_ns: int
+    error_code: int
+    detail: int
+    message: str
+
+
 class EmgRpmsgProtocol:
-    """Binary codec matching ``core/emg/EmgProtocol.h`` version 2."""
+    """Codec for the packed v1 structures in CPU1 ``emg_protocol.h``."""
 
     MAGIC = 0x31474D45
-    VERSION = 2
+    VERSION = 1
     MAX_PACKET_BYTES = 256
-    MAX_CHANNELS = 2
-    MAX_RAW_SAMPLES = 25
-    HEADER = struct.Struct("<IBBHIQHBBHH")
-    CONFIG = struct.Struct("<HBBff")
-    CHANNEL_FEATURE = struct.Struct("<ffffB3x")
+    MAX_CHANNELS = 4
+    RAW_SCALAR_CAPACITY = 64
+    MAX_RAW_SAMPLES = RAW_SCALAR_CAPACITY
+    CONFIG_ACK_FLAGS = 0x43464731  # "CFG1"
+    HEADER = struct.Struct("<IHHHHIQIHH")
+    CONFIG = struct.Struct("<ffHHI")
+    RAW_PREFIX = struct.Struct("<HH")
+    RAW_SAMPLES = struct.Struct("<64h")
+    FEATURE_PREFIX = struct.Struct("<HH")
+    CHANNEL_FEATURE = struct.Struct("<fffHBBf")
+    HEARTBEAT = struct.Struct("<II")
+    ERROR = struct.Struct("<HH48s")
     RAW_CHUNK = 1
     FEATURE = 2
     CONFIG_MESSAGE = 3
+    HEARTBEAT_MESSAGE = 4
+    ERROR_MESSAGE = 5
 
     @classmethod
     def _header(
@@ -390,39 +410,42 @@ class EmgRpmsgProtocol:
         host_ts_ns: int = 0,
         sample_rate_hz: int = 1000,
         channel_count: int = 2,
-        sample_count: int = 0,
-        payload_bytes: int = 0,
+        total_size: int = 0,
     ) -> bytes:
         return cls.HEADER.pack(
             cls.MAGIC,
             cls.VERSION,
-            message_type,
             cls.HEADER.size,
+            message_type,
+            total_size,
             seq & 0xFFFFFFFF,
             host_ts_ns,
-            max(1, min(65535, int(sample_rate_hz))),
+            max(1, min(0xFFFFFFFF, int(sample_rate_hz))),
             channel_count,
-            sample_count,
-            payload_bytes,
             0,
         )
 
     @classmethod
     def pack_config(cls, config: Any) -> bytes:
         channel_count = max(1, min(cls.MAX_CHANNELS, int(getattr(config, "channel_count", 2))))
-        raw_samples = max(1, min(cls.MAX_RAW_SAMPLES, int(getattr(config, "raw_chunk_samples", 25))))
+        raw_samples = max(
+            1,
+            min(cls.RAW_SCALAR_CAPACITY // channel_count,
+                int(getattr(config, "raw_chunk_samples", 25))),
+        )
         payload = cls.CONFIG.pack(
-            raw_samples,
-            4,
-            0,
             float(getattr(config, "active_threshold", 800.0)),
             float(getattr(config, "noise_threshold", 15.0)),
+            max(1, min(0xFFFF, int(getattr(config, "window_size", 200)))),
+            raw_samples,
+            0,
         )
+        total_size = cls.HEADER.size + len(payload)
         return cls._header(
             cls.CONFIG_MESSAGE,
+            total_size=total_size,
             sample_rate_hz=int(getattr(config, "sample_rate_hz", 1000)),
             channel_count=channel_count,
-            payload_bytes=len(payload),
         ) + payload
 
     @classmethod
@@ -434,70 +457,104 @@ class EmgRpmsgProtocol:
             or chunk.channel_count <= 0
             or chunk.channel_count > cls.MAX_CHANNELS
             or count <= 0
-            or count > cls.MAX_RAW_SAMPLES
+            or count * chunk.channel_count > cls.RAW_SCALAR_CAPACITY
             or len(chunk.interleaved_samples) != expected
         ):
             return None
-        payload = struct.pack(f"<{expected}i", *chunk.interleaved_samples)
+        saturated = [max(-32768, min(32767, int(value)))
+                     for value in chunk.interleaved_samples]
+        padded = saturated + [0] * (cls.RAW_SCALAR_CAPACITY - expected)
+        payload = (cls.RAW_PREFIX.pack(count, expected)
+                   + cls.RAW_SAMPLES.pack(*padded))
+        total_size = cls.HEADER.size + len(payload)
         return cls._header(
             cls.RAW_CHUNK,
             seq=chunk.seq,
             host_ts_ns=chunk.host_ts_ns,
             sample_rate_hz=chunk.sample_rate_hz,
             channel_count=chunk.channel_count,
-            sample_count=count,
-            payload_bytes=len(payload),
+            total_size=total_size,
         ) + payload
 
     @classmethod
-    def parse_feature(cls, packet: bytes) -> Optional[EmgFeatureFrame]:
+    def unpack_header(cls, packet: bytes):
         if len(packet) < cls.HEADER.size:
             return None
-        (
-            magic,
-            version,
-            message_type,
-            header_size,
-            seq,
-            host_ts_ns,
-            sample_rate_hz,
-            channel_count,
-            sample_count,
-            payload_bytes,
-            _reserved,
-        ) = cls.HEADER.unpack_from(packet)
+        header = cls.HEADER.unpack_from(packet)
+        magic, version, header_size, _kind, total_size = header[:5]
+        if (magic != cls.MAGIC or version != cls.VERSION
+                or header_size != cls.HEADER.size
+                or total_size != len(packet)
+                or total_size > cls.MAX_PACKET_BYTES):
+            return None
+        return header
+
+    @classmethod
+    def parse_feature(cls, packet: bytes) -> Optional[EmgFeatureFrame]:
+        header = cls.unpack_header(packet)
+        expected_size = (cls.HEADER.size + cls.FEATURE_PREFIX.size
+                         + cls.MAX_CHANNELS * cls.CHANNEL_FEATURE.size)
+        if header is None or len(packet) != expected_size:
+            return None
+        (_, _, _, message_type, _, seq, host_ts_ns, sample_rate_hz,
+         channel_count, _reserved) = header
+        window_size, feature_count = cls.FEATURE_PREFIX.unpack_from(
+            packet, cls.HEADER.size)
         if (
-            magic != cls.MAGIC
-            or version != cls.VERSION
-            or message_type != cls.FEATURE
-            or header_size != cls.HEADER.size
+            message_type != cls.FEATURE
             or not 1 <= channel_count <= cls.MAX_CHANNELS
-            or sample_count != 0
-            or payload_bytes != channel_count * cls.CHANNEL_FEATURE.size
-            or len(packet) != cls.HEADER.size + payload_bytes
+            or feature_count != channel_count
+            or window_size <= 0
         ):
             return None
         channels = []
-        for index in range(channel_count):
-            offset = cls.HEADER.size + index * cls.CHANNEL_FEATURE.size
-            rms, zcr, cv, fatigue, state_value = cls.CHANNEL_FEATURE.unpack_from(packet, offset)
+        base = cls.HEADER.size + cls.FEATURE_PREFIX.size
+        for index in range(feature_count):
+            offset = base + index * cls.CHANNEL_FEATURE.size
+            rms, cv, fatigue, zcr, state_value, valid, envelope = (
+                cls.CHANNEL_FEATURE.unpack_from(packet, offset))
             if (
-                not all(math.isfinite(value) for value in (rms, zcr, cv, fatigue))
+                not all(math.isfinite(value) for value in (rms, cv, fatigue, envelope))
                 or state_value > int(EmgMuscleState.FATIGUE)
             ):
                 return None
-            channels.append(
+            if valid:
+                channels.append(
                 EmgChannelFeature(
                     channel=index,
                     rms=rms,
-                    zcr=zcr,
+                    zcr=float(zcr),
                     cv=cv,
                     fatigue_index=fatigue,
                     state=EmgMuscleState(state_value),
+                    valid=True,
+                    envelope_mean=envelope,
                 )
-            )
+                )
         frame = EmgFeatureFrame(host_ts_ns, seq, sample_rate_hz, tuple(channels))
         return frame if frame.valid else None
+
+    @classmethod
+    def parse_heartbeat(cls, packet: bytes) -> Optional[int]:
+        header = cls.unpack_header(packet)
+        if (header is None or header[3] != cls.HEARTBEAT_MESSAGE
+                or len(packet) != cls.HEADER.size + cls.HEARTBEAT.size):
+            return None
+        _uptime_ms, flags = cls.HEARTBEAT.unpack_from(packet, cls.HEADER.size)
+        return flags
+
+    @classmethod
+    def parse_error(cls, packet: bytes) -> Optional[EmgRpmsgError]:
+        header = cls.unpack_header(packet)
+        if (header is None or header[3] != cls.ERROR_MESSAGE
+                or len(packet) != cls.HEADER.size + cls.ERROR.size):
+            return None
+        error_code, detail, message = cls.ERROR.unpack_from(packet, cls.HEADER.size)
+        return EmgRpmsgError(
+            seq=header[5], host_ts_ns=header[6], error_code=error_code,
+            detail=detail,
+            message=message.split(b"\0", 1)[0].decode("utf-8", "replace"),
+        )
 
 
 class EmgRpmsgClient:
@@ -505,6 +562,8 @@ class EmgRpmsgClient:
 
     # _IOW(0xb5, 0x1, struct rpmsg_endpoint_info[40]) on Linux.
     RPMSG_CREATE_EPT_IOCTL = 0x4028B501
+    # _IO(0xb5, 0x2), issued on the endpoint character device.
+    RPMSG_DESTROY_EPT_IOCTL = 0xB502
     RPMSG_ADDR_ANY = 0xFFFFFFFF
 
     def __init__(self, config: Any) -> None:
@@ -512,12 +571,16 @@ class EmgRpmsgClient:
         self._ctrl_fd = -1
         self._data_fd = -1
         self._connected = threading.Event()
+        self._config_done = threading.Event()
+        self._endpoint_open = False
+        self._last_protocol_error: Optional[EmgRpmsgError] = None
         self._reader_running = threading.Event()
         self._reader: Optional[threading.Thread] = None
         self._io_lock = threading.Lock()
         self._feature_callback: Optional[Callable[[EmgFeatureFrame], None]] = None
         self._status_callback: Optional[Callable[[str], None]] = None
         self.invalid_feature_packets = 0
+        self.protocol_errors = 0
 
     @property
     def is_connected(self) -> bool:
@@ -577,22 +640,53 @@ class EmgRpmsgClient:
             self.close()
             return False
         self.invalid_feature_packets = 0
-        self._connected.set()
+        self.protocol_errors = 0
+        self._last_protocol_error = None
+        self._config_done.clear()
+        self._endpoint_open = True
         self._reader_running.set()
         self._reader = threading.Thread(target=self._read_loop, name="emg-rpmsg", daemon=True)
         self._reader.start()
-        self._emit(f"EMG RPMsg connected endpoint={endpoint}")
+        self._emit(f"EMG RPMsg endpoint opened endpoint={endpoint}; waiting for CPU1 CONFIG ACK")
         if not self.send_config():
             self.close()
             return False
+        timeout_ms = max(
+            1, int(getattr(self._config, "rpmsg_config_timeout_ms", 1500)))
+        if not self._config_done.wait(timeout_ms / 1000.0):
+            self._emit("EMG RPMsg CONFIG ACK timeout")
+            self.close()
+            return False
+        if self._last_protocol_error is not None:
+            error = self._last_protocol_error
+            self._emit(
+                f"EMG CPU1 rejected CONFIG: code={error.error_code} "
+                f"detail={error.detail} message={error.message}")
+            self.close()
+            return False
+        if not self._connected.is_set():
+            self._emit("EMG RPMsg CONFIG was not accepted")
+            self.close()
+            return False
+        self._emit(f"EMG RPMsg ready endpoint={endpoint}")
         return True
 
     def close(self) -> None:
         self._reader_running.clear()
+        self._config_done.set()
         if self._reader and self._reader is not threading.current_thread():
             self._reader.join(timeout=1.0)
         self._reader = None
         with self._io_lock:
+            if self._data_fd >= 0 and os.name == "posix":
+                try:
+                    import fcntl
+
+                    fcntl.ioctl(self._data_fd, self.RPMSG_DESTROY_EPT_IOCTL)
+                except (ImportError, OSError):
+                    # Closing the descriptors is still required when the
+                    # endpoint has already disappeared with remoteproc.
+                    pass
             for name in ("_data_fd", "_ctrl_fd"):
                 descriptor = getattr(self, name)
                 if descriptor >= 0:
@@ -601,12 +695,14 @@ class EmgRpmsgClient:
                     except OSError:
                         pass
                     setattr(self, name, -1)
+        self._endpoint_open = False
         if self._connected.is_set():
             self._connected.clear()
             self._emit("EMG RPMsg disconnected")
 
     def send_config(self) -> bool:
-        return self._write_packet(EmgRpmsgProtocol.pack_config(self._config))
+        return self._write_packet(
+            EmgRpmsgProtocol.pack_config(self._config), allow_unready=True)
 
     def send_raw_chunk(self, chunk: EmgRawChunk) -> bool:
         packet = EmgRpmsgProtocol.pack_raw_chunk(chunk)
@@ -615,8 +711,9 @@ class EmgRpmsgClient:
             return False
         return self._write_packet(packet)
 
-    def _write_packet(self, packet: bytes) -> bool:
-        if not self.is_connected or not packet or len(packet) > 256:
+    def _write_packet(self, packet: bytes, allow_unready: bool = False) -> bool:
+        if ((not self.is_connected and not (allow_unready and self._endpoint_open))
+                or not packet or len(packet) > 256):
             return False
         with self._io_lock:
             if self._data_fd < 0:
@@ -649,10 +746,26 @@ class EmgRpmsgClient:
             except OSError as exc:
                 self._emit(f"EMG RPMsg read/poll failed: {exc}")
                 break
+            error = EmgRpmsgProtocol.parse_error(packet)
+            if error is not None:
+                self.protocol_errors += 1
+                self._last_protocol_error = error
+                self._emit(
+                    f"EMG CPU1 error code={error.error_code} detail={error.detail} "
+                    f"message={error.message}")
+                self._config_done.set()
+                continue
+            flags = EmgRpmsgProtocol.parse_heartbeat(packet)
+            if flags is not None:
+                if flags & EmgRpmsgProtocol.CONFIG_ACK_FLAGS:
+                    self._connected.set()
+                    self._config_done.set()
+                    self._emit("EMG RPMsg CONFIG ACK received")
+                continue
             frame = EmgRpmsgProtocol.parse_feature(packet)
             if frame is None:
                 self.invalid_feature_packets += 1
-                self._emit("EMG RPMsg rejected invalid feature packet")
+                self._emit("EMG RPMsg rejected invalid v1 packet")
             elif self._feature_callback:
                 self._feature_callback(frame)
         self._connected.clear()
@@ -1126,6 +1239,7 @@ class EmgManager:
         status.ble_command_errors = self._ble.command_errors
         status.ble_status_timeouts = self._ble.status_timeouts
         status.invalid_feature_packets = self._rpmsg.invalid_feature_packets
+        status.rpmsg_errors += int(getattr(self._rpmsg, "protocol_errors", 0))
         status.parse_errors = self._serial.parse_errors
         status.estimated_sample_rate_hz = self._serial.estimated_sample_rate_hz
         return status
@@ -1254,6 +1368,7 @@ __all__ = [
     "EmgRawSample",
     "EmgRawChunk",
     "EmgRpmsgClient",
+    "EmgRpmsgError",
     "EmgRpmsgProtocol",
     "EmgRuntimeStatus",
     "SerialEmgCapture",

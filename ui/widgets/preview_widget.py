@@ -314,7 +314,7 @@ class PreviewWidget(QWidget):
             if elapsed > 10 and not self._no_frame_warned:
                 self._no_frame_warned = True
 
-            info_text = "按\"开始训练\"启动 Pipeline"
+            info_text = "点击“开始采集”启动摄像头和骨骼识别"
             painter.setPen(QColor(150, 160, 170))
             painter.drawText(
                 QRect(0, center_y + 5, rect.width(), 24),

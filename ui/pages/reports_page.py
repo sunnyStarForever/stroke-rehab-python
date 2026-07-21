@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QEvent, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QSplitter, QLabel,
 )
@@ -24,12 +24,13 @@ from qfluentwidgets import (
 )
 from ..theme import COLORS, PAGE_STYLE, pill_style
 from rehab_engine.reporting import generate_session_report
+from ..report_images import adapt_report_images
 
 
 class ReportsPage(QWidget):
     """Training reports and history browser."""
 
-    report_loaded = pyqtSignal(int, str, str, str)
+    report_loaded = pyqtSignal(int, str, str, str, str)
     history_loaded = pyqtSignal(int, object)
 
     def __init__(self, config=None, parent=None):
@@ -41,11 +42,18 @@ class ReportsPage(QWidget):
         self._report_generation = 0
         self._history_generation = 0
         self._closing = False
+        self._raw_html = ""
+        self._report_base_dir = Path()
+        self._last_report_width = -1
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(80)
+        self._resize_timer.timeout.connect(self._apply_responsive_html)
 
         self._init_ui()
         self.report_loaded.connect(self._on_report_loaded)
         self.history_loaded.connect(self._on_history_loaded)
-        self._browser.setHtml(self._default_html())
+        self._set_report_html(self._default_html())
         self._load_history()
 
     def _init_ui(self):
@@ -125,6 +133,7 @@ class ReportsPage(QWidget):
 
         self._browser = TextBrowser(self)
         self._browser.setOpenExternalLinks(True)
+        self._browser.viewport().installEventFilter(self)
         right_layout.addWidget(self._browser, 1)
 
         content.addWidget(left_card)
@@ -153,11 +162,13 @@ class ReportsPage(QWidget):
         def _do_load():
             subtitle = ""
             error = ""
+            report_dir = str(sd)
             if need_gen:
                 try:
                     path = Path(generate_session_report(session_dir, csv_path))
                     subtitle = f"报告文件：{path.name}"
                     html = path.read_text(encoding="utf-8", errors="ignore")
+                    report_dir = str(path.parent)
                 except Exception as exc:
                     html = self._default_html()
                     subtitle = "报告生成失败"
@@ -168,24 +179,25 @@ class ReportsPage(QWidget):
                     if hf.is_file():
                         html = hf.read_text(encoding="utf-8", errors="ignore")
                         subtitle = f"报告文件：{hf.name}"
+                        report_dir = str(hf.parent)
                         break
                 else:
                     subtitle = "骨骼数据：" + (
                         "已就绪" if csv_path and Path(csv_path).exists() else "未找到")
             try:
-                self.report_loaded.emit(generation, html, subtitle, error)
+                self.report_loaded.emit(generation, html, subtitle, error, report_dir)
             except RuntimeError:
                 pass
 
         threading.Thread(target=_do_load, name="report-load", daemon=True).start()
 
     def _on_report_loaded(self, generation: int, html: str,
-                          subtitle: str, error: str):
+                          subtitle: str, error: str, report_dir: str):
         """Runs on the Qt thread through a queued signal."""
         if self._closing or generation != self._report_generation:
             return
         self._report_subtitle.setText(subtitle)
-        self._browser.setHtml(html)
+        self._set_report_html(html, Path(report_dir))
         if error:
             InfoBar.error("报告生成失败", error, duration=6000,
                           position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
@@ -274,6 +286,33 @@ class ReportsPage(QWidget):
         self._closing = True
         self._report_generation += 1
         self._history_generation += 1
+        self._resize_timer.stop()
+
+    def eventFilter(self, watched, event):
+        if watched is self._browser.viewport() and event.type() == QEvent.Resize:
+            self._resize_timer.start()
+        return super().eventFilter(watched, event)
+
+    def _set_report_html(self, html: str, base_dir: Optional[Path] = None):
+        self._raw_html = html
+        self._report_base_dir = base_dir or Path()
+        self._last_report_width = -1
+        self._apply_responsive_html()
+
+    def _apply_responsive_html(self):
+        if not self._raw_html or self._closing:
+            return
+        width = max(1, self._browser.viewport().width() - 48)
+        if width == self._last_report_width:
+            return
+        self._last_report_width = width
+        adapted = adapt_report_images(
+            self._raw_html, width,
+            self._report_base_dir if str(self._report_base_dir) else None)
+        scrollbar = self._browser.verticalScrollBar()
+        position = scrollbar.value()
+        self._browser.setHtml(adapted)
+        scrollbar.setValue(position)
 
     def _on_history_selected(self, item):
         row = self._history_list.row(item) if item else -1
@@ -286,7 +325,7 @@ class ReportsPage(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self, "保存报告", "training_report.html", "HTML (*.html)")
         if path:
-            Path(path).write_text(self._browser.toHtml(), encoding="utf-8")
+            Path(path).write_text(self._raw_html or self._browser.toHtml(), encoding="utf-8")
             InfoBar.success("已保存", f"报告已保存到 {path}",
                             position=InfoBarPosition.BOTTOM_RIGHT, parent=self)
 

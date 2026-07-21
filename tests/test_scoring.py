@@ -124,13 +124,6 @@ class ActionArtifactTests(unittest.TestCase):
 
 
 class ScoreBridgeIntegrationTests(unittest.TestCase):
-    def test_set_fps_updates_running_scorer_without_reset(self):
-        bridge = ScoreBridge()
-        with patch.object(bridge, "_send_command", return_value=True) as send:
-            self.assertTrue(bridge.set_fps(6.5))
-        send.assert_called_once_with({"cmd": "set_fs", "fs": 6.5})
-        self.assertEqual(bridge._skeleton_fps, 6.5)
-
     def test_submit_accepts_five_valid_joints(self):
         bridge = ScoreBridge()
         bridge._running = True

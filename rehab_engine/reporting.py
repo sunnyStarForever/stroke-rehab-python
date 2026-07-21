@@ -176,6 +176,7 @@ h1{{color:#172033;margin:8px 0 4px;font-size:30px;}} .muted{{color:#667085;}}
 .fill{{height:100%;background:#2563EB;border-radius:6px;}} table{{width:100%;border-collapse:collapse;}}
 th,td{{padding:10px;text-align:left;border-bottom:1px solid #EEF2F6;}} th{{color:#475467;}} td:first-child{{color:#667085;}}
 a{{color:#2563EB;text-decoration:none;font-weight:600;}}
+img{{max-width:100%;height:auto;}}
 .note{{background:#EAF2FF;color:#1D4ED8;border-radius:10px;padding:14px 16px;line-height:1.7;}}
 @media(max-width:760px){{.grid{{grid-template-columns:repeat(2,1fr);}}}}
 </style></head><body><div class="wrap">

@@ -18,5 +18,6 @@ rpmsg_ctrl_device: "/dev/rpmsg_ctrl0"
 rpmsg_data_device: "/dev/rpmsg0"
 rpmsg_endpoint_name: "emg_rpmsg"
 rpmsg_poll_timeout_ms: 5
+rpmsg_config_timeout_ms: 1500
 active_threshold: 800.0
 noise_threshold: 15.0

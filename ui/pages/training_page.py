@@ -83,8 +83,9 @@ ACTION_TIPS = {
 
 
 class TrainingState(Enum):
-    IDLE = "待开始"
-    STARTING = "正在连接设备"
+    IDLE = "待采集"
+    STARTING_CAPTURE = "正在启动采集"
+    CAPTURING = "采集中（未训练）"
     TRAINING = "训练中"
     RESTING = "休息中"
     PAUSED = "已暂停"
@@ -276,9 +277,22 @@ class TrainingPage(QWidget):
     def set_debug_enabled(self, enabled: bool):
         self._preview.set_show_debug(enabled)
 
-    def _preflight_checks(self):
-        """Return blocking errors and non-blocking warnings before a session."""
+    def _capture_preflight_checks(self):
+        """Validate only resources required for capture and pose inference."""
         errors, warnings = [], []
+        self._check_cameras()
+        if not rehab_engine._STUB_MODE and not self._cameras_found:
+            errors.append("未检测到 RGB 摄像头")
+        elif rehab_engine._STUB_MODE:
+            warnings.append("当前为 STUB 模拟模式")
+        if (not rehab_engine._STUB_MODE and
+                (self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30)):
+            errors.append("真实 RGB 与 Depth 相机必须同时设置为 30 FPS")
+        return errors, warnings
+
+    def _training_preflight_checks(self):
+        """Validate resources first needed when a formal session begins."""
+        errors = []
         if not self._current_course or not self._current_course.actions:
             errors.append("未选择有效训练课程")
         try:
@@ -289,15 +303,7 @@ class TrainingPage(QWidget):
             probe.unlink()
         except OSError as exc:
             errors.append(f"训练记录目录不可写：{exc}")
-        self._check_cameras()
-        if not rehab_engine._STUB_MODE and not self._cameras_found:
-            errors.append("未检测到 RGB 摄像头")
-        elif rehab_engine._STUB_MODE:
-            warnings.append("当前为 STUB 模拟模式")
-        if (not rehab_engine._STUB_MODE and
-                (self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30)):
-            errors.append("真实 RGB 与 Depth 相机必须同时设置为 30 FPS")
-        return errors, warnings
+        return errors
 
     def _record_sessions_dir(self) -> Path:
         """Resolve relative recording paths against the Python project root."""
@@ -493,6 +499,7 @@ class TrainingPage(QWidget):
         ctrl.setContentsMargins(16, 8, 16, 8)
         ctrl.setSpacing(10)
 
+        self._btn_capture = PrimaryPushButton("开始采集")
         self._btn_start = PrimaryPushButton("开始训练")
         self._btn_pause = PushButton("暂停")
         self._btn_stop = PushButton("停止")
@@ -502,7 +509,7 @@ class TrainingPage(QWidget):
         self._btn_debug.setCheckable(True)
         self._btn_debug.setFixedHeight(30)
 
-        for button in [self._btn_start, self._btn_pause, self._btn_stop,
+        for button in [self._btn_capture, self._btn_start, self._btn_pause, self._btn_stop,
                        self._btn_report, self._btn_open_report]:
             button.setMinimumHeight(36)
         self._btn_start.setMinimumWidth(112)
@@ -510,6 +517,7 @@ class TrainingPage(QWidget):
         self._btn_stop.setStyleSheet(
             f"PushButton{{color:{COLORS['danger']};}}")
 
+        self._btn_capture.clicked.connect(self._on_start_capture)
         self._btn_start.clicked.connect(self._on_start)
         self._btn_pause.clicked.connect(self._on_pause)
         self._btn_stop.clicked.connect(self._on_stop)
@@ -517,6 +525,7 @@ class TrainingPage(QWidget):
         self._btn_open_report.clicked.connect(self._on_open_report)
         self._btn_debug.clicked.connect(self._on_toggle_debug)
 
+        ctrl.addWidget(self._btn_capture)
         ctrl.addWidget(self._btn_start)
         ctrl.addWidget(self._btn_pause)
         ctrl.addWidget(self._btn_stop)
@@ -562,12 +571,16 @@ class TrainingPage(QWidget):
 
     def _update_buttons(self):
         s = self._state
-        self._btn_start.setEnabled(s in (TrainingState.IDLE, TrainingState.FINISHED))
-        self._btn_start.setText("开始新训练" if s == TrainingState.FINISHED else "开始训练")
+        self._btn_capture.setEnabled(s in (TrainingState.IDLE, TrainingState.FINISHED))
+        self._btn_start.setEnabled(
+            s == TrainingState.CAPTURING and self._pipeline.is_running)
+        self._btn_start.setText("开始训练")
         self._btn_pause.setEnabled(
             s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
         self._btn_pause.setText("继续训练" if s == TrainingState.PAUSED else "暂停")
-        self._btn_stop.setEnabled(s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
+        self._btn_stop.setEnabled(s in (
+            TrainingState.CAPTURING, TrainingState.TRAINING,
+            TrainingState.RESTING, TrainingState.PAUSED))
         self._btn_report.setEnabled(
             s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
         self._btn_open_report.setEnabled(bool(self._session_dir))
@@ -579,38 +592,36 @@ class TrainingPage(QWidget):
         for name, button in self._preview_mode_buttons.items():
             button.setChecked(name == mode)
 
-    def _on_start(self):
+    def _on_start_capture(self):
         if self._state not in (TrainingState.IDLE, TrainingState.FINISHED):
-            self._append_feedback("训练已在启动或运行中，请勿重复点击开始。")
+            self._append_feedback("采集已在启动或运行中，请勿重复点击。")
             return
-        errors, warnings = self._preflight_checks()
+        errors, warnings = self._capture_preflight_checks()
         if errors:
             message = "；".join(errors)
-            self._append_feedback(f"训练前检查失败：{message}")
-            InfoBar.error("无法开始训练", message, duration=6000,
+            self._append_feedback(f"采集前检查失败：{message}")
+            InfoBar.error("无法开始采集", message, duration=6000,
                           position=InfoBarPosition.TOP_RIGHT, parent=self)
             return
         if warnings:
             self._append_feedback("训练前提示：" + "；".join(warnings))
 
         # Log pipeline start details
-        self._append_feedback(f"═══ 启动训练 Pipeline ═══")
+        self._append_feedback("═══ 启动采集 Pipeline ═══")
         self._append_feedback(f"引擎模式: {'STUB (模拟)' if rehab_engine._STUB_MODE else 'FULL (真实)'}")
         self._append_feedback(f"RGB 设备: {self._config.device.rgb_device_path}")
         self._append_feedback(f"分辨率: {self._config.device.rgb_width}x{self._config.device.rgb_height} @ {self._config.device.rgb_fps}fps")
-        self._append_feedback(f"课程: {self._current_course.course_name}")
         self._append_feedback(
             f"EMG: {'启用（真实采集）' if self._config.emg.enabled else '禁用'}")
 
-        self._append_feedback(f"启动训练：{self._current_course.course_name}")
+        self._append_feedback("正在启动摄像头与骨骼推理预览…")
 
         self._ending = False
         self._fps_warning_active = False
         self._frame_index = 0
-        self._score_panel.reset()
         self._start_generation += 1
         generation = self._start_generation
-        self._update_state(TrainingState.STARTING)
+        self._update_state(TrainingState.STARTING_CAPTURE)
         self._append_feedback("正在后台连接真实 RGB/Depth 设备并初始化模型…")
 
         def _start_pipeline():
@@ -633,7 +644,7 @@ class TrainingPage(QWidget):
             if ok:
                 self._pipeline.stop()
             return
-        if self._state != TrainingState.STARTING:
+        if self._state != TrainingState.STARTING_CAPTURE:
             if ok:
                 self._pipeline.stop()
             return
@@ -643,6 +654,35 @@ class TrainingPage(QWidget):
             InfoBar.error("启动失败", message,
                           position=InfoBarPosition.TOP_RIGHT, parent=self)
             return
+        self._preview.set_recording(False)
+        self._preview.set_show_debug(self._config.ui_debug_enabled)
+        self._update_state(TrainingState.CAPTURING)
+        self._append_feedback(
+            "采集已启动，请确认摄像头和骨骼显示正常后点击“开始训练”。")
+        self._voice.speak(
+            "采集已启动，请确认骨骼显示后开始训练",
+            key="capture_ready", priority=2, force=True)
+
+    def _on_start(self):
+        if self._state != TrainingState.CAPTURING:
+            self._append_feedback("请先点击“开始采集”并等待摄像头与骨骼就绪。")
+            return
+        if not self._pipeline.is_running:
+            self._append_feedback("采集 Pipeline 已停止，请重新开始采集。")
+            self._update_state(TrainingState.IDLE)
+            return
+        errors = self._training_preflight_checks()
+        if errors:
+            message = "；".join(errors)
+            self._append_feedback(f"训练前检查失败：{message}")
+            InfoBar.error("无法开始训练", message, duration=6000,
+                          position=InfoBarPosition.TOP_RIGHT, parent=self)
+            return
+        self._ending = False
+        self._fps_warning_active = False
+        self._frame_index = 0
+        self._score_panel.reset()
+        self._append_feedback(f"启动正式训练：{self._current_course.course_name}")
         try:
             self._session_dir = self._pipeline.start_recording(
                 str(self._record_sessions_dir()))
@@ -674,12 +714,6 @@ class TrainingPage(QWidget):
         self._write_course_summary(False)
         self._preview.set_recording(True)
         self._preview.set_show_debug(self._config.ui_debug_enabled)
-
-        # Log pipeline status after start
-        if rehab_engine._STUB_MODE:
-            self._append_feedback("⚠ Pipeline 运行在模拟模式 — 画面为合成数据")
-        else:
-            self._append_feedback("✓ Pipeline 已启动 — 等待相机数据...")
 
         self._elapsed_seconds = 0
 
@@ -731,7 +765,9 @@ class TrainingPage(QWidget):
             )
             if not box.exec():
                 return
-        self._end_session(TrainingState.IDLE, generate_report=False, reason="训练已停止。")
+        reason = ("采集已停止。" if self._state == TrainingState.CAPTURING
+                  else "训练已停止。")
+        self._end_session(TrainingState.IDLE, generate_report=False, reason=reason)
 
     def _on_finish(self):
         self._end_session(
@@ -1152,6 +1188,11 @@ class TrainingPage(QWidget):
                 self._fps_warning_active = False
 
     def _refresh_preview(self):
+        if (self._state == TrainingState.CAPTURING
+                and not self._pipeline.is_running
+                and not self._pipeline.is_stopping):
+            self._append_feedback("采集 Pipeline 已意外停止，请重新开始采集。")
+            self._update_state(TrainingState.IDLE)
         frame = self._pipeline.preview.latest_frame()
         if frame:
             self._preview.set_frame(frame)

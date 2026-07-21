@@ -196,6 +196,7 @@ class EmgConfig:
     rpmsg_data_device: str = "/dev/rpmsg0"
     rpmsg_endpoint_name: str = "emg_rpmsg"
     rpmsg_poll_timeout_ms: int = 5
+    rpmsg_config_timeout_ms: int = 1500
     active_threshold: float = 800.0
     noise_threshold: float = 15.0
 

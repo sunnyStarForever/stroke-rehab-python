@@ -1,6 +1,6 @@
 depth_capture:
   device_uri: ""
-  enable_hardware_d2c: true
+  enable_hardware_d2c: false
   enable_openni_color_stream_for_debug: false
   enable_depth_color_sync: false
   width: 640

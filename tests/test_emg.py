@@ -1,7 +1,10 @@
 import struct
+import sys
 import time
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest import mock
 
 from rehab_engine import EmgConfig
 from rehab_engine.emg import (
@@ -16,6 +19,7 @@ from rehab_engine.emg import (
     EmgManager,
     EmgMuscleState,
     EmgRawChunk,
+    EmgRpmsgClient,
     EmgRpmsgProtocol,
     SerialEmgCapture,
 )
@@ -52,42 +56,187 @@ class EmgBleNotifyParserTests(unittest.TestCase):
 
 
 class EmgRpmsgProtocolTests(unittest.TestCase):
-    def test_config_and_raw_chunk_match_v2_header_contract(self):
+    def test_config_and_raw_chunk_match_cpu1_v1_contract(self):
         config = EmgConfig(raw_chunk_samples=25, channel_count=2)
         config_packet = EmgRpmsgProtocol.pack_config(config)
-        self.assertEqual(EmgRpmsgProtocol.HEADER.size, 28)
-        self.assertEqual(len(config_packet), 40)
+        self.assertEqual(EmgRpmsgProtocol.HEADER.size, 32)
+        self.assertEqual(len(config_packet), 48)
         self.assertEqual(config_packet[:4], b"EMG1")
+        self.assertEqual(
+            config_packet.hex(),
+            "454d47310100200003003000000000000000000000000000"
+            "e8030000020000000000484400007041c800190000000000",
+        )
+        header = EmgRpmsgProtocol.HEADER.unpack_from(config_packet)
+        self.assertEqual(header[:5], (
+            EmgRpmsgProtocol.MAGIC, 1, 32,
+            EmgRpmsgProtocol.CONFIG_MESSAGE, 48))
 
-        chunk = EmgRawChunk(123456, 8, 1000, 2, tuple(range(50)))
+        values = tuple(range(48)) + (99999, -99999)
+        chunk = EmgRawChunk(123456, 8, 1000, 2, values)
         raw_packet = EmgRpmsgProtocol.pack_raw_chunk(chunk)
         self.assertIsNotNone(raw_packet)
-        self.assertEqual(len(raw_packet), 228)
+        self.assertEqual(len(raw_packet), 164)
         header = EmgRpmsgProtocol.HEADER.unpack_from(raw_packet)
-        self.assertEqual(header[2], EmgRpmsgProtocol.RAW_CHUNK)
-        self.assertEqual(header[8], 25)
-        self.assertEqual(header[9], 200)
+        self.assertEqual(header[3], EmgRpmsgProtocol.RAW_CHUNK)
+        self.assertEqual(header[4], 164)
+        sample_count, scalar_count = EmgRpmsgProtocol.RAW_PREFIX.unpack_from(
+            raw_packet, EmgRpmsgProtocol.HEADER.size)
+        self.assertEqual((sample_count, scalar_count), (25, 50))
+        samples = EmgRpmsgProtocol.RAW_SAMPLES.unpack_from(
+            raw_packet, EmgRpmsgProtocol.HEADER.size + 4)
+        self.assertEqual(samples[48:50], (32767, -32768))
+        self.assertEqual(samples[50:], (0,) * 14)
 
     def test_feature_packet_validation_preserves_fields(self):
-        payload = b"".join(
-            (
-                EmgRpmsgProtocol.CHANNEL_FEATURE.pack(10.0, 0.1, 0.2, 0.3, 1),
-                EmgRpmsgProtocol.CHANNEL_FEATURE.pack(20.0, 0.2, 0.3, 0.4, 3),
-            )
-        )
+        payload = EmgRpmsgProtocol.FEATURE_PREFIX.pack(200, 2) + b"".join((
+            EmgRpmsgProtocol.CHANNEL_FEATURE.pack(10.0, 0.2, 0.3, 7, 1, 1, 9.0),
+            EmgRpmsgProtocol.CHANNEL_FEATURE.pack(20.0, 0.3, 0.4, 8, 3, 1, 18.0),
+            EmgRpmsgProtocol.CHANNEL_FEATURE.pack(0, 0, 0, 0, 0, 0, 0),
+            EmgRpmsgProtocol.CHANNEL_FEATURE.pack(0, 0, 0, 0, 0, 0, 0),
+        ))
         packet = EmgRpmsgProtocol._header(
             EmgRpmsgProtocol.FEATURE,
             seq=77,
             host_ts_ns=123456,
             sample_rate_hz=1000,
             channel_count=2,
-            payload_bytes=len(payload),
+            total_size=EmgRpmsgProtocol.HEADER.size + len(payload),
         ) + payload
         frame = EmgRpmsgProtocol.parse_feature(packet)
         self.assertIsNotNone(frame)
         self.assertEqual(frame.seq, 77)
         self.assertEqual(frame.channels[1].state, EmgMuscleState.FATIGUE)
+        self.assertEqual(frame.channels[1].zcr, 8.0)
+        self.assertEqual(frame.channels[1].envelope_mean, 18.0)
         self.assertIsNone(EmgRpmsgProtocol.parse_feature(packet[:-1]))
+
+    def test_heartbeat_ack_and_cpu1_error_are_distinguished(self):
+        heartbeat_payload = EmgRpmsgProtocol.HEARTBEAT.pack(
+            123, EmgRpmsgProtocol.CONFIG_ACK_FLAGS)
+        heartbeat = EmgRpmsgProtocol._header(
+            EmgRpmsgProtocol.HEARTBEAT_MESSAGE,
+            total_size=EmgRpmsgProtocol.HEADER.size + len(heartbeat_payload),
+        ) + heartbeat_payload
+        self.assertEqual(
+            EmgRpmsgProtocol.parse_heartbeat(heartbeat),
+            EmgRpmsgProtocol.CONFIG_ACK_FLAGS)
+
+        error_payload = EmgRpmsgProtocol.ERROR.pack(
+            2, 32, b"bad config packet".ljust(48, b"\0"))
+        error_packet = EmgRpmsgProtocol._header(
+            EmgRpmsgProtocol.ERROR_MESSAGE, seq=9, host_ts_ns=10,
+            total_size=EmgRpmsgProtocol.HEADER.size + len(error_payload),
+        ) + error_payload
+        error = EmgRpmsgProtocol.parse_error(error_packet)
+        self.assertEqual((error.error_code, error.detail), (2, 32))
+        self.assertEqual(error.message, "bad config packet")
+
+    def test_v1_bounds_and_header_corruption_are_rejected(self):
+        self.assertIsNone(EmgRpmsgProtocol.pack_raw_chunk(
+            EmgRawChunk(1, 1, 1000, 4, tuple(range(68)))))
+        self.assertIsNone(EmgRpmsgProtocol.pack_raw_chunk(
+            EmgRawChunk(1, 1, 1000, 0, (1,))))
+        packet = bytearray(EmgRpmsgProtocol.pack_config(EmgConfig()))
+        packet[4:6] = struct.pack("<H", 2)
+        self.assertIsNone(EmgRpmsgProtocol.unpack_header(packet))
+
+
+class EmgRpmsgClientHandshakeTests(unittest.TestCase):
+    @staticmethod
+    def _heartbeat():
+        payload = EmgRpmsgProtocol.HEARTBEAT.pack(
+            1, EmgRpmsgProtocol.CONFIG_ACK_FLAGS)
+        return EmgRpmsgProtocol._header(
+            EmgRpmsgProtocol.HEARTBEAT_MESSAGE,
+            total_size=EmgRpmsgProtocol.HEADER.size + len(payload),
+        ) + payload
+
+    @staticmethod
+    def _error():
+        payload = EmgRpmsgProtocol.ERROR.pack(
+            2, 32, b"bad config packet".ljust(48, b"\0"))
+        return EmgRpmsgProtocol._header(
+            EmgRpmsgProtocol.ERROR_MESSAGE,
+            total_size=EmgRpmsgProtocol.HEADER.size + len(payload),
+        ) + payload
+
+    def _connect_with_packets(self, packets, timeout_ms=100):
+        config = EmgConfig()
+        config.rpmsg_config_timeout_ms = timeout_ms
+        client = EmgRpmsgClient(config)
+        statuses = []
+        client.set_on_status(statuses.append)
+        queue = list(packets)
+
+        class Poller:
+            def register(self, *_args):
+                pass
+
+            def poll(self, _timeout):
+                if queue:
+                    return [(11, 1)]
+                time.sleep(0.002)
+                return []
+
+        def read(_fd, _size):
+            return queue.pop(0)
+
+        fcntl = SimpleNamespace(ioctl=lambda *_args: 0)
+        patches = (
+            mock.patch("rehab_engine.emg.os.name", "posix"),
+            mock.patch("rehab_engine.emg.os.path.exists", return_value=True),
+            mock.patch("rehab_engine.emg.os.open", side_effect=[10, 11]),
+            mock.patch("rehab_engine.emg.os.write", side_effect=lambda _fd, data: len(data)),
+            mock.patch("rehab_engine.emg.os.read", side_effect=read),
+            mock.patch("rehab_engine.emg.os.close"),
+            mock.patch("rehab_engine.emg.select.poll", return_value=Poller(), create=True),
+            mock.patch("rehab_engine.emg.os.O_NONBLOCK", 0, create=True),
+            mock.patch("rehab_engine.emg.select.POLLIN", 1, create=True),
+            mock.patch.dict(sys.modules, {"fcntl": fcntl}),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                patches[5], patches[6], patches[7], patches[8], patches[9]:
+            result = client.connect()
+            ready = client.is_connected
+            errors = client.protocol_errors
+            client.close()
+        return result, ready, errors, statuses
+
+    def test_config_ack_is_required_before_client_is_ready(self):
+        result, ready, errors, statuses = self._connect_with_packets(
+            [self._heartbeat()])
+        self.assertTrue(result)
+        self.assertTrue(ready)
+        self.assertEqual(errors, 0)
+        self.assertTrue(any("CONFIG ACK received" in item for item in statuses))
+
+    def test_config_timeout_and_cpu1_error_fail_connection(self):
+        result, ready, _errors, statuses = self._connect_with_packets([], 20)
+        self.assertFalse(result)
+        self.assertFalse(ready)
+        self.assertTrue(any("ACK timeout" in item for item in statuses))
+
+        result, ready, errors, statuses = self._connect_with_packets([self._error()])
+        self.assertFalse(result)
+        self.assertFalse(ready)
+        self.assertEqual(errors, 1)
+        self.assertTrue(any("code=2" in item for item in statuses))
+
+    def test_write_disconnect_clears_ready_and_rejects_out_of_bounds_chunk(self):
+        client = EmgRpmsgClient(EmgConfig())
+        client._data_fd = 11
+        client._endpoint_open = True
+        client._connected.set()
+        statuses = []
+        client.set_on_status(statuses.append)
+        with mock.patch("rehab_engine.emg.os.write", side_effect=OSError("gone")):
+            self.assertFalse(client.send_raw_chunk(
+                EmgRawChunk(1, 1, 1000, 2, (1, 2))))
+        self.assertFalse(client.is_connected)
+        self.assertTrue(any("write failed" in item for item in statuses))
+        self.assertFalse(client.send_raw_chunk(
+            EmgRawChunk(1, 2, 1000, 4, tuple(range(68)))))
 
 
 @dataclass
