@@ -463,11 +463,6 @@ class TrainingPage(QWidget):
         self._emg_panel = EmgPanel(side)
         side_layout.addWidget(self._emg_panel)
 
-        # Debug panel (collapsible via toggle button on control bar)
-        self._debug_panel = DebugPanel(side)
-        self._debug_panel.setVisible(False)
-        side_layout.addWidget(self._debug_panel)
-
         side_layout.addStretch()
 
         main_row.addWidget(preview_card, 1)
