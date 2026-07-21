@@ -149,6 +149,12 @@ class DebugPanel(SimpleCardWidget):
         on_refresh = getattr(self, "_on_debug_refresh_cb", None)
         if on_refresh:
             on_refresh()
+        QTimer.singleShot(2500, self._restore_refresh_button)
+
+    def _restore_refresh_button(self):
+        if not self._refresh_btn.isEnabled():
+            self._refresh_btn.setEnabled(True)
+            self._refresh_btn.setText("刷新状态")
 
     def set_refresh_callback(self, callback):
         """Set a callable that the panel invokes when the user clicks refresh."""

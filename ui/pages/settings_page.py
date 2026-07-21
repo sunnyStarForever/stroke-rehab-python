@@ -3,6 +3,7 @@ Settings page — device configuration and system preferences.
 Replaces app/dialogs/DeviceSettingsDialog.cpp + RecordingSettingsDialog.cpp.
 """
 
+import copy
 import threading
 
 from PyQt5.QtWidgets import (
@@ -42,8 +43,10 @@ class SettingsPage(ScrollArea):
 
     course_changed = pyqtSignal(str)
     debug_changed = pyqtSignal(bool)
+    theme_changed = pyqtSignal(str)
     settings_applied = pyqtSignal(str)
     ble_scan_finished = pyqtSignal(object)
+    diagnostics_finished = pyqtSignal(object)
     log_requested = pyqtSignal()
     performance_requested = pyqtSignal()
 
@@ -56,6 +59,7 @@ class SettingsPage(ScrollArea):
 
         self._init_ui()
         self.ble_scan_finished.connect(self._finish_ble_scan)
+        self.diagnostics_finished.connect(self._finish_device_test)
         self._load_config()
 
     def _init_ui(self):
@@ -159,6 +163,8 @@ class SettingsPage(ScrollArea):
 
         course_grid = QGridLayout()
         course_grid.setHorizontalSpacing(14)
+        self._theme_combo = ComboBox()
+        self._theme_combo.addItems(["浅色", "深色"])
         self._patient_name = LineEdit()
         self._patient_id = LineEdit()
         self._patient_id.setPlaceholderText("P0001")
@@ -176,6 +182,8 @@ class SettingsPage(ScrollArea):
         course_grid.addWidget(BodyLabel("训练课程"), 1, 0)
         course_grid.addWidget(self._course_combo, 1, 1)
         course_grid.addWidget(self._debug_switch, 2, 1)
+        course_grid.addWidget(BodyLabel("界面主题"), 7, 0)
+        course_grid.addWidget(self._theme_combo, 7, 1)
         course_grid.setColumnStretch(1, 1)
         course_grid.addWidget(BodyLabel("患者编号"), 3, 0)
         course_grid.addWidget(self._patient_id, 3, 1)
@@ -308,6 +316,8 @@ class SettingsPage(ScrollArea):
         self._patient_age.setValue(c.patient_age)
         self._patient_diagnosis.setText(c.patient_diagnosis)
         self._debug_switch.setChecked(c.ui_debug_enabled)
+        self._theme_combo.setCurrentText(
+            "深色" if getattr(c, "ui_theme", "light") == "dark" else "浅色")
         if c.selected_course_id in self._course_ids:
             self._course_combo.setCurrentIndex(
                 self._course_ids.index(c.selected_course_id))
@@ -346,6 +356,7 @@ class SettingsPage(ScrollArea):
         c.patient_age = self._patient_age.value()
         c.patient_diagnosis = self._patient_diagnosis.text().strip()
         c.ui_debug_enabled = self._debug_switch.isChecked()
+        c.ui_theme = "dark" if self._theme_combo.currentText() == "深色" else "light"
         index = self._course_combo.currentIndex()
         if 0 <= index < len(self._course_ids):
             c.selected_course_id = self._course_ids[index]
@@ -359,6 +370,7 @@ class SettingsPage(ScrollArea):
 
         self.course_changed.emit(c.selected_course_id)
         self.debug_changed.emit(c.ui_debug_enabled)
+        self.theme_changed.emit(c.ui_theme)
         self.settings_applied.emit(str(config_path))
         parent = self.window()
         if hasattr(parent, "refresh_diagnostics"):
@@ -405,9 +417,59 @@ class SettingsPage(ScrollArea):
                 position=InfoBarPosition.TOP_RIGHT, parent=self,
             )
 
+    def _form_config_snapshot(self):
+        c = copy.deepcopy(self._config)
+        c.device.rgb_device_path = self._rgb_device.currentText()
+        c.device.rgb_pixel_format = self._rgb_format.currentText()
+        res = self._rgb_resolution.currentText().split("x")
+        if len(res) == 2:
+            c.device.rgb_width = int(res[0])
+            c.device.rgb_height = int(res[1])
+        c.device.rgb_fps = int(self._rgb_fps.currentText())
+        c.device.openni_device_uri = self._depth_device.text().strip()
+        dres = self._depth_resolution.currentText().split("x")
+        if len(dres) == 2:
+            c.device.depth_width = int(dres[0])
+            c.device.depth_height = int(dres[1])
+        c.device.depth_fps = int(self._depth_fps.currentText())
+        c.device.enable_hardware_d2c = self._hw_d2c.isChecked()
+        c.emg.enabled = self._emg_enabled.isChecked()
+        c.emg.capture_backend = self._emg_backend.currentText()
+        c.emg.serial_device = self._emg_serial.text().strip()
+        selected_ble = self._emg_ble_device.currentText().strip()
+        c.emg.ble_address = self._ble_devices.get(selected_ble, selected_ble)
+        c.ui_theme = "dark" if self._theme_combo.currentText() == "深色" else "light"
+        return c
+
+    def _finish_device_test(self, diagnostics):
+        self._btn_test.setEnabled(True)
+        self._btn_test.setText("测试设备")
+        errors = diagnostics.errors()
+        warnings = diagnostics.warnings()
+        if errors:
+            detail = "；".join(item.name for item in errors[:4])
+            InfoBar.error("设备检查未通过", detail, duration=6000,
+                          position=InfoBarPosition.TOP_RIGHT, parent=self)
+        elif warnings:
+            detail = "；".join(item.name for item in warnings[:4])
+            InfoBar.warning("设备可用但存在警告", detail, duration=5000,
+                            position=InfoBarPosition.TOP_RIGHT, parent=self)
+        else:
+            InfoBar.success("设备检查通过", "相机、引擎与保存路径状态正常。",
+                            position=InfoBarPosition.TOP_RIGHT, parent=self)
+
     def _test_devices(self):
         """Run the same diagnostics used at startup and summarize the result."""
         self._btn_test.setEnabled(False)
+        self._btn_test.setText("检测中…")
+        snapshot = self._form_config_snapshot()
+
+        def worker():
+            self.diagnostics_finished.emit(run_diagnostics(snapshot))
+
+        threading.Thread(target=worker, name="settings-device-test", daemon=True).start()
+        return
+
         try:
             diagnostics = run_diagnostics(self._config)
             errors = diagnostics.errors()

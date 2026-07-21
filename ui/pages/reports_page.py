@@ -120,6 +120,9 @@ class ReportsPage(QWidget):
         report_heading.addWidget(self._report_title)
         report_heading.addWidget(self._report_subtitle)
         header.addLayout(report_heading, 1)
+        self._btn_trend = PushButton("康复趋势")
+        self._btn_trend.clicked.connect(self._show_trends)
+        header.addWidget(self._btn_trend)
 
         self._btn_save = PushButton("保存报告")
         self._btn_save.setEnabled(False)
@@ -273,6 +276,7 @@ class ReportsPage(QWidget):
             return
         self._history_entries = entries
         self._history_list.clear()
+        refresh_trends = not self._session_dir
 
         for path, start_time, session_label in entries:
             name = session_label or Path(path).name
@@ -280,6 +284,109 @@ class ReportsPage(QWidget):
                 name = f"{start_time[:16].replace('T', ' ')}\n{name}"
             self._history_list.addItem(name)
         self._history_count.setText(f"{len(entries)} 次")
+
+        if refresh_trends:
+            self._show_trends()
+
+    def _show_trends(self):
+        self._session_dir = ""
+        self._csv_path = ""
+        self._report_title.setText("康复趋势")
+        self._report_subtitle.setText("基于最近训练记录的连续康复观察")
+        self._btn_save.setEnabled(True)
+        self._btn_folder.setEnabled(False)
+        self._browser.setHtml(self._trend_html())
+
+    def _session_snapshot(self, session_dir: str, start_time: str, label: str) -> dict:
+        session = Path(session_dir)
+        meta = {}
+        summary = {}
+        for name in ("session_ui_meta.json", "meta.json"):
+            path = session / name
+            if path.exists():
+                try:
+                    meta = json.loads(path.read_text(encoding="utf-8"))
+                    break
+                except Exception:
+                    pass
+        summary_path = session / "course_summary.json"
+        if summary_path.exists():
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except Exception:
+                summary = {}
+        actions = summary.get("actions", []) if isinstance(summary, dict) else []
+        scores = [
+            float(item.get("average_score", 0.0) or 0.0)
+            for item in actions
+            if float(item.get("average_score", 0.0) or 0.0) > 0.0
+        ]
+        actual = sum(int(item.get("actual_reps", 0) or 0) for item in actions)
+        target = sum(int(item.get("target_reps", 0) or 0) for item in actions)
+        completion = (actual / target * 100.0) if target > 0 else 0.0
+        elapsed = int(meta.get("elapsed_seconds", 0) or 0)
+        return {
+            "session": session,
+            "start": start_time or meta.get("start_time", ""),
+            "label": label or meta.get("course_name", "") or session.name,
+            "score": sum(scores) / len(scores) if scores else 0.0,
+            "completion": completion,
+            "actual": actual,
+            "target": target,
+            "elapsed": elapsed,
+            "finished": bool(meta.get("finished", False)),
+        }
+
+    def _trend_html(self) -> str:
+        snapshots = [
+            self._session_snapshot(path, start, label)
+            for path, start, label in self._history_entries[:12]
+        ]
+        if not snapshots:
+            return self._default_html()
+        recent = snapshots[:6]
+        avg_score = sum(item["score"] for item in recent) / len(recent)
+        avg_completion = sum(item["completion"] for item in recent) / len(recent)
+        total_minutes = sum(item["elapsed"] for item in recent) // 60
+        rows = []
+        cards = []
+        for item in snapshots:
+            score = max(0, min(100, item["score"]))
+            completion = max(0, min(100, item["completion"]))
+            date = item["start"][:16].replace("T", " ")
+            rows.append(
+                f"<tr><td>{date}</td><td>{item['label']}</td>"
+                f"<td>{item['elapsed']//60} 分钟</td><td>{item['actual']}/{item['target']}</td>"
+                f"<td>{score:.1f}</td><td>{completion:.0f}%</td></tr>"
+            )
+            cards.append(
+                f"<div class='session'><div><b>{date}</b><span>{item['label']}</span></div>"
+                f"<div class='bar'><i style='width:{score:.0f}%'></i></div>"
+                f"<em>{score:.1f}</em></div>"
+            )
+        return f"""<html><head><meta charset="utf-8"><style>
+body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:#F8FAFD;color:#344054;padding:28px;}}
+h1{{color:#172033;font-size:28px;margin:0 0 8px;}} h2{{color:#172033;font-size:18px;margin-top:28px;}}
+.hint{{color:#667085;line-height:1.7;}} .grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:20px 0;}}
+.metric{{background:white;border:1px solid #E4EAF2;border-radius:14px;padding:18px;}}
+.metric span{{display:block;color:#667085;font-size:13px;}} .metric b{{font-size:30px;color:#2563EB;}}
+.panel{{background:white;border:1px solid #E4EAF2;border-radius:14px;padding:18px;margin-top:14px;}}
+.session{{display:grid;grid-template-columns:220px 1fr 70px;gap:12px;align-items:center;margin:12px 0;}}
+.session span{{display:block;color:#667085;font-size:12px;margin-top:3px;}}
+.bar{{height:10px;background:#E9EEF5;border-radius:999px;overflow:hidden;}} .bar i{{display:block;height:100%;background:#2563EB;}}
+table{{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden;}}
+th,td{{text-align:left;border-bottom:1px solid #E4EAF2;padding:10px;font-size:13px;}} th{{color:#667085;background:#F4F7FB;}}
+</style></head><body>
+<h1>康复趋势总览</h1>
+<p class="hint">这里汇总最近训练记录，用来观察训练坚持度、动作完成率和综合评分的变化。单次医学判断仍应结合治疗师评估。</p>
+<div class="grid">
+<div class="metric"><span>近 6 次平均评分</span><b>{avg_score:.1f}</b></div>
+<div class="metric"><span>近 6 次平均完成率</span><b>{avg_completion:.0f}%</b></div>
+<div class="metric"><span>近 6 次训练总时长</span><b>{total_minutes}</b><span>分钟</span></div>
+</div>
+<div class="panel"><h2>评分走势</h2>{''.join(cards)}</div>
+<div class="panel"><h2>训练明细</h2><table><tr><th>时间</th><th>训练</th><th>时长</th><th>完成</th><th>评分</th><th>完成率</th></tr>{''.join(rows)}</table></div>
+</body></html>"""
 
     def shutdown(self):
         """Invalidate outstanding worker results before the page is destroyed."""

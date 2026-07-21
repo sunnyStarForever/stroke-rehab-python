@@ -224,3 +224,4 @@ class PipelineConfig:
     patient_age: int = 0
     patient_diagnosis: str = ""
     ui_debug_enabled: bool = False
+    ui_theme: str = "light"

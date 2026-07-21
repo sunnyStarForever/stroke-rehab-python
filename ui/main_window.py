@@ -56,6 +56,7 @@ class StrokeRehabWindow(FluentWindow):
         self._notification_gate = UserNotificationGate(cooldown_seconds=30.0)
 
         self._config = load_pipeline_config()
+        self._apply_theme(getattr(self._config, "ui_theme", "light"))
         self.engine_log_received.connect(self._on_engine_log)
         logger.set_callback(self.engine_log_received.emit)
 
@@ -151,12 +152,18 @@ class StrokeRehabWindow(FluentWindow):
         settings.course_changed.connect(training.set_course)
         settings.course_changed.connect(lambda _course_id: home.refresh_from_config())
         settings.debug_changed.connect(training.set_debug_enabled)
+        settings.theme_changed.connect(self._apply_theme)
         settings.settings_applied.connect(lambda _path: home.refresh_from_config())
         settings.log_requested.connect(self.show_log_dialog)
         settings.performance_requested.connect(self.show_performance_dialog)
         home.course_selected.connect(self._open_course)
         home.report_requested.connect(self.navigate_to_reports)
         training.set_debug_enabled(self._config.ui_debug_enabled)
+
+    def _apply_theme(self, mode: str):
+        mode = (mode or "light").lower()
+        setTheme(Theme.DARK if mode == "dark" else Theme.LIGHT)
+        setThemeColor("#2563EB")
 
     def _open_course(self, course_id: str):
         training = self.findChild(TrainingPage)

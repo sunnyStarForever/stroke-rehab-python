@@ -42,3 +42,5 @@ Thumbs.db
 !.env.example
 *.local
 config.user.json
+mock_config.user.json
+mock_recordings/

@@ -34,7 +34,7 @@ from typing import Optional
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QSizePolicy,
+    QLabel, QSizePolicy, QDialog,
 )
 
 from qfluentwidgets import (
@@ -67,6 +67,8 @@ from ..widgets.score_panel import ScorePanel
 from ..widgets.emg_panel import EmgPanel
 from ..widgets.debug_panel import DebugPanel
 from ..theme import COLORS, PAGE_STYLE, pill_style, state_badge_style
+
+TRAINING_REPORT_MIN_SECONDS = 20
 
 
 ACTION_TIPS = {
@@ -137,6 +139,8 @@ class TrainingPage(QWidget):
         self._current_action_csv = ""
         self._action_summaries = []
         self._offline_report_runners = {}
+        self._feedback_history = deque(maxlen=200)
+        self._debug_dialog = None
 
         # Camera detection
         self._cameras_found: list = []
@@ -470,6 +474,16 @@ class TrainingPage(QWidget):
         main_row.addWidget(side)
         root.addLayout(main_row, 1)
 
+        self._debug_panel = DebugPanel(self)
+        self._debug_panel.set_refresh_callback(self._on_debug_refresh)
+        self._debug_panel.reset()
+        self._debug_dialog = QDialog(self)
+        self._debug_dialog.setWindowTitle("评分调试窗口")
+        self._debug_dialog.resize(820, 520)
+        debug_layout = QVBoxLayout(self._debug_dialog)
+        debug_layout.setContentsMargins(12, 12, 12, 12)
+        debug_layout.addWidget(self._debug_panel)
+
         # --- Feedback card ---
         feedback_card = SimpleCardWidget(self)
         feedback_layout = QVBoxLayout(feedback_card)
@@ -491,7 +505,23 @@ class TrainingPage(QWidget):
         self._feedback.setPlaceholderText("训练反馈将显示在这里…")
         self._feedback.setMaximumHeight(68)
         feedback_layout.addWidget(self._feedback)
+        feedback_card.setVisible(False)
         root.addWidget(feedback_card)
+
+        feedback_bar = SimpleCardWidget(self)
+        feedback_bar_layout = QHBoxLayout(feedback_bar)
+        feedback_bar_layout.setContentsMargins(14, 9, 14, 9)
+        feedback_bar_layout.setSpacing(10)
+        self._feedback_level = QLabel("INFO")
+        self._feedback_level.setAlignment(Qt.AlignCenter)
+        self._feedback_level.setStyleSheet(pill_style("primary"))
+        self._feedback_message = QLabel("训练准备就绪。")
+        self._feedback_message.setWordWrap(True)
+        self._feedback_message.setStyleSheet(
+            f"color:{COLORS['ink']}; font-size:14px; font-weight:600;")
+        feedback_bar_layout.addWidget(self._feedback_level)
+        feedback_bar_layout.addWidget(self._feedback_message, 1)
+        root.addWidget(feedback_bar)
 
         # --- Control bar ---
         ctrl_card = CardWidget(self)
@@ -508,12 +538,18 @@ class TrainingPage(QWidget):
         self._btn_debug = PushButton("调试面板")
         self._btn_debug.setCheckable(True)
         self._btn_debug.setFixedHeight(30)
+        self._btn_stop.setText("结束本次训练")
+        self._btn_report.setText("生成报告")
+        self._btn_report.setVisible(False)
+        self._btn_debug.setText("调试窗口")
+        self._btn_debug.setCheckable(False)
 
         for button in [self._btn_capture, self._btn_start, self._btn_pause, self._btn_stop,
                        self._btn_report, self._btn_open_report]:
             button.setMinimumHeight(36)
         self._btn_start.setMinimumWidth(112)
         self._btn_report.setMinimumWidth(146)
+        self._btn_stop.setMinimumWidth(132)
         self._btn_stop.setStyleSheet(
             f"PushButton{{color:{COLORS['danger']};}}")
 
@@ -584,6 +620,8 @@ class TrainingPage(QWidget):
         self._btn_report.setEnabled(
             s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
         self._btn_open_report.setEnabled(bool(self._session_dir))
+        self._btn_stop.setText("结束本次训练")
+        self._btn_report.setVisible(False)
 
     # ---- Button handlers ----
 
@@ -759,6 +797,23 @@ class TrainingPage(QWidget):
     def _on_stop(self):
         if self._state in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED):
             box = MessageBox(
+                "结束本次训练？",
+                f"系统会先安全停止采集并保存数据；训练达到 {TRAINING_REPORT_MIN_SECONDS} 秒或已有动作结果时，将自动生成报告。",
+                self,
+            )
+            if not box.exec():
+                return
+        generate_report = self._should_generate_report_on_stop()
+        reason = (
+            "训练已结束，正在生成本次报告…"
+            if generate_report else
+            f"训练已结束，数据已保存；训练不足 {TRAINING_REPORT_MIN_SECONDS} 秒，暂不生成报告。"
+        )
+        self._end_session(TrainingState.IDLE, generate_report=generate_report, reason=reason)
+        return
+
+        if self._state in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED):
+            box = MessageBox(
                 "停止当前训练？",
                 "停止后会保存已采集的骨骼数据，但本次课程将标记为未完整完成。",
                 self,
@@ -778,6 +833,17 @@ class TrainingPage(QWidget):
         if self._session_dir:
             csv_path = str(Path(self._session_dir) / "skeleton_3d.csv")
             self.report_requested.emit(self._session_dir, csv_path)
+
+    def _should_generate_report_on_stop(self) -> bool:
+        if not self._session_dir:
+            return False
+        if self._elapsed_seconds >= TRAINING_REPORT_MIN_SECONDS:
+            return True
+        return any(
+            int(summary.get("actual_reps", 0) or 0) > 0
+            or float(summary.get("average_score", 0.0) or 0.0) > 0.0
+            for summary in self._action_summaries
+        )
 
     def _end_session(self, final_state: TrainingState,
                      generate_report: bool, reason: str):
@@ -1103,7 +1169,8 @@ class TrainingPage(QWidget):
                 f"完成第{count}次，评分{result.overall_score:.0f}分",
                 key=f"score_cycle_{count}", priority=7, force=True)
         # Also feed FPS info to debug panel
-        if self._debug_panel.isVisible() and self._calibrated_scoring_fps > 0:
+        if (self._debug_dialog is not None and self._debug_dialog.isVisible()
+                and self._calibrated_scoring_fps > 0):
             self._debug_panel.set_fps_info(
                 self._calibrated_scoring_fps, self._skeleton_fps())
 
@@ -1111,13 +1178,12 @@ class TrainingPage(QWidget):
         self._append_feedback(f"评分提示：{message}")
 
     def _on_toggle_debug(self):
-        """Toggle the debug panel visibility and connect refresh callback."""
-        visible = not self._debug_panel.isVisible()
-        self._debug_panel.setVisible(visible)
-        self._btn_debug.setChecked(visible)
-        if visible:
-            self._debug_panel.set_refresh_callback(self._on_debug_refresh)
-            self._debug_panel.request_refresh()
+        """Open the scoring debug window."""
+        self._debug_dialog.show()
+        self._debug_dialog.raise_()
+        self._debug_dialog.activateWindow()
+        self._debug_panel.set_refresh_callback(self._on_debug_refresh)
+        self._debug_panel.request_refresh()
 
     def _on_debug_refresh(self):
         """Callback from DebugPanel when user clicks 'refresh state'."""
@@ -1205,7 +1271,24 @@ class TrainingPage(QWidget):
 
     def _append_feedback(self, message: str):
         ts = datetime.now().strftime("%H:%M:%S")
-        self._feedback.append(f"[{ts}] {message}")
+        entry = f"[{ts}] {message}"
+        self._feedback_history.append(entry)
+        self._feedback.append(entry)
+        if hasattr(self, "_feedback_message"):
+            self._feedback_message.setText(message)
+        if hasattr(self, "_feedback_level"):
+            lowered = message.lower()
+            if any(token in message for token in ("失败", "错误", "异常")) or "error" in lowered:
+                self._feedback_level.setText("ERROR")
+                self._feedback_level.setStyleSheet(
+                    f"color:{COLORS['danger']}; background:{COLORS['danger_soft']}; "
+                    "border-radius:9px; padding:3px 10px; font-size:11px; font-weight:700;")
+            elif any(token in message for token in ("警告", "提示", "不足", "未达到", "⚠")):
+                self._feedback_level.setText("WARN")
+                self._feedback_level.setStyleSheet(pill_style("warning"))
+            else:
+                self._feedback_level.setText("INFO")
+                self._feedback_level.setStyleSheet(pill_style("primary"))
 
     # ---- Shutdown ----
 
