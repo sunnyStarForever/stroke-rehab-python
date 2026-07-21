@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 
 @dataclass
@@ -92,7 +92,6 @@ class PreviewFrame:
     emg_status: str = ""
     emg_rms: List[float] = field(default_factory=list)
     emg_fatigue_index: List[float] = field(default_factory=list)
-    emg_features: List[Dict[str, float]] = field(default_factory=list)
 
     # Mirror
     mirror: bool = False
@@ -180,7 +179,6 @@ class PreviewComposer:
                emg_status: str = "",
                emg_rms: Optional[List[float]] = None,
                emg_fatigue: Optional[List[float]] = None,
-               emg_features: Optional[List[Dict[str, float]]] = None,
                mirror: bool = False,
                # Real RGB image (numpy array, full mode)
                rgb_image=None,
@@ -254,7 +252,6 @@ class PreviewComposer:
         frame.emg_status = emg_status
         frame.emg_rms = emg_rms or []
         frame.emg_fatigue_index = emg_fatigue or []
-        frame.emg_features = emg_features or []
 
         frame.mirror = mirror
         frame.rgb_image = rgb_image

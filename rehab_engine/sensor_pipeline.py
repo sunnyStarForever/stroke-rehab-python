@@ -948,7 +948,7 @@ class SensorPipeline:
             except queue.Empty: continue
 
             self._processed += 1; self._worker_since_last += 1; self._pair_id += 1
-            emg_status, emg_rms, emg_fatigue, emg_features = self._tick_emg(
+            emg_status, emg_rms, emg_fatigue = self._tick_emg(
                 int(pair.get("ts", 0))
             )
             depth_is_hardware = not bool(pair.get("mock"))
@@ -1077,7 +1077,6 @@ class SensorPipeline:
                 depth_frames=video_stats.depth_frames,
                 emg_status=emg_status, emg_rms=emg_rms,
                 emg_fatigue=emg_fatigue,
-                emg_features=emg_features,
                 rgb_image=rgb_image, depth_image=depth_image,
                 depth_is_hardware=depth_is_hardware)
 
@@ -1305,25 +1304,11 @@ class SensorPipeline:
             else self._emg.latest_feature()
         )
         if frame is None:
-            return self._format_emg_status(status), [], [], []
-        features = [
-            {
-                "channel": float(channel.channel),
-                "rms": float(channel.rms),
-                "mav": float(getattr(channel, "mav", 0.0)),
-                "iemg": float(getattr(channel, "iemg", 0.0)),
-                "wl": float(getattr(channel, "waveform_length", 0.0)),
-                "zc": float(getattr(channel, "zero_crossings", 0.0)),
-                "zcr": float(channel.zcr),
-                "fatigue": float(channel.fatigue_index),
-            }
-            for channel in frame.channels
-        ]
+            return self._format_emg_status(status), [], []
         return (
             self._format_emg_status(status),
             [channel.rms for channel in frame.channels],
             [channel.fatigue_index for channel in frame.channels],
-            features,
         )
 
     @staticmethod

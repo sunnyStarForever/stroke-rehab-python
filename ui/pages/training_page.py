@@ -129,6 +129,7 @@ class TrainingPage(QWidget):
         self._score_generation = 0
         self._start_generation = 0
         self._fps_warning_active = False
+        self._pipeline_warning_active = False
         self._paused_from = TrainingState.IDLE
         self._displayed_action_reps = 0
         self._scoring_submit_times = deque(maxlen=120)
@@ -651,6 +652,7 @@ class TrainingPage(QWidget):
 
         self._ending = False
         self._fps_warning_active = False
+        self._pipeline_warning_active = False
         self._frame_index = 0
         self._start_generation += 1
         generation = self._start_generation
@@ -689,6 +691,7 @@ class TrainingPage(QWidget):
             return
         self._preview.set_recording(False)
         self._preview.set_show_debug(self._config.ui_debug_enabled)
+        self._pipeline_warning_active = False
         self._update_state(TrainingState.CAPTURING)
         self._append_feedback(
             "采集已启动，请确认摄像头和骨骼显示正常后点击“开始训练”。")
@@ -701,8 +704,7 @@ class TrainingPage(QWidget):
             self._append_feedback("请先点击“开始采集”并等待摄像头与骨骼就绪。")
             return
         if not self._pipeline.is_running:
-            self._append_feedback("采集 Pipeline 已停止，请重新开始采集。")
-            self._update_state(TrainingState.IDLE)
+            self._append_feedback("采集 Pipeline 当前未运行，界面保持采集状态；请检查设备后手动结束或重新开始采集。")
             return
         errors = self._training_preflight_checks()
         if errors:
@@ -1141,12 +1143,8 @@ class TrainingPage(QWidget):
 
     def _on_score(self, result: ScoreResult):
         self._score_panel.set_score(result)
-        reported = max(result.count, result.completed_count)
-        if reported > self._displayed_action_reps + 1:
-            self._displayed_action_reps += 1
-        else:
-            self._displayed_action_reps = max(self._displayed_action_reps, reported)
-        count = self._displayed_action_reps
+        count = max(0, int(result.count))
+        self._displayed_action_reps = count
         self._score_panel.set_display_count(count)
         quality = (
             "动作质量：优秀" if result.overall_score >= 85 else
@@ -1249,11 +1247,16 @@ class TrainingPage(QWidget):
                 self._fps_warning_active = False
 
     def _refresh_preview(self):
-        if (self._state == TrainingState.CAPTURING
+        if (self._state in (TrainingState.CAPTURING, TrainingState.TRAINING,
+                            TrainingState.RESTING)
                 and not self._pipeline.is_running
                 and not self._pipeline.is_stopping):
-            self._append_feedback("采集 Pipeline 已意外停止，请重新开始采集。")
-            self._update_state(TrainingState.IDLE)
+            if not self._pipeline_warning_active:
+                self._pipeline_warning_active = True
+                self._append_feedback(
+                    "Pipeline 当前未运行，界面保持当前状态；请检查设备后手动结束或重新开始采集。")
+        elif self._pipeline.is_running:
+            self._pipeline_warning_active = False
         frame = self._pipeline.preview.latest_frame()
         if frame:
             self._preview.set_frame(frame)

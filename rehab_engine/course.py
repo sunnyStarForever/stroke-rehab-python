@@ -297,13 +297,9 @@ class CourseRunner:
             if action is None:
                 return
 
-            # Preserve the original runner's tolerance for the scorer briefly
-            # reporting a detected centre before the completed cycle count.
-            reported = max(score.count, score.completed_count)
-            if reported > self._actual_reps + 1:
-                self._actual_reps += 1
-            else:
-                self._actual_reps = max(self._actual_reps, reported)
+            # Realtime counting is strictly peak-based: one detected peak is
+            # one repetition. Keep course progress identical to score.count.
+            self._actual_reps = max(0, int(score.count))
 
             # Only completed cycles carry a meaningful last_cycle score.
             if score.status == "new_completed_cycle":

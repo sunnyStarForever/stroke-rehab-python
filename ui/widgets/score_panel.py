@@ -87,7 +87,7 @@ class ScorePanel(SimpleCardWidget):
 
     def set_score(self, result: ScoreResult):
         """Update all score displays from a ScoreResult."""
-        count = getattr(result, "completed_count", result.count)
+        count = result.count
         self._count_label.setText(f"{count} / {self._target or '—'}")
         self._overall_label.setText(
             f"{result.overall_score:.1f}" if result.overall_score > 0 else "—")
