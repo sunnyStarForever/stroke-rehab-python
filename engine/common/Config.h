@@ -20,7 +20,9 @@ struct DeviceConfig {
   int depthWidth{640};
   int depthHeight{480};
   int depthFps{30};
-  bool enableHardwareD2C{true};
+  // RGB is captured through V4L2, outside OpenNI.  Keep OpenNI registration
+  // disabled unless a caller deliberately enables an OpenNI color stream.
+  bool enableHardwareD2C{false};
   bool enableOpenNIColorStreamForDebug{false};
   bool enableOpenNIDepthColorSync{false};
   int latestQueueSize{1};

@@ -129,7 +129,12 @@ def load_pipeline_config(
         if "depth_capture" in ydata:
             dc = ydata["depth_capture"]
             config.device.openni_device_uri = dc.get("device_uri", config.device.openni_device_uri)
-            config.device.enable_hardware_d2c = dc.get("enable_hardware_d2c", True)
+            config.device.enable_hardware_d2c = dc.get(
+                "enable_hardware_d2c", config.device.enable_hardware_d2c)
+            config.device.enable_openni_color_stream_for_debug = dc.get(
+                "enable_openni_color_stream_for_debug",
+                config.device.enable_openni_color_stream_for_debug,
+            )
             config.device.enable_openni_depth_color_sync = dc.get("enable_depth_color_sync", False)
             config.device.depth_width = dc.get("width", config.device.depth_width)
             config.device.depth_height = dc.get("height", config.device.depth_height)

@@ -22,6 +22,11 @@ def _frame(source, timestamp, frame_id=0):
                          arrival_ts_ns=timestamp + 10, frame_id=frame_id)
 
 
+class DeviceConfigTests(unittest.TestCase):
+    def test_openni_hardware_d2c_is_opt_in(self):
+        self.assertFalse(DeviceConfig().enable_hardware_d2c)
+
+
 class FrameSynchronizerTests(unittest.TestCase):
     def test_nearest_match_removes_each_frame_once_and_preserves_signed_delta(self):
         sync = FrameSynchronizer(SyncConfig(match_threshold_ns=20, queue_size=5))
@@ -95,6 +100,7 @@ class _NativeConfig:
 class _Rgb:
     instances = []
     start_ok = True
+    start_order = []
 
     def __init__(self):
         self.callback = None
@@ -105,6 +111,7 @@ class _Rgb:
         self.status_callback = callback
 
     def start(self, config, callback):
+        self.start_order.append(type(self).__name__)
         self.config = config
         self.callback = callback
         return self.start_ok
@@ -151,6 +158,7 @@ class _LegacyCore(_Core):
 class NativeBackendTests(unittest.TestCase):
     def setUp(self):
         _Rgb.instances.clear()
+        _Rgb.start_order.clear()
         _Depth.instances.clear()
         _LegacyDepth.instances.clear()
         _Rgb.start_ok = _Depth.start_ok = True
@@ -204,6 +212,7 @@ class NativeBackendTests(unittest.TestCase):
         backend = NativeRgbDepthBackend(_Core, DeviceConfig(), SyncConfig())
         pairs = []
         self.assertTrue(backend.start(pairs.append))
+        self.assertEqual(_Rgb.start_order, ["_Depth", "_Rgb"])
         depth = _Depth.instances[0]
         rgb = _Rgb.instances[0]
         depth.callback(

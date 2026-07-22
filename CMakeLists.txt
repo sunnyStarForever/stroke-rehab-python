@@ -78,15 +78,37 @@ else()
   message(STATUS "OpenCV: ${OpenCV_VERSION}")
 
   # ---- OpenNI2 ----
-  find_path(OpenNI2_INCLUDE_DIR OpenNI.h
-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../stroke-rehab/including/OpenNI/sdk/Include
-          ${CMAKE_CURRENT_SOURCE_DIR}/../including/OpenNI/sdk/Include
-          /usr/include/openni2  /usr/include/ni2
-          /usr/local/include/openni2  /usr/local/include/ni2)
-  find_library(OpenNI2_LIBRARY NAMES OpenNI2
-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../stroke-rehab/including/OpenNI/sdk/libs
-          ${CMAKE_CURRENT_SOURCE_DIR}/../including/OpenNI/sdk/libs
-          /usr/lib  /usr/local/lib)
+  # Keep headers and runtime from the same SDK.  A generic find_library() may
+  # select the distro libOpenNI2.so before PATHS are considered; that system
+  # library advertises SONAME libOpenNI2.so.0 and cannot load the bundled
+  # Orbbec driver repository used by this application.
+  set(_bundled_openni_roots
+    ${CMAKE_CURRENT_SOURCE_DIR}/../stroke-rehab/including/OpenNI/sdk
+    ${CMAKE_CURRENT_SOURCE_DIR}/../including/OpenNI/sdk)
+  set(_bundled_openni_root "")
+  foreach(_root IN LISTS _bundled_openni_roots)
+    if(EXISTS "${_root}/Include/OpenNI.h" AND
+       EXISTS "${_root}/libs/libOpenNI2.so")
+      set(_bundled_openni_root "${_root}")
+      break()
+    endif()
+  endforeach()
+
+  if(_bundled_openni_root)
+    # FORCE replaces a system path retained by an earlier CMake configure.
+    set(OpenNI2_INCLUDE_DIR "${_bundled_openni_root}/Include"
+      CACHE PATH "OpenNI2 include directory" FORCE)
+    set(OpenNI2_LIBRARY "${_bundled_openni_root}/libs/libOpenNI2.so"
+      CACHE FILEPATH "OpenNI2 library" FORCE)
+    message(STATUS "OpenNI2: bundled SDK ${_bundled_openni_root}")
+  else()
+    find_path(OpenNI2_INCLUDE_DIR OpenNI.h
+      PATHS /usr/include/openni2 /usr/include/ni2
+            /usr/local/include/openni2 /usr/local/include/ni2)
+    find_library(OpenNI2_LIBRARY NAMES OpenNI2
+      PATHS /usr/lib /usr/local/lib)
+    message(STATUS "OpenNI2: system fallback ${OpenNI2_LIBRARY}")
+  endif()
   if(OpenNI2_INCLUDE_DIR AND OpenNI2_LIBRARY)
     set(HAVE_OPENNI2_DEF TRUE)
   else()

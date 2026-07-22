@@ -333,16 +333,22 @@ class NativeRgbDepthBackend:
         # a legacy module from leaking synthetic startup frames before it is
         # rejected below.
         self._running = False
-        rgb_ok = self._rgb.start(native_config, self._on_rgb)
+        # Open and attest the OpenNI depth stream before V4L2 starts touching
+        # the Astra Pro RGB interface.  Starting both native workers together
+        # can leave the vendor OpenNI driver blocked during device.open(), even
+        # though the same depth device opens successfully on its own.
         depth_started = self._depth.start(native_config, self._on_depth)
         depth_ok = False
         if depth_started and hasattr(self._depth, "real_depth_active"):
             deadline = time.monotonic() + 5.0
             while (not self._depth.real_depth_active()
                    and self._depth.is_running()
-                   and time.monotonic() < deadline):
+                    and time.monotonic() < deadline):
                 time.sleep(0.02)
             depth_ok = bool(self._depth.real_depth_active())
+        rgb_ok = False
+        if depth_ok:
+            rgb_ok = bool(self._rgb.start(native_config, self._on_rgb))
         if not rgb_ok or not depth_ok:
             self._emit(
                 "Native capture start failed: "

@@ -63,7 +63,8 @@ class DeviceConfig:
     depth_width: int = 640
     depth_height: int = 480
     depth_fps: int = 30
-    enable_hardware_d2c: bool = True
+    # RGB is owned by V4L2 in the Python runtime, so OpenNI D2C must be opt-in.
+    enable_hardware_d2c: bool = False
     enable_openni_color_stream_for_debug: bool = False
     enable_openni_depth_color_sync: bool = False
     latest_queue_size: int = 1

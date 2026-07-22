@@ -206,7 +206,11 @@ void DepthCaptureOpenNI::run() {
 
   Logger::info(std::string("[DEPTH INIT] hardware D2C requested=") +
                (config_.enableHardwareD2C ? "true" : "false"));
-  if (config_.enableHardwareD2C) {
+  // This runtime owns RGB through V4L2.  The Orbbec OpenNI driver may touch
+  // the separate UVC color device while configuring DEPTH_TO_COLOR, even when
+  // no OpenNI color frames are requested.  Only enable registration when an
+  // OpenNI color stream has actually been created and started.
+  if (config_.enableHardwareD2C && colorStreamStarted) {
     const bool registrationOk =
         device.setImageRegistrationMode(IMAGE_REGISTRATION_DEPTH_TO_COLOR) ==
         STATUS_OK;
@@ -214,6 +218,10 @@ void DepthCaptureOpenNI::run() {
     if (!registrationOk) {
       Logger::warn("Hardware D2C not available, software aligner will be used.");
     }
+  } else if (config_.enableHardwareD2C) {
+    Logger::warn(
+        "[DEPTH INIT] hardware D2C ignored because OpenNI color stream is "
+        "disabled; RGB remains exclusively owned by V4L2");
   }
   Logger::info(std::string("[DEPTH INIT] hardware D2C active=") +
                (hardwareD2CActive_.load() ? "true" : "false"));
