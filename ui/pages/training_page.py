@@ -215,12 +215,12 @@ class TrainingPage(QWidget):
             self._append_feedback("✗ 未检测到摄像头设备 (/dev/video*)")
 
         # Config
-        self._append_feedback(f"✓ 配置: RGB={self._config.device.rgb_device_path} "
+        self._append_feedback(f"✓ 配置: 彩色相机={self._config.device.rgb_device_path} "
                              f"{self._config.device.rgb_width}x{self._config.device.rgb_height} "
-                             f"@{self._config.device.rgb_fps}fps")
-        self._append_feedback(f"✓ 配置: Depth={self._config.device.depth_width}x{self._config.device.depth_height}")
+                             f"@{self._config.device.rgb_fps}帧/秒")
+        self._append_feedback(f"✓ 配置: 深度相机={self._config.device.depth_width}x{self._config.device.depth_height}")
         self._append_feedback(
-            f"✓ 配置: EMG={'启用（真实采集）' if self._config.emg.enabled else '禁用'}")
+            f"✓ 配置: 肌电={'启用（真实采集）' if self._config.emg.enabled else '禁用'}")
 
         self._append_feedback("════════════════════")
 
@@ -245,14 +245,14 @@ class TrainingPage(QWidget):
         if self._pipeline.stub_mode:
             return "📷 模拟画面（非真实相机数据）"
         if self._pipeline.is_stopping:
-            return "📷 正在释放 RGB/Depth 设备"
+            return "📷 正在释放彩色/深度相机设备"
         if self._pipeline.is_running:
             stats = self._pipeline.performance_stats()
             marker = "✓" if (stats["rgb_30fps_ok"] and stats["depth_30fps_ok"]
                                and stats["pair_30fps_ok"]) else "⚠"
-            return (f"{marker} 真实数据 RGB {stats['rgb_fps']:.1f}/30 | "
-                    f"Depth {stats['depth_fps']:.1f}/30 | "
-                    f"显示 {stats['pair_fps']:.1f}/30 fps")
+            return (f"{marker} 真实数据 彩色 {stats['rgb_fps']:.1f}/30 | "
+                    f"深度 {stats['depth_fps']:.1f}/30 | "
+                    f"显示 {stats['pair_fps']:.1f}/30 帧/秒")
         status = self._pipeline.camera_status
         return f"📷 真实相机 {status['status']}"
 
@@ -292,7 +292,7 @@ class TrainingPage(QWidget):
             warnings.append("当前为 STUB 模拟模式")
         if (not rehab_engine._STUB_MODE and
                 (self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30)):
-            errors.append("真实 RGB 与 Depth 相机必须同时设置为 30 FPS")
+            errors.append("真实彩色与深度相机必须同时设置为 30 帧/秒")
         return errors, warnings
 
     def _training_preflight_checks(self):
@@ -644,9 +644,9 @@ class TrainingPage(QWidget):
         self._append_feedback("═══ 启动采集 Pipeline ═══")
         self._append_feedback(f"引擎模式: {'STUB (模拟)' if rehab_engine._STUB_MODE else 'FULL (真实)'}")
         self._append_feedback(f"RGB 设备: {self._config.device.rgb_device_path}")
-        self._append_feedback(f"分辨率: {self._config.device.rgb_width}x{self._config.device.rgb_height} @ {self._config.device.rgb_fps}fps")
+        self._append_feedback(f"分辨率: {self._config.device.rgb_width}x{self._config.device.rgb_height} @ {self._config.device.rgb_fps}帧/秒")
         self._append_feedback(
-            f"EMG: {'启用（真实采集）' if self._config.emg.enabled else '禁用'}")
+            f"肌电: {'启用（真实采集）' if self._config.emg.enabled else '禁用'}")
 
         self._append_feedback("正在启动摄像头与骨骼推理预览…")
 
@@ -657,7 +657,7 @@ class TrainingPage(QWidget):
         self._start_generation += 1
         generation = self._start_generation
         self._update_state(TrainingState.STARTING_CAPTURE)
-        self._append_feedback("正在后台连接真实 RGB/Depth 设备并初始化模型…")
+        self._append_feedback("正在后台连接真实彩色/深度相机并初始化模型…")
 
         def _start_pipeline():
             try:
@@ -996,7 +996,7 @@ class TrainingPage(QWidget):
         if not self._scoring_recorder.start(self._current_action_dir):
             self._append_feedback(f"动作 CSV 启动失败：{self._current_action_dir}")
         if not self._pipeline.start_action_recording(self._current_action_dir):
-            self._append_feedback(f"动作 EMG 录制启动失败：{self._current_action_dir}")
+            self._append_feedback(f"动作肌电录制启动失败：{self._current_action_dir}")
         summary = self._summary_for_action(action.order)
         if summary is not None:
             summary["action_dir"] = self._current_action_dir
@@ -1104,7 +1104,7 @@ class TrainingPage(QWidget):
         try:
             self._pipeline.stop_action_recording()
         except Exception as exc:
-            self._append_feedback(f"动作 EMG 录制停止异常：{exc}")
+            self._append_feedback(f"动作肌电录制停止异常：{exc}")
 
     def _skeleton_fps(self) -> float:
         actual = float(self._pipeline.performance_stats().get("worker_fps", 0.0))
@@ -1237,8 +1237,8 @@ class TrainingPage(QWidget):
             if not healthy and not self._fps_warning_active:
                 self._fps_warning_active = True
                 self._append_feedback(
-                    f"⚠ 真实采集帧率未达到30：RGB {stats['rgb_fps']:.1f}，"
-                    f"Depth {stats['depth_fps']:.1f}，显示 {stats['pair_fps']:.1f} fps")
+                    f"⚠ 真实采集帧率未达到30：彩色 {stats['rgb_fps']:.1f}，"
+                    f"深度 {stats['depth_fps']:.1f}，显示 {stats['pair_fps']:.1f} 帧/秒")
                 InfoBar.warning(
                     "相机帧率下降",
                     "当前显示的仍是真实数据，请检查 USB 带宽、分辨率和设备负载。",

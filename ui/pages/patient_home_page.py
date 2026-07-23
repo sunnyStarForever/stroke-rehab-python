@@ -163,7 +163,7 @@ class PatientHomePage(QWidget):
         self._content_layout.setContentsMargins(4, 0, 4, 0)
         self._content_layout.setSpacing(18)
 
-        eyebrow = QLabel("PATIENT TRAINING")
+        eyebrow = QLabel("患者康复训练")
         eyebrow.setObjectName("pageEyebrow")
         title = QLabel("患者训练首页")
         title.setObjectName("pageTitle")

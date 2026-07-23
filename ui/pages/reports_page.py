@@ -4,6 +4,7 @@ Replaces app/pages/ReportPage.cpp.
 """
 
 import json
+import os
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -12,9 +13,15 @@ from typing import Optional
 from PyQt5.QtCore import Qt, pyqtSignal, QEvent, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QSplitter, QLabel,
+    QStackedWidget,
 )
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtCore import QUrl
+
+try:
+    from PyQt5.QtWebEngineWidgets import QWebEngineView
+except Exception:  # PyQtWebEngine is optional on the board image.
+    QWebEngineView = None
 
 from qfluentwidgets import (
     CardWidget, SimpleCardWidget,
@@ -30,7 +37,7 @@ from ..report_images import adapt_report_images
 class ReportsPage(QWidget):
     """Training reports and history browser."""
 
-    report_loaded = pyqtSignal(int, str, str, str, str)
+    report_loaded = pyqtSignal(int, str, str, str, str, str)
     history_loaded = pyqtSignal(int, object)
 
     def __init__(self, config=None, parent=None):
@@ -44,6 +51,8 @@ class ReportsPage(QWidget):
         self._closing = False
         self._raw_html = ""
         self._report_base_dir = Path()
+        self._current_report_path = Path()
+        self._web_view = None
         self._last_report_width = -1
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -64,7 +73,7 @@ class ReportsPage(QWidget):
 
         page_header = QHBoxLayout()
         heading = QVBoxLayout()
-        eyebrow = QLabel("TRAINING INSIGHTS")
+        eyebrow = QLabel("康复训练洞察")
         eyebrow.setObjectName("pageEyebrow")
         page_title = QLabel("训练报告")
         page_title.setObjectName("pageTitle")
@@ -127,17 +136,26 @@ class ReportsPage(QWidget):
         self._btn_save = PushButton("保存报告")
         self._btn_save.setEnabled(False)
         self._btn_save.clicked.connect(self._save_report)
+        self._btn_open_full = PushButton("打开完整报告")
+        self._btn_open_full.setEnabled(False)
+        self._btn_open_full.clicked.connect(self._open_full_report)
         self._btn_folder = PushButton("打开文件夹")
         self._btn_folder.setEnabled(False)
         self._btn_folder.clicked.connect(self._open_folder)
         header.addWidget(self._btn_save)
+        header.addWidget(self._btn_open_full)
         header.addWidget(self._btn_folder)
         right_layout.addLayout(header)
 
         self._browser = TextBrowser(self)
         self._browser.setOpenExternalLinks(True)
         self._browser.viewport().installEventFilter(self)
-        right_layout.addWidget(self._browser, 1)
+        self._viewer_stack = QStackedWidget(self)
+        self._viewer_stack.addWidget(self._browser)
+        if QWebEngineView is not None:
+            self._web_view = QWebEngineView(self)
+            self._viewer_stack.addWidget(self._web_view)
+        right_layout.addWidget(self._viewer_stack, 1)
 
         content.addWidget(left_card)
         content.addWidget(right_card)
@@ -166,12 +184,14 @@ class ReportsPage(QWidget):
             subtitle = ""
             error = ""
             report_dir = str(sd)
+            report_path = ""
             if need_gen:
                 try:
                     path = Path(generate_session_report(session_dir, csv_path))
                     subtitle = f"报告文件：{path.name}"
                     html = path.read_text(encoding="utf-8", errors="ignore")
                     report_dir = str(path.parent)
+                    report_path = str(path)
                 except Exception as exc:
                     html = self._default_html()
                     subtitle = "报告生成失败"
@@ -183,23 +203,29 @@ class ReportsPage(QWidget):
                         html = hf.read_text(encoding="utf-8", errors="ignore")
                         subtitle = f"报告文件：{hf.name}"
                         report_dir = str(hf.parent)
+                        report_path = str(hf)
                         break
                 else:
                     subtitle = "骨骼数据：" + (
                         "已就绪" if csv_path and Path(csv_path).exists() else "未找到")
             try:
-                self.report_loaded.emit(generation, html, subtitle, error, report_dir)
+                self.report_loaded.emit(
+                    generation, html, subtitle, error, report_dir, report_path)
             except RuntimeError:
                 pass
 
         threading.Thread(target=_do_load, name="report-load", daemon=True).start()
 
     def _on_report_loaded(self, generation: int, html: str,
-                          subtitle: str, error: str, report_dir: str):
+                          subtitle: str, error: str, report_dir: str,
+                          report_path: str):
         """Runs on the Qt thread through a queued signal."""
         if self._closing or generation != self._report_generation:
             return
         self._report_subtitle.setText(subtitle)
+        self._current_report_path = Path(report_path) if report_path else Path()
+        self._btn_open_full.setEnabled(
+            bool(report_path) and self._current_report_path.exists())
         self._set_report_html(html, Path(report_dir))
         if error:
             InfoBar.error("报告生成失败", error, duration=6000,
@@ -291,11 +317,13 @@ class ReportsPage(QWidget):
     def _show_trends(self):
         self._session_dir = ""
         self._csv_path = ""
+        self._current_report_path = Path()
         self._report_title.setText("康复趋势")
         self._report_subtitle.setText("基于最近训练记录的连续康复观察")
         self._btn_save.setEnabled(True)
         self._btn_folder.setEnabled(False)
-        self._browser.setHtml(self._trend_html())
+        self._btn_open_full.setEnabled(False)
+        self._set_report_html(self._trend_html(), Path())
 
     def _session_snapshot(self, session_dir: str, start_time: str, label: str) -> dict:
         session = Path(session_dir)
@@ -418,7 +446,7 @@ th,td{{text-align:left;border-bottom:1px solid #E4EAF2;padding:10px;font-size:13
 <div class="metric"><span>近 6 次疲劳倾向占比</span><b>{avg_emg_fatigue:.0f}%</b></div>
 </div>
 <div class="panel"><h2>评分走势</h2>{''.join(cards)}</div>
-<div class="panel"><h2>肌电参与趋势</h2>{''.join(emg_cards) if emg_cards else '<p class="hint">最近记录中暂未找到肌电数据。</p>'}<p class="hint">蓝色条表示主动发力占比，橙色条表示疲劳倾向占比，右侧数值为平均肌电强度（RMS）。</p></div>
+<div class="panel"><h2>肌电参与趋势</h2>{''.join(emg_cards) if emg_cards else '<p class="hint">最近记录中暂未找到肌电数据。</p>'}<p class="hint">蓝色条表示主动发力占比，橙色条表示疲劳倾向占比，右侧数值为平均肌电强度。</p></div>
 <div class="panel"><h2>训练明细</h2><table><tr><th>时间</th><th>训练</th><th>时长</th><th>完成</th><th>评分</th><th>完成率</th><th>肌电强度/疲劳</th></tr>{''.join(rows)}</table></div>
 </body></html>"""
 
@@ -434,14 +462,62 @@ th,td{{text-align:left;border-bottom:1px solid #E4EAF2;padding:10px;font-size:13
             self._resize_timer.start()
         return super().eventFilter(watched, event)
 
+    def _report_render_mode(self) -> str:
+        mode = str(getattr(self._config, "report_render_mode", "webengine") or "webengine")
+        return mode if mode in ("webengine", "external", "text") else "webengine"
+
+    def _report_base_url(self) -> QUrl:
+        if self._report_base_dir and self._report_base_dir.exists():
+            return QUrl.fromLocalFile(str(self._report_base_dir.resolve()) + "/")
+        return QUrl()
+
+    def _webengine_available_for_runtime(self) -> bool:
+        if self._web_view is None:
+            return False
+        platform = os.environ.get("QT_QPA_PLATFORM", "").lower()
+        # QtWebEngine can crash at the native layer in offscreen/minimal test
+        # platforms, so only use it for real GUI sessions unless explicitly forced.
+        if platform in ("offscreen", "minimal") and os.environ.get(
+                "STROKE_FORCE_WEBENGINE", "") != "1":
+            return False
+        return True
+
     def _set_report_html(self, html: str, base_dir: Optional[Path] = None):
         self._raw_html = html
         self._report_base_dir = base_dir or Path()
         self._last_report_width = -1
+        mode = self._report_render_mode()
+        if mode == "webengine":
+            if self._webengine_available_for_runtime():
+                self._viewer_stack.setCurrentWidget(self._web_view)
+                self._web_view.setHtml(self._raw_html, self._report_base_url())
+                return
+            self._viewer_stack.setCurrentWidget(self._browser)
+            self._browser.setHtml(self._webengine_unavailable_html())
+            if self._current_report_path and self._current_report_path.exists():
+                self._btn_open_full.setEnabled(True)
+            return
+        if mode == "external":
+            self._viewer_stack.setCurrentWidget(self._browser)
+            if not (self._current_report_path and self._current_report_path.exists()):
+                self._browser.setHtml(self._raw_html)
+                return
+            self._browser.setHtml(self._external_report_html())
+            if self._current_report_path and self._current_report_path.exists():
+                QTimer.singleShot(0, self._open_full_report)
+            return
+        self._viewer_stack.setCurrentWidget(self._browser)
         self._apply_responsive_html()
+
+    def refresh_render_mode(self):
+        """Re-render the current report after settings change."""
+        if self._raw_html:
+            self._set_report_html(self._raw_html, self._report_base_dir)
 
     def _apply_responsive_html(self):
         if not self._raw_html or self._closing:
+            return
+        if self._report_render_mode() != "text":
             return
         width = max(1, self._browser.viewport().width() - 48)
         if width == self._last_report_width:
@@ -454,6 +530,40 @@ th,td{{text-align:left;border-bottom:1px solid #E4EAF2;padding:10px;font-size:13
         position = scrollbar.value()
         self._browser.setHtml(adapted)
         scrollbar.setValue(position)
+
+    def _open_full_report(self):
+        if self._current_report_path and self._current_report_path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._current_report_path.resolve())))
+        elif self._session_dir and Path(self._session_dir).exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self._session_dir).resolve())))
+
+    def _webengine_unavailable_html(self) -> str:
+        return """<html><head><meta charset="utf-8"><style>
+body{font-family:'Microsoft YaHei',sans-serif;background:#F8FAFD;color:#344054;padding:42px;}
+section{background:white;border:1px solid #E4EAF2;border-radius:16px;padding:32px;margin:40px auto;max-width:760px;}
+h1{color:#172033;font-size:26px;}p{font-size:15px;line-height:1.8;color:#667085;}
+.badge{display:inline-block;background:#EAF2FF;color:#1D4ED8;border-radius:999px;padding:5px 12px;font-weight:700;font-size:12px;}
+</style></head><body><section>
+<div class="badge">报告渲染提示</div>
+<h1>当前环境未安装内置浏览器组件</h1>
+<p>设置中选择的是“内置浏览器”模式，但当前 Python 环境未检测到 PyQtWebEngine。请安装 PyQtWebEngine，或在设置页把“报告显示方式”切换为“系统浏览器”或“轻量富文本”。</p>
+<p>你仍然可以点击右上角“打开完整报告”，使用系统浏览器查看完整 HTML 报告。</p>
+</section></body></html>"""
+
+    def _external_report_html(self) -> str:
+        report_name = self._current_report_path.name if self._current_report_path else "完整报告"
+        return f"""<html><head><meta charset="utf-8"><style>
+body{{font-family:'Microsoft YaHei',sans-serif;background:#F8FAFD;color:#344054;padding:42px;}}
+section{{background:white;border:1px solid #E4EAF2;border-radius:16px;padding:32px;margin:40px auto;max-width:760px;}}
+h1{{color:#172033;font-size:26px;}}p{{font-size:15px;line-height:1.8;color:#667085;}}
+.badge{{display:inline-block;background:#ECFDF3;color:#047857;border-radius:999px;padding:5px 12px;font-weight:700;font-size:12px;}}
+</style></head><body><section>
+<div class="badge">轻量显示模式</div>
+<h1>完整报告将使用系统浏览器打开</h1>
+<p>当前选择的是“系统浏览器”模式，软件内不直接渲染复杂 HTML，以减少板端资源占用并避免图表尺寸异常。</p>
+<p>报告文件：{report_name}</p>
+<p>如果没有自动弹出，请点击右上角“打开完整报告”。</p>
+</section></body></html>"""
 
     def _on_history_selected(self, item):
         row = self._history_list.row(item) if item else -1
@@ -483,7 +593,7 @@ h1{color:#172033;font-size:28px;}h2{color:#17324D;}p{font-size:15px;line-height:
 .hint{color:#667085;}.steps{background:#F4F7FB;border-radius:10px;padding:16px 20px;}
 .score{color:#27AE60;font-weight:700;font-size:24px;}
 </style></head><body><section>
-<div class="eyebrow">REPORT CENTER</div>
+<div class="eyebrow">报告中心</div>
 <h1>从一次训练记录开始</h1>
 <p class="hint">选择左侧历史训练，即可在这里查看动作完成度、综合评分和详细分析。</p>
 <div class="steps"><p>① 完成一次康复训练</p><p>② 从左侧选择训练记录</p><p>③ 查看或保存完整报告</p></div>

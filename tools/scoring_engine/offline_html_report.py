@@ -164,17 +164,17 @@ EMG_STATE_LABELS = {
 }
 
 EMG_FEATURE_LABELS = {
-    "rms": "肌电强度（RMS）",
-    "zcr": "过零率（收缩切换活跃度，ZCR）",
-    "cv": "波动系数（稳定性，CV）",
+    "rms": "均方根强度",
+    "zcr": "过零率（收缩切换活跃度）",
+    "cv": "波动系数（稳定性）",
     "fatigue_index": "疲劳指数",
 }
 
 EMG_RAW_FEATURE_LABELS = {
-    "mav": "平均绝对肌电值（MAV）",
-    "iemg": "积分肌电值（IEMG）",
-    "wl": "波形长度（WL）",
-    "zc": "过零次数（ZC）",
+    "mav": "平均绝对肌电值",
+    "iemg": "积分肌电值",
+    "wl": "波形长度",
+    "zc": "过零次数",
 }
 
 
@@ -519,7 +519,7 @@ def _plot_segment_timeline(segments_df, n_frames, save_path):
     ax.set_xlim(0, max(n_frames, int(segments_df["end"].max()) + 1))
     ax.set_ylim(0, 5)
     ax.set_yticks([])
-    ax.set_xlabel("Frame")
+    ax.set_xlabel("帧序号")
     ax.set_title("动作周期分割时间轴")
     ax.grid(axis="x", alpha=0.3)
 
@@ -1159,8 +1159,8 @@ def _render_emg_section(output_dir, embed_images=True):
         suggestions.append("肌电参与度和疲劳指标处于可接受范围，可结合动作评分继续观察。")
 
     cards = [
-        ("主动肌平均强度（RMS）", f"{active_rms:.1f}"),
-        ("拮抗肌平均强度（RMS）", f"{antagonist_rms:.1f}"),
+        ("主动肌平均强度", f"{active_rms:.1f}"),
+        ("拮抗肌平均强度", f"{antagonist_rms:.1f}"),
         ("主动发力占比", f"{active_ratio:.1%}"),
         ("疲劳倾向占比", f"{fatigue_ratio:.1%}"),
         ("震颤/不稳定占比", f"{tremor_ratio:.1%}"),
@@ -1168,9 +1168,9 @@ def _render_emg_section(output_dir, embed_images=True):
         ("主导状态", html.escape(EMG_STATE_LABELS.get(dominant_state, dominant_state))),
     ]
     if feature_rate > 0:
-        cards.append(("肌电特征帧率", f"{feature_rate:.1f} Hz"))
+        cards.append(("肌电特征帧率", f"{feature_rate:.1f} 次/秒"))
     if raw_rate > 0:
-        cards.append(("原始肌电采样率", f"{raw_rate:.1f} Hz"))
+        cards.append(("原始肌电采样率", f"{raw_rate:.1f} 次/秒"))
     cards_html = "".join(
         f"""
         <div class="metric-card">
@@ -1203,7 +1203,7 @@ def _render_emg_section(output_dir, embed_images=True):
         <div class="analysis-box">{suggestion_html}</div>
         <div class="figure-grid">{figure_html}</div>
         <div class="analysis-box">
-            指标说明：肌电强度（RMS）反映肌肉收缩强弱；平均绝对肌电值用于观察整体发力水平；
+            指标说明：均方根强度反映肌肉收缩强弱；平均绝对肌电值用于观察整体发力水平；
             积分肌电值反映一个时间窗内的累计肌肉活动量；波形长度用于观察信号复杂度和发力变化；
             过零次数/过零率可辅助判断肌肉激活切换是否频繁。以上结果用于康复训练观察，不替代临床诊断。
         </div>

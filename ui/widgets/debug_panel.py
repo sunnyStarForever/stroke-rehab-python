@@ -104,7 +104,7 @@ class DebugPanel(SimpleCardWidget):
         self._nframes_label = CaptionLabel("帧数: —")
         self._count_label = CaptionLabel("计数: —")
         self._completed_label = CaptionLabel("完成: —")
-        self._fps_label = CaptionLabel("FPS: —")
+        self._fps_label = CaptionLabel("帧率：—")
         for lbl in (self._nframes_label, self._count_label,
                     self._completed_label, self._fps_label):
             lbl.setStyleSheet(f"color:{COLORS['text']}; font-weight:600;")
@@ -136,7 +136,7 @@ class DebugPanel(SimpleCardWidget):
         if self._ax is None:
             return
         self._ax.set_facecolor("#F8FAFD")
-        self._ax.set_xlabel("Frame index")
+        self._ax.set_xlabel("帧序号")
         self._ax.set_ylabel("Feature value")
         self._ax.grid(True, alpha=0.3)
 
@@ -210,7 +210,7 @@ class DebugPanel(SimpleCardWidget):
             return
 
         x = np.arange(len(data))
-        self._ax.plot(x, data, color=COLORS["primary"], linewidth=1.2, label="signal")
+        self._ax.plot(x, data, color=COLORS["primary"], linewidth=1.2, label="分割特征曲线")
 
         # Overlay detected peaks (all)
         if len(self._peaks) > 0:
@@ -219,7 +219,7 @@ class DebugPanel(SimpleCardWidget):
                 self._ax.scatter(
                     valid_peaks, data[valid_peaks],
                     color="#93C5FD", marker="v", s=30, zorder=5,
-                    label=f"detected ({len(valid_peaks)})",
+                    label=f"检测峰值（{len(valid_peaks)}）",
                 )
 
         # Overlay accepted peaks (confirmed)
@@ -229,7 +229,7 @@ class DebugPanel(SimpleCardWidget):
                 self._ax.scatter(
                     valid_ap, data[valid_ap],
                     color=COLORS["success"], marker="v", s=50, zorder=6,
-                    label=f"accepted ({len(valid_ap)})",
+                    label=f"计数峰值（{len(valid_ap)}）",
                 )
 
         # Overlay accepted centers
@@ -239,7 +239,7 @@ class DebugPanel(SimpleCardWidget):
                 self._ax.scatter(
                     valid_centers, data[valid_centers],
                     color=COLORS["danger"], marker="*", s=80, zorder=7,
-                    label=f"centers ({len(valid_centers)})",
+                    label=f"动作中心（{len(valid_centers)}）",
                 )
 
         self._ax.legend(fontsize=7, loc="upper right")

@@ -240,7 +240,7 @@ def generate_session_report(session_dir: str, csv_path: str) -> str:
 <div class="card"><h2>肌电协同观察</h2>
 <p class="muted">该部分基于动作目录中的真实肌电记录统计，用于辅助观察主动发力、疲劳倾向和发力稳定性。</p>
 <div class="grid">
- <div class="metric"><div class="label">平均肌电强度（RMS）</div><div class="value">{_safe_float(emg_summary.get('avg_rms')):.1f}</div></div>
+ <div class="metric"><div class="label">平均肌电强度</div><div class="value">{_safe_float(emg_summary.get('avg_rms')):.1f}</div></div>
  <div class="metric"><div class="label">主动发力占比</div><div class="value good">{active_ratio:.1f}%</div></div>
  <div class="metric"><div class="label">疲劳倾向占比</div><div class="value">{fatigue_ratio:.1f}%</div></div>
  <div class="metric"><div class="label">震颤/不稳定占比</div><div class="value">{tremor_ratio:.1f}%</div></div>
@@ -267,7 +267,7 @@ img{{max-width:100%;height:auto;}}
 .note{{background:#EAF2FF;color:#1D4ED8;border-radius:10px;padding:14px 16px;line-height:1.7;}}
 @media(max-width:760px){{.grid{{grid-template-columns:repeat(2,1fr);}}}}
 </style></head><body><div class="wrap">
-<div class="eyebrow">SESSION SUMMARY</div><h1>{course}</h1>
+<div class="eyebrow">训练总结</div><h1>{course}</h1>
 <div class="muted">{patient} · {html.escape(generated_at)}</div>
 <div class="grid">
  <div class="metric"><div class="label">训练时长</div><div class="value">{minutes:02d}:{seconds:02d}</div></div>
@@ -280,7 +280,7 @@ img{{max-width:100%;height:auto;}}
 <div style="margin-top:18px">平均关节置信度 <b>{confidence:.1f}%</b><div class="bar"><div class="fill" style="width:{min(100, confidence):.1f}%"></div></div></div></div>
 <div class="card"><h2>会话信息</h2><table>
 <tr><td>训练对象</td><td>{patient}</td></tr><tr><td>训练课程</td><td>{course}</td></tr>
-<tr><td>运行模式</td><td>{engine_mode}</td></tr><tr><td>估算骨骼帧率</td><td>{stats['estimated_fps']:.1f} fps</td></tr>
+<tr><td>运行模式</td><td>{engine_mode}</td></tr><tr><td>估算骨骼帧率</td><td>{stats['estimated_fps']:.1f} 帧/秒</td></tr>
 <tr><td>是否完整结束</td><td>{'是' if meta.get('finished') else '否'}</td></tr></table></div>
 {action_section}
 {emg_section}

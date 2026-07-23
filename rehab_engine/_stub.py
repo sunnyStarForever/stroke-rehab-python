@@ -226,3 +226,7 @@ class PipelineConfig:
     patient_diagnosis: str = ""
     ui_debug_enabled: bool = False
     ui_theme: str = "light"
+    # webengine: render full HTML reports in an embedded browser (best layout, higher resource use)
+    # external: keep the app lightweight and open full reports in the system browser
+    # text: legacy QTextBrowser rich-text rendering (lowest dependency, limited CSS support)
+    report_render_mode: str = "webengine"

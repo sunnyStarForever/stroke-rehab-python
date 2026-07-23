@@ -58,7 +58,7 @@ class EmgWaveform(QWidget):
             + [max(channel) for channel in self._history if len(channel) > 0]
         )
         colors = [QColor(COLORS["primary"]), QColor(COLORS["success"])]
-        labels = ["CH1", "CH2"]
+        labels = ["通道一", "通道二"]
         for index, channel in enumerate(self._history):
             points = list(channel)
             if len(points) < 2:
@@ -81,9 +81,9 @@ class EmgFeatureWaveform(QWidget):
     """Stacked feature waveform painter for one EMG channel."""
 
     FEATURES = [
-        ("rms", "肌电强度（RMS）", COLORS["primary"]),
-        ("zcr", "过零率（ZCR）", COLORS["warning"]),
-        ("cv", "波动系数（CV）", COLORS["cyan"]),
+        ("rms", "均方根强度", COLORS["primary"]),
+        ("zcr", "过零率", COLORS["warning"]),
+        ("cv", "波动系数", COLORS["cyan"]),
         ("fatigue", "疲劳指数", COLORS["danger"]),
         ("envelope", "包络均值", COLORS["success"]),
     ]
@@ -182,7 +182,7 @@ class EmgFeatureDialog(QDialog):
         title = QLabel("肌电特征实时波形")
         title.setObjectName("sectionTitle")
         hint = CaptionLabel(
-            "左右分别显示 CH1 / CH2；每个通道展示肌电强度、过零率、波动系数、疲劳指数与包络均值趋势")
+            "左右分别显示通道一 / 通道二；每个通道展示均方根强度、过零率、波动系数、疲劳指数与包络均值趋势")
         hint.setStyleSheet(f"color:{COLORS['muted']};")
         title_box.addWidget(title)
         title_box.addWidget(hint)
@@ -200,8 +200,8 @@ class EmgFeatureDialog(QDialog):
         grid = QGridLayout()
         grid.setHorizontalSpacing(14)
         self._channels = [
-            EmgFeatureWaveform("CH1", self),
-            EmgFeatureWaveform("CH2", self),
+            EmgFeatureWaveform("通道一", self),
+            EmgFeatureWaveform("通道二", self),
         ]
         grid.addWidget(self._channels[0], 0, 0)
         grid.addWidget(self._channels[1], 0, 1)
@@ -261,7 +261,7 @@ class EmgPanel(SimpleCardWidget):
         header.addStretch()
         self._btn_features = PushButton("查看肌电曲线")
         self._btn_features.setFixedHeight(28)
-        self._btn_features.setToolTip("弹出大窗口查看 CH1/CH2 的肌电特征实时曲线")
+        self._btn_features.setToolTip("弹出大窗口查看两个肌电通道的实时特征曲线")
         self._btn_features.clicked.connect(self._open_feature_dialog)
         header.addWidget(self._btn_features)
         self._status_dot = QLabel("未连接")
@@ -275,15 +275,15 @@ class EmgPanel(SimpleCardWidget):
         layout.addWidget(self._status_label)
 
         self._waveform = EmgWaveform(self)
-        self._waveform.setToolTip("小波形展示最近一段时间 CH1/CH2 的肌电强度（RMS）变化，用于快速观察当前发力是否稳定。")
+        self._waveform.setToolTip("小波形展示最近一段时间两个肌电通道的均方根强度变化，用于快速观察当前发力是否稳定。")
         layout.addWidget(self._waveform)
-        waveform_hint = CaptionLabel("小波形：最近肌电强度（RMS）变化，蓝色为 CH1，绿色为 CH2")
+        waveform_hint = CaptionLabel("小波形：最近肌电均方根强度变化，蓝色为通道一，绿色为通道二")
         waveform_hint.setStyleSheet(f"color:{COLORS['muted']};")
         waveform_hint.setWordWrap(True)
         layout.addWidget(waveform_hint)
 
         self._ch_bars = []
-        for ch_name in ["CH1", "CH2"]:
+        for ch_name in ["通道一", "通道二"]:
             row = QHBoxLayout()
             row.addWidget(BodyLabel(ch_name))
             bar = QProgressBar()

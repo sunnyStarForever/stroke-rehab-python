@@ -36,6 +36,12 @@ _DEPTH_RESOLUTIONS = ["640x480", "320x240", "1280x720"]
 # of substituting mock frames.
 _FPS_VALUES = ["30"]
 _EMG_BACKENDS = ["bluez", "serial"]
+_REPORT_RENDER_LABELS = {
+    "内置浏览器（效果最佳，资源占用较高）": "webengine",
+    "系统浏览器打开完整报告（软件内更轻量）": "external",
+    "轻量富文本（资源最低，图表显示有限）": "text",
+}
+_REPORT_RENDER_VALUES = {value: label for label, value in _REPORT_RENDER_LABELS.items()}
 
 
 class SettingsPage(ScrollArea):
@@ -111,13 +117,13 @@ class SettingsPage(ScrollArea):
         self._rgb_fps = ComboBox()
         self._rgb_fps.addItems(_FPS_VALUES)
 
-        grid.addWidget(BodyLabel("RGB 设备"), 0, 0)
+        grid.addWidget(BodyLabel("彩色相机设备"), 0, 0)
         grid.addWidget(self._rgb_device, 0, 1)
         grid.addWidget(BodyLabel("格式"), 0, 2)
         grid.addWidget(self._rgb_format, 0, 3)
         grid.addWidget(BodyLabel("分辨率"), 1, 0)
         grid.addWidget(self._rgb_resolution, 1, 1)
-        grid.addWidget(BodyLabel("FPS"), 1, 2)
+        grid.addWidget(BodyLabel("帧率"), 1, 2)
         grid.addWidget(self._rgb_fps, 1, 3)
         cam_layout.addLayout(grid)
 
@@ -138,7 +144,7 @@ class SettingsPage(ScrollArea):
         depth_grid.addWidget(self._depth_device, 0, 1)
         depth_grid.addWidget(BodyLabel("分辨率"), 0, 2)
         depth_grid.addWidget(self._depth_resolution, 0, 3)
-        depth_grid.addWidget(BodyLabel("FPS"), 1, 0)
+        depth_grid.addWidget(BodyLabel("帧率"), 1, 0)
         depth_grid.addWidget(self._depth_fps, 1, 1)
         depth_grid.addWidget(self._hw_d2c, 1, 3)
         cam_layout.addLayout(depth_grid)
@@ -184,6 +190,10 @@ class SettingsPage(ScrollArea):
         course_grid.addWidget(self._debug_switch, 2, 1)
         course_grid.addWidget(BodyLabel("界面主题"), 7, 0)
         course_grid.addWidget(self._theme_combo, 7, 1)
+        self._report_render_combo = ComboBox()
+        self._report_render_combo.addItems(list(_REPORT_RENDER_LABELS))
+        course_grid.addWidget(BodyLabel("报告显示方式"), 8, 0)
+        course_grid.addWidget(self._report_render_combo, 8, 1)
         course_grid.setColumnStretch(1, 1)
         course_grid.addWidget(BodyLabel("患者编号"), 3, 0)
         course_grid.addWidget(self._patient_id, 3, 1)
@@ -217,7 +227,7 @@ class SettingsPage(ScrollArea):
 
         emg_row1 = QHBoxLayout()
         self._emg_enabled = SwitchButton()
-        self._emg_enabled.setText("启用 EMG")
+        self._emg_enabled.setText("启用肌电")
         self._emg_backend = ComboBox()
         self._emg_backend.addItems(_EMG_BACKENDS)
         self._emg_serial = LineEdit()
@@ -318,6 +328,12 @@ class SettingsPage(ScrollArea):
         self._debug_switch.setChecked(c.ui_debug_enabled)
         self._theme_combo.setCurrentText(
             "深色" if getattr(c, "ui_theme", "light") == "dark" else "浅色")
+        self._report_render_combo.setCurrentText(
+            _REPORT_RENDER_VALUES.get(
+                getattr(c, "report_render_mode", "webengine"),
+                _REPORT_RENDER_VALUES["webengine"],
+            )
+        )
         if c.selected_course_id in self._course_ids:
             self._course_combo.setCurrentIndex(
                 self._course_ids.index(c.selected_course_id))
@@ -357,6 +373,8 @@ class SettingsPage(ScrollArea):
         c.patient_diagnosis = self._patient_diagnosis.text().strip()
         c.ui_debug_enabled = self._debug_switch.isChecked()
         c.ui_theme = "dark" if self._theme_combo.currentText() == "深色" else "light"
+        c.report_render_mode = _REPORT_RENDER_LABELS.get(
+            self._report_render_combo.currentText(), "webengine")
         index = self._course_combo.currentIndex()
         if 0 <= index < len(self._course_ids):
             c.selected_course_id = self._course_ids[index]
@@ -439,6 +457,8 @@ class SettingsPage(ScrollArea):
         selected_ble = self._emg_ble_device.currentText().strip()
         c.emg.ble_address = self._ble_devices.get(selected_ble, selected_ble)
         c.ui_theme = "dark" if self._theme_combo.currentText() == "深色" else "light"
+        c.report_render_mode = _REPORT_RENDER_LABELS.get(
+            self._report_render_combo.currentText(), "webengine")
         return c
 
     def _finish_device_test(self, diagnostics):

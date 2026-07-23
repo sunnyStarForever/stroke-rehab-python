@@ -154,6 +154,7 @@ class StrokeRehabWindow(FluentWindow):
         settings.debug_changed.connect(training.set_debug_enabled)
         settings.theme_changed.connect(self._apply_theme)
         settings.settings_applied.connect(lambda _path: home.refresh_from_config())
+        settings.settings_applied.connect(lambda _path: reports.refresh_render_mode())
         settings.log_requested.connect(self.show_log_dialog)
         settings.performance_requested.connect(self.show_performance_dialog)
         home.course_selected.connect(self._open_course)
@@ -246,8 +247,8 @@ class StrokeRehabWindow(FluentWindow):
             s = training.pipeline_stats()
             if s:
                 parts.append(
-                    f"同步: {s.get('sync_fps', 0.0):.1f}fps | "
-                    f"Worker: {s.get('worker_fps', s.get('pair_fps', 0.0)):.1f}fps | "
+                    f"同步: {s.get('sync_fps', 0.0):.1f}帧/秒 | "
+                    f"处理: {s.get('worker_fps', s.get('pair_fps', 0.0)):.1f}帧/秒 | "
                     f"已处理: {s['processed']} | "
                     f"丢弃: {s['dropped_pairs']}"
                 )
