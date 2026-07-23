@@ -948,7 +948,8 @@ class SensorPipeline:
             except queue.Empty: continue
 
             self._processed += 1; self._worker_since_last += 1; self._pair_id += 1
-            emg_status, emg_rms, emg_fatigue = self._tick_emg(
+            (emg_status, emg_sample_rate_hz, emg_rms, emg_zcr,
+             emg_cv, emg_fatigue, emg_envelope, emg_state) = self._tick_emg(
                 int(pair.get("ts", 0))
             )
             depth_is_hardware = not bool(pair.get("mock"))
@@ -1075,8 +1076,14 @@ class SensorPipeline:
                 skeleton_frames=self._recorder.stats().frames if self._recording else 0,
                 rgb_frames=video_stats.rgb_frames,
                 depth_frames=video_stats.depth_frames,
-                emg_status=emg_status, emg_rms=emg_rms,
+                emg_status=emg_status,
+                emg_sample_rate_hz=emg_sample_rate_hz,
+                emg_rms=emg_rms,
+                emg_zcr=emg_zcr,
+                emg_cv=emg_cv,
                 emg_fatigue=emg_fatigue,
+                emg_envelope=emg_envelope,
+                emg_state=emg_state,
                 rgb_image=rgb_image, depth_image=depth_image,
                 depth_is_hardware=depth_is_hardware)
 
@@ -1304,11 +1311,16 @@ class SensorPipeline:
             else self._emg.latest_feature()
         )
         if frame is None:
-            return self._format_emg_status(status), [], []
+            return self._format_emg_status(status), 0, [], [], [], [], [], []
         return (
             self._format_emg_status(status),
+            int(frame.sample_rate_hz),
             [channel.rms for channel in frame.channels],
+            [channel.zcr for channel in frame.channels],
+            [channel.cv for channel in frame.channels],
             [channel.fatigue_index for channel in frame.channels],
+            [channel.envelope_mean for channel in frame.channels],
+            [getattr(channel.state, "name", str(channel.state)) for channel in frame.channels],
         )
 
     @staticmethod

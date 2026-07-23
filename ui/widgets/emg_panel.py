@@ -4,12 +4,16 @@ Replaces the EMG section in TrainingPage.cpp.
 """
 
 from collections import deque
+from typing import Optional
 
 from PyQt5.QtCore import QRectF, Qt
-from PyQt5.QtGui import QColor, QPainter, QPen
-from PyQt5.QtWidgets import QHBoxLayout, QLabel, QProgressBar, QVBoxLayout, QWidget
+from PyQt5.QtGui import QColor, QFont, QPainter, QPen
+from PyQt5.QtWidgets import (
+    QDialog, QGridLayout, QHBoxLayout, QLabel, QProgressBar, QVBoxLayout,
+    QWidget,
+)
 
-from qfluentwidgets import BodyLabel, CaptionLabel, SimpleCardWidget
+from qfluentwidgets import BodyLabel, CaptionLabel, PushButton, SimpleCardWidget
 
 from rehab_engine.preview import PreviewFrame
 from ..theme import COLORS, pill_style
@@ -73,11 +77,175 @@ class EmgWaveform(QWidget):
             painter.drawText(int(plot.left()), int(baseline - amplitude - 2), labels[index])
 
 
+class EmgFeatureWaveform(QWidget):
+    """Stacked feature waveform painter for one EMG channel."""
+
+    FEATURES = [
+        ("rms", "RMS", COLORS["primary"]),
+        ("zcr", "ZCR", COLORS["warning"]),
+        ("cv", "CV", COLORS["cyan"]),
+        ("fatigue", "Fatigue", COLORS["danger"]),
+        ("envelope", "Envelope", COLORS["success"]),
+    ]
+
+    def __init__(self, channel_name: str, parent=None):
+        super().__init__(parent)
+        self._channel_name = channel_name
+        self._history = {key: deque(maxlen=360) for key, _, _ in self.FEATURES}
+        self._state = "—"
+        self.setMinimumHeight(330)
+
+    def add_values(self, values: dict, state: str = ""):
+        for key, _, _ in self.FEATURES:
+            value = values.get(key)
+            if value is None:
+                self._history[key].append(0.0)
+            else:
+                try:
+                    self._history[key].append(float(value))
+                except (TypeError, ValueError):
+                    self._history[key].append(0.0)
+        if state:
+            self._state = state
+        self.update()
+
+    def reset(self):
+        for values in self._history.values():
+            values.clear()
+        self._state = "—"
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        painter.setPen(QPen(QColor(COLORS["border"]), 1))
+        painter.setBrush(QColor("#F8FAFD"))
+        painter.drawRoundedRect(rect, 12, 12)
+
+        painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        painter.setPen(QColor(COLORS["ink"]))
+        painter.drawText(rect.adjusted(12, 8, -12, 0), Qt.AlignTop | Qt.AlignLeft,
+                         f"{self._channel_name}  ·  状态 {self._state}")
+
+        plot = QRectF(rect).adjusted(12, 36, -12, -10)
+        band_h = plot.height() / max(1, len(self.FEATURES))
+        painter.setFont(QFont("Segoe UI", 9))
+
+        for index, (key, label, color) in enumerate(self.FEATURES):
+            top = plot.top() + index * band_h
+            bottom = top + band_h - 6
+            mid = (top + bottom) / 2.0
+            painter.setPen(QPen(QColor("#E5EAF2"), 1))
+            painter.drawLine(int(plot.left()), int(bottom), int(plot.right()), int(bottom))
+            painter.drawLine(int(plot.left()), int(mid), int(plot.right()), int(mid))
+
+            points = list(self._history[key])
+            last_value = points[-1] if points else 0.0
+            painter.setPen(QColor(COLORS["muted"]))
+            painter.drawText(
+                int(plot.left()), int(top + 14),
+                f"{label}: {last_value:.3g}")
+            if len(points) < 2:
+                continue
+
+            min_v = min(points)
+            max_v = max(points)
+            span = max(max_v - min_v, 1e-9)
+            usable_h = max(1.0, bottom - top - 18)
+            step = plot.width() / max(1, len(points) - 1)
+            painter.setPen(QPen(QColor(color), 1.8))
+            last_x = plot.left()
+            last_y = bottom - 4 - ((points[0] - min_v) / span) * usable_h
+            for i, value in enumerate(points[1:], start=1):
+                x = plot.left() + i * step
+                y = bottom - 4 - ((value - min_v) / span) * usable_h
+                painter.drawLine(int(last_x), int(last_y), int(x), int(y))
+                last_x, last_y = x, y
+
+
+class EmgFeatureDialog(QDialog):
+    """Popup dialog for two-channel EMG feature trends."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("肌电特征实时波形")
+        self.resize(980, 620)
+        self._last_seq = -1
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 18)
+        root.setSpacing(12)
+
+        header = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title = QLabel("肌电特征实时波形")
+        title.setObjectName("sectionTitle")
+        hint = CaptionLabel("左右分别显示 CH1 / CH2；每个通道展示 RMS、ZCR、CV、Fatigue 与 Envelope 趋势")
+        hint.setStyleSheet(f"color:{COLORS['muted']};")
+        title_box.addWidget(title)
+        title_box.addWidget(hint)
+        header.addLayout(title_box, 1)
+        self._sample_rate = QLabel("采样率：—")
+        self._sample_rate.setStyleSheet(pill_style("primary"))
+        header.addWidget(self._sample_rate)
+        root.addLayout(header)
+
+        self._status = CaptionLabel("肌电状态：等待数据")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(f"color:{COLORS['muted']};")
+        root.addWidget(self._status)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        self._channels = [
+            EmgFeatureWaveform("CH1", self),
+            EmgFeatureWaveform("CH2", self),
+        ]
+        grid.addWidget(self._channels[0], 0, 0)
+        grid.addWidget(self._channels[1], 0, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        root.addLayout(grid, 1)
+
+        footer = CaptionLabel("注：当前展示的是上位机接收到的肌电特征帧，不生成模拟肌电数据。")
+        footer.setStyleSheet(f"color:{COLORS['muted']};")
+        root.addWidget(footer)
+
+    def update_frame(self, frame: PreviewFrame):
+        if frame.seq == self._last_seq:
+            return
+        self._last_seq = frame.seq
+        rate = int(getattr(frame, "emg_sample_rate_hz", 0) or 0)
+        self._sample_rate.setText(f"采样率：{rate} Hz" if rate > 0 else "采样率：—")
+        self._status.setText(f"肌电状态：{frame.emg_status or '未接入'}")
+
+        states = list(getattr(frame, "emg_state", []) or [])
+        for index, widget in enumerate(self._channels):
+            values = {
+                "rms": _value_at(frame.emg_rms, index),
+                "zcr": _value_at(getattr(frame, "emg_zcr", []), index),
+                "cv": _value_at(getattr(frame, "emg_cv", []), index),
+                "fatigue": _value_at(frame.emg_fatigue_index, index),
+                "envelope": _value_at(getattr(frame, "emg_envelope_mean", []), index),
+            }
+            widget.add_values(
+                values,
+                states[index] if index < len(states) else "",
+            )
+
+
+def _value_at(values, index: int):
+    return values[index] if values and index < len(values) else None
+
+
 class EmgPanel(SimpleCardWidget):
     """Compact EMG status display."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._last_frame: Optional[PreviewFrame] = None
+        self._feature_dialog: Optional[EmgFeatureDialog] = None
         self._init_ui()
 
     def _init_ui(self):
@@ -90,6 +258,10 @@ class EmgPanel(SimpleCardWidget):
         title.setObjectName("sectionTitle")
         header.addWidget(title)
         header.addStretch()
+        self._btn_features = PushButton("特征波形")
+        self._btn_features.setFixedHeight(28)
+        self._btn_features.clicked.connect(self._open_feature_dialog)
+        header.addWidget(self._btn_features)
         self._status_dot = QLabel("未连接")
         self._status_dot.setStyleSheet(pill_style("neutral"))
         header.addWidget(self._status_dot)
@@ -125,6 +297,7 @@ class EmgPanel(SimpleCardWidget):
 
     def set_frame(self, frame: PreviewFrame):
         """Update EMG display from a PreviewFrame."""
+        self._last_frame = frame
         status = frame.emg_status or "肌电未接入"
         lowered = status.lower()
 
@@ -163,3 +336,14 @@ class EmgPanel(SimpleCardWidget):
             else:
                 bar.setValue(0)
                 val_label.setText("—")
+        if self._feature_dialog is not None:
+            self._feature_dialog.update_frame(frame)
+
+    def _open_feature_dialog(self):
+        if self._feature_dialog is None:
+            self._feature_dialog = EmgFeatureDialog(self.window())
+        if self._last_frame is not None:
+            self._feature_dialog.update_frame(self._last_frame)
+        self._feature_dialog.show()
+        self._feature_dialog.raise_()
+        self._feature_dialog.activateWindow()

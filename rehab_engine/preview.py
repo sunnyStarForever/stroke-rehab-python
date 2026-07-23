@@ -90,8 +90,13 @@ class PreviewFrame:
 
     # EMG
     emg_status: str = ""
+    emg_sample_rate_hz: int = 0
     emg_rms: List[float] = field(default_factory=list)
+    emg_zcr: List[float] = field(default_factory=list)
+    emg_cv: List[float] = field(default_factory=list)
     emg_fatigue_index: List[float] = field(default_factory=list)
+    emg_envelope_mean: List[float] = field(default_factory=list)
+    emg_state: List[str] = field(default_factory=list)
 
     # Mirror
     mirror: bool = False
@@ -177,8 +182,13 @@ class PreviewComposer:
                depth_frames: int = 0,
                # EMG
                emg_status: str = "",
+               emg_sample_rate_hz: int = 0,
                emg_rms: Optional[List[float]] = None,
+               emg_zcr: Optional[List[float]] = None,
+               emg_cv: Optional[List[float]] = None,
                emg_fatigue: Optional[List[float]] = None,
+               emg_envelope: Optional[List[float]] = None,
+               emg_state: Optional[List[str]] = None,
                mirror: bool = False,
                # Real RGB image (numpy array, full mode)
                rgb_image=None,
@@ -250,8 +260,13 @@ class PreviewComposer:
         frame.depth_recorded_frames = depth_frames
 
         frame.emg_status = emg_status
+        frame.emg_sample_rate_hz = int(emg_sample_rate_hz or 0)
         frame.emg_rms = emg_rms or []
+        frame.emg_zcr = emg_zcr or []
+        frame.emg_cv = emg_cv or []
         frame.emg_fatigue_index = emg_fatigue or []
+        frame.emg_envelope_mean = emg_envelope or []
+        frame.emg_state = emg_state or []
 
         frame.mirror = mirror
         frame.rgb_image = rgb_image
