@@ -234,12 +234,7 @@ class StrokeRehabWindow(FluentWindow):
 
         parts = []
 
-        # Engine mode badge
-        from rehab_engine import _STUB_MODE
-        if _STUB_MODE:
-            parts.append("🔶 STUB模式")
-        else:
-            parts.append("🔷 引擎模式")
+        parts.append("🔷 真实数据模式")
 
         # Training status
         if training.is_training:

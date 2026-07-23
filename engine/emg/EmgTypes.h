@@ -105,7 +105,6 @@ struct EmgIntervalSummary {
 struct EmgRuntimeStatus {
   bool enabled{false};
   bool running{false};
-  bool mockMode{false};
   bool bleConnected{false};
   bool rpmsgConnected{false};
   bool recording{false};

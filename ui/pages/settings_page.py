@@ -32,8 +32,8 @@ _RGB_FORMATS = ["MJPG", "YUYV"]
 _RESOLUTIONS = ["640x480", "1280x720", "1920x1080"]
 _DEPTH_RESOLUTIONS = ["640x480", "320x240", "1280x720"]
 # RGB and depth are intentionally locked to the synchronized 30 FPS profile.
-# If hardware cannot sustain it, the runtime reports the measured rate instead
-# of substituting mock frames.
+# If hardware cannot sustain it, the runtime reports the measured rate and
+# keeps the real-data-only policy.
 _FPS_VALUES = ["30"]
 _EMG_BACKENDS = ["bluez", "serial"]
 

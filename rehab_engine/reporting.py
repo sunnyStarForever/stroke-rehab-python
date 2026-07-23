@@ -118,7 +118,7 @@ def generate_session_report(session_dir: str, csv_path: str) -> str:
     patient = html.escape(meta.get("patient_name") or "未命名训练对象")
     course = html.escape(
         meta.get("course_name") or course_summary.get("course_name") or "康复训练")
-    engine_mode = "模拟模式" if meta.get("engine_mode") == "stub" else "真实引擎"
+    engine_mode = "真实引擎" if meta.get("engine_mode") == "full" else "真实数据要求"
     minutes, seconds = divmod(int(meta.get("elapsed_seconds") or stats["duration_seconds"]), 60)
     validity = stats["valid_ratio"] * 100
     confidence = stats["mean_confidence"] * 100

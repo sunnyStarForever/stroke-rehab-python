@@ -176,7 +176,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="emit JSON only")
     args = parser.parse_args()
 
-    from rehab_engine import _STUB_MODE, load_pipeline_config, run_diagnostics
+    from rehab_engine import _CORE_READY, load_pipeline_config, run_diagnostics
     from rehab_engine.capture import FrameEnvelope, FrameSource, FrameSynchronizer
 
     config = load_pipeline_config()
@@ -199,7 +199,7 @@ def main() -> int:
     checks = {
         "config_loaded": True,
         "python_sync_smoke": sync_ok,
-        "native_hardware_adapter_loaded": not _STUB_MODE,
+        "native_hardware_adapter_loaded": bool(_CORE_READY),
         "diagnostic_errors": [f"{item.name}: {item.detail}" for item in fatal],
     }
     details = {}

@@ -59,7 +59,6 @@ from rehab_engine.sensor_pipeline import SensorPipeline
 from rehab_engine.preview import PreviewComposer, PreviewFrame
 from rehab_engine.voice import VoiceAssistant
 from rehab_engine import PipelineConfig, logger
-import rehab_engine  # for rehab_engine._STUB_MODE
 
 
 from ..widgets.preview_widget import PreviewWidget
@@ -129,6 +128,7 @@ class TrainingPage(QWidget):
         self._score_generation = 0
         self._start_generation = 0
         self._fps_warning_active = False
+        self._pipeline_warning_active = False
         self._paused_from = TrainingState.IDLE
         self._displayed_action_reps = 0
         self._scoring_submit_times = deque(maxlen=120)
@@ -191,13 +191,8 @@ class TrainingPage(QWidget):
         """Log system status to the feedback area at startup."""
         self._append_feedback("═══ 系统启动诊断 ═══")
 
-        # Engine mode
-        if rehab_engine._STUB_MODE:
-            self._append_feedback("⚠ 引擎模式: STUB（模拟数据）— 未加载 C++ .so")
-            self._preview.set_engine_mode("STUB")
-        else:
-            self._append_feedback("✓ 引擎模式: FULL（真实 C++ 引擎已加载）")
-            self._preview.set_engine_mode("FULL")
+        self._append_feedback("✓ 引擎模式: FULL（仅接受真实 RGB-D 数据）")
+        self._preview.set_engine_mode("FULL")
 
         # Python
         import sys
@@ -241,8 +236,6 @@ class TrainingPage(QWidget):
         if not self._camera_checked:
             self._check_cameras()
 
-        if self._pipeline.stub_mode:
-            return "📷 模拟画面（非真实相机数据）"
         if self._pipeline.is_stopping:
             return "📷 正在释放 RGB/Depth 设备"
         if self._pipeline.is_running:
@@ -269,7 +262,7 @@ class TrainingPage(QWidget):
         course = self._course_repo.find_by_id(course_id)
         if course is None:
             return False
-        if self._state in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED):
+        if self._state in (TrainingState.TRAINING, TrainingState.RESTING):
             self._append_feedback("课程设置已保存，将在当前训练结束后生效。")
             return False
         self._current_course = course
@@ -285,12 +278,9 @@ class TrainingPage(QWidget):
         """Validate only resources required for capture and pose inference."""
         errors, warnings = [], []
         self._check_cameras()
-        if not rehab_engine._STUB_MODE and not self._cameras_found:
+        if not self._cameras_found:
             errors.append("未检测到 RGB 摄像头")
-        elif rehab_engine._STUB_MODE:
-            warnings.append("当前为 STUB 模拟模式")
-        if (not rehab_engine._STUB_MODE and
-                (self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30)):
+        if self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30:
             errors.append("真实 RGB 与 Depth 相机必须同时设置为 30 FPS")
         return errors, warnings
 
@@ -550,7 +540,8 @@ class TrainingPage(QWidget):
 
         self._btn_capture.clicked.connect(self._on_start_capture)
         self._btn_start.clicked.connect(self._on_start)
-        self._btn_pause.clicked.connect(self._on_pause)
+        self._btn_pause.setVisible(False)
+        self._btn_pause.setEnabled(False)
         self._btn_stop.clicked.connect(self._on_stop)
         self._btn_report.clicked.connect(self._on_finish)
         self._btn_open_report.clicked.connect(self._on_open_report)
@@ -558,7 +549,6 @@ class TrainingPage(QWidget):
 
         ctrl.addWidget(self._btn_capture)
         ctrl.addWidget(self._btn_start)
-        ctrl.addWidget(self._btn_pause)
         ctrl.addWidget(self._btn_stop)
         ctrl.addStretch()
         ctrl.addWidget(self._btn_debug)
@@ -595,6 +585,12 @@ class TrainingPage(QWidget):
     # ---- State machine ----
 
     def _update_state(self, state: TrainingState):
+        if state == TrainingState.PAUSED:
+            state = (
+                TrainingState.RESTING
+                if self._course_runner.state == RunnerState.RESTING
+                else TrainingState.TRAINING
+            )
         self._state = state
         self._state_badge.setText(state.value)
         self._state_badge.setStyleSheet(state_badge_style(state.name))
@@ -606,14 +602,14 @@ class TrainingPage(QWidget):
         self._btn_start.setEnabled(
             s == TrainingState.CAPTURING and self._pipeline.is_running)
         self._btn_start.setText("开始训练")
-        self._btn_pause.setEnabled(
-            s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
-        self._btn_pause.setText("继续训练" if s == TrainingState.PAUSED else "暂停")
+        self._btn_pause.setVisible(False)
+        self._btn_pause.setEnabled(False)
+        self._btn_pause.setText("暂停")
         self._btn_stop.setEnabled(s in (
             TrainingState.CAPTURING, TrainingState.TRAINING,
-            TrainingState.RESTING, TrainingState.PAUSED))
+            TrainingState.RESTING))
         self._btn_report.setEnabled(
-            s in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED))
+            s in (TrainingState.TRAINING, TrainingState.RESTING))
         self._btn_open_report.setEnabled(bool(self._session_dir))
         self._btn_stop.setText("结束本次训练")
         self._btn_report.setVisible(False)
@@ -641,7 +637,7 @@ class TrainingPage(QWidget):
 
         # Log pipeline start details
         self._append_feedback("═══ 启动采集 Pipeline ═══")
-        self._append_feedback(f"引擎模式: {'STUB (模拟)' if rehab_engine._STUB_MODE else 'FULL (真实)'}")
+        self._append_feedback("引擎模式: FULL (真实数据)")
         self._append_feedback(f"RGB 设备: {self._config.device.rgb_device_path}")
         self._append_feedback(f"分辨率: {self._config.device.rgb_width}x{self._config.device.rgb_height} @ {self._config.device.rgb_fps}fps")
         self._append_feedback(
@@ -651,6 +647,7 @@ class TrainingPage(QWidget):
 
         self._ending = False
         self._fps_warning_active = False
+        self._pipeline_warning_active = False
         self._frame_index = 0
         self._start_generation += 1
         generation = self._start_generation
@@ -689,6 +686,7 @@ class TrainingPage(QWidget):
             return
         self._preview.set_recording(False)
         self._preview.set_show_debug(self._config.ui_debug_enabled)
+        self._pipeline_warning_active = False
         self._update_state(TrainingState.CAPTURING)
         self._append_feedback(
             "采集已启动，请确认摄像头和骨骼显示正常后点击“开始训练”。")
@@ -701,8 +699,7 @@ class TrainingPage(QWidget):
             self._append_feedback("请先点击“开始采集”并等待摄像头与骨骼就绪。")
             return
         if not self._pipeline.is_running:
-            self._append_feedback("采集 Pipeline 已停止，请重新开始采集。")
-            self._update_state(TrainingState.IDLE)
+            self._append_feedback("采集 Pipeline 当前未运行，界面保持采集状态；请检查设备后手动结束或重新开始采集。")
             return
         errors = self._training_preflight_checks()
         if errors:
@@ -763,34 +760,10 @@ class TrainingPage(QWidget):
             key="session_start", priority=2, force=True)
 
     def _on_pause(self):
-        if self._state == TrainingState.PAUSED:
-            if self._course_runner.resume_course():
-                self._pipeline.resume_recording()
-                self._training_timer.start(1000)
-                resume_state = (
-                    TrainingState.RESTING
-                    if self._course_runner.state == RunnerState.RESTING
-                    else TrainingState.TRAINING
-                )
-                self._update_state(resume_state)
-                self._preview.set_recording(True)
-                self._append_feedback("训练已继续。")
-                self._voice.speak("训练继续", key="resume", priority=3, force=True)
-            return
-
-        if self._state not in (TrainingState.TRAINING, TrainingState.RESTING):
-            return
-        self._paused_from = self._state
-        if self._course_runner.pause_course():
-            self._training_timer.stop()
-            self._pipeline.pause_recording()
-            self._preview.set_recording(False)
-            self._update_state(TrainingState.PAUSED)
-            self._append_feedback("训练已暂停，采集画面保留但数据不计入训练。")
-            self._voice.speak("训练已暂停", key="pause", priority=2, force=True)
+        self._append_feedback("暂停功能已禁用；训练和采集将持续运行，除非手动结束或程序异常退出。")
 
     def _on_stop(self):
-        if self._state in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED):
+        if self._state in (TrainingState.TRAINING, TrainingState.RESTING):
             box = MessageBox(
                 "结束本次训练？",
                 f"系统会先安全停止采集并保存数据；训练达到 {TRAINING_REPORT_MIN_SECONDS} 秒或已有动作结果时，将自动生成报告。",
@@ -805,19 +778,6 @@ class TrainingPage(QWidget):
             f"训练已结束，数据已保存；训练不足 {TRAINING_REPORT_MIN_SECONDS} 秒，暂不生成报告。"
         )
         self._end_session(TrainingState.IDLE, generate_report=generate_report, reason=reason)
-        return
-
-        if self._state in (TrainingState.TRAINING, TrainingState.RESTING, TrainingState.PAUSED):
-            box = MessageBox(
-                "停止当前训练？",
-                "停止后会保存已采集的骨骼数据，但本次课程将标记为未完整完成。",
-                self,
-            )
-            if not box.exec():
-                return
-        reason = ("采集已停止。" if self._state == TrainingState.CAPTURING
-                  else "训练已停止。")
-        self._end_session(TrainingState.IDLE, generate_report=False, reason=reason)
 
     def _on_finish(self):
         self._end_session(
@@ -913,7 +873,7 @@ class TrainingPage(QWidget):
             "elapsed_seconds": self._elapsed_seconds,
             "finished": final_state == TrainingState.FINISHED,
             "end_time": datetime.now().isoformat(timespec="seconds"),
-            "engine_mode": "stub" if rehab_engine._STUB_MODE else "full",
+            "engine_mode": "full",
             "pipeline_csv_path": str(Path(self._session_dir) / "skeleton_3d.csv"),
             "course_summary_path": str(Path(self._session_dir) / "course_summary.json"),
         }
@@ -1032,8 +992,7 @@ class TrainingPage(QWidget):
 
     def _on_score_start_finished(self, generation: int, bridge: ScoreBridge, ok: bool):
         if (generation != self._score_generation or bridge is not self._score_bridge
-                or self._state not in (TrainingState.TRAINING, TrainingState.RESTING,
-                                       TrainingState.PAUSED)):
+                or self._state not in (TrainingState.TRAINING, TrainingState.RESTING)):
             bridge.stop()
             return
         if ok:
@@ -1141,12 +1100,8 @@ class TrainingPage(QWidget):
 
     def _on_score(self, result: ScoreResult):
         self._score_panel.set_score(result)
-        reported = max(result.count, result.completed_count)
-        if reported > self._displayed_action_reps + 1:
-            self._displayed_action_reps += 1
-        else:
-            self._displayed_action_reps = max(self._displayed_action_reps, reported)
-        count = self._displayed_action_reps
+        count = max(0, int(result.count))
+        self._displayed_action_reps = count
         self._score_panel.set_display_count(count)
         quality = (
             "动作质量：优秀" if result.overall_score >= 85 else
@@ -1207,7 +1162,7 @@ class TrainingPage(QWidget):
             self._scoring_recorder.append(
                 self._frame_index, ScoringSkeletonAdapter.convert(joints))
         # ScoreBridge owns the original Rehab22 -> P-Coder coordinate transform,
-        # validity gate and synthetic joint fallbacks.
+        # validity gate for real Rehab22 joint data.
         if bridge is not None:
             now_ns = time.monotonic_ns()
             if bridge.submit_skeleton(self._frame_index, now_ns, joints):
@@ -1232,7 +1187,7 @@ class TrainingPage(QWidget):
         self._elapsed_seconds += 1
         m, s = divmod(self._elapsed_seconds, 60)
         self._timer_label.setText(f"{m:02d}:{s:02d}")
-        if not self._pipeline.stub_mode and self._elapsed_seconds >= 3:
+        if self._elapsed_seconds >= 3:
             stats = self._pipeline.performance_stats()
             healthy = (stats["rgb_30fps_ok"] and stats["depth_30fps_ok"]
                        and stats["pair_30fps_ok"])
@@ -1249,11 +1204,16 @@ class TrainingPage(QWidget):
                 self._fps_warning_active = False
 
     def _refresh_preview(self):
-        if (self._state == TrainingState.CAPTURING
+        if (self._state in (TrainingState.CAPTURING, TrainingState.TRAINING,
+                            TrainingState.RESTING)
                 and not self._pipeline.is_running
                 and not self._pipeline.is_stopping):
-            self._append_feedback("采集 Pipeline 已意外停止，请重新开始采集。")
-            self._update_state(TrainingState.IDLE)
+            if not self._pipeline_warning_active:
+                self._pipeline_warning_active = True
+                self._append_feedback(
+                    "Pipeline 当前未运行，界面保持当前状态；请检查设备后手动结束或重新开始采集。")
+        elif self._pipeline.is_running:
+            self._pipeline_warning_active = False
         frame = self._pipeline.preview.latest_frame()
         if frame:
             self._preview.set_frame(frame)

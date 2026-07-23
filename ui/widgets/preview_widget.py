@@ -65,7 +65,7 @@ class PreviewWidget(QWidget):
         self._score_threshold = 0.35
 
         # ---- Diagnostic state ----
-        self._engine_mode: str = "?"          # "STUB", "FULL"
+        self._engine_mode: str = "?"          # "FULL"
         self._frame_count: int = 0
         self._last_frame_time: float = 0.0
         self._no_frame_warned: bool = False   # warn once if no frames arrive
@@ -81,7 +81,7 @@ class PreviewWidget(QWidget):
         self.update()
 
     def set_engine_mode(self, mode: str):
-        """Set engine mode display: 'STUB' or 'FULL'."""
+        """Set engine mode display. Runtime preview accepts real data only."""
         self._engine_mode = mode
         self.update()
 
@@ -289,10 +289,7 @@ class PreviewWidget(QWidget):
         badge_font = QFont("Segoe UI", 13)
         painter.setFont(badge_font)
 
-        if self._engine_mode == "STUB":
-            badge_text = "🔶 引擎模式: STUB（模拟数据）"
-            badge_color = QColor(240, 180, 50)   # amber
-        elif self._engine_mode == "FULL":
+        if self._engine_mode == "FULL":
             badge_text = "🔷 引擎模式: FULL（真实引擎）"
             badge_color = QColor(72, 180, 240)    # blue
         else:
@@ -354,13 +351,6 @@ class PreviewWidget(QWidget):
             QRect(0, center_y + 40, rect.width(), 22),
             Qt.AlignCenter, hint_text)
 
-        if self._engine_mode == "STUB":
-            painter.setPen(QColor(180, 150, 50))
-            painter.drawText(
-                QRect(0, center_y + 70, rect.width(), 22),
-                Qt.AlignCenter,
-                "编译 C++ 引擎后可显示真实画面 (运行 setup_board.sh)")
-
     # ================================================================
     # Engine mode badge (on active preview)
     # ================================================================
@@ -374,11 +364,7 @@ class PreviewWidget(QWidget):
         painter.setFont(font)
         fm = QFontMetrics(font)
 
-        if self._engine_mode == "STUB":
-            text = " STUB "
-            bg = QColor(180, 140, 30, 200)
-            fg = QColor(255, 255, 255)
-        elif self._engine_mode == "FULL":
+        if self._engine_mode == "FULL":
             text = " FULL "
             bg = QColor(30, 140, 200, 200)
             fg = QColor(255, 255, 255)

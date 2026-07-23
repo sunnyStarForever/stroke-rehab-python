@@ -4,9 +4,6 @@ Stroke Rehab Python Application Layer.
 Python owns configuration, lifecycle, business logic and UI.  The optional
 ``rehab_engine._core`` module is a hardware/inference adapter only.
 
-To use in stub mode (desktop dev):
-    from rehab_engine._stub import PipelineConfig, ...
-
 To use in full mode (with compiled C++ engine):
     from rehab_engine._core import PipelineConfig, ...
 """
@@ -18,21 +15,15 @@ import sys
 # It is built from bindings/module.cpp with PYBIND11_MODULE(_core, m) {...}
 _STUB_MODE = False
 _core_loaded = False
-_force_stub = os.environ.get("STROKE_REHAB_FORCE_STUB", "").strip().lower() in {
-    "1", "true", "yes", "on",
-}
+_CORE_READY = False
 try:
-    if _force_stub:
-        raise ImportError("stub mode forced by STROKE_REHAB_FORCE_STUB")
     from . import _core  # noqa: F401 — compiled pybind11 module
     _core_loaded = True
 except ImportError:
-    _STUB_MODE = True
+    _core_loaded = False
 
-# Import success alone is insufficient: a desktop STROKE_ENGINE_STUB module
-# intentionally has no camera classes.
 if _core_loaded:
-    _STUB_MODE = not all(
+    _CORE_READY = all(
         hasattr(_core, name)
         for name in ("RgbCaptureV4L2", "DepthCaptureOpenNI", "DeviceConfig")
     )
@@ -91,12 +82,12 @@ from ._stub import (  # noqa: F401
     __engine_version__ as _stub_engine_version,
 )
 
-if _STUB_MODE:
-    logger = _stub_logger
-    __engine_version__ = _stub_engine_version
-else:
+if _CORE_READY:
     logger = _FullLogger(_core.logger)
     __engine_version__ = getattr(_core, "__version__", "unknown")
+else:
+    logger = _stub_logger
+    __engine_version__ = "real-core-unavailable"
 
 # Diagnostics (run before UI to check hardware status)
 from .diagnostics import Diagnostics, DiagItem, run_diagnostics, print_diagnostics

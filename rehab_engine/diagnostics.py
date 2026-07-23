@@ -120,15 +120,15 @@ def run_diagnostics(config=None) -> Diagnostics:
     diagnostics.add("Python", "OK", f"{platform.python_version()} / {sys.executable}")
 
     try:
-        from . import _STUB_MODE
-        if _STUB_MODE:
-            diagnostics.add(
-                "原生硬件适配器", "WARN", "未加载 _core，桌面使用模拟采集",
-                "目标板真实 V4L2/OpenNI 采集需要编译 _core")
+        from . import _CORE_READY
+        if _CORE_READY:
+            diagnostics.add("原生硬件适配器", "OK", "_core 已加载；仅接受真实 RGB-D 采集")
         else:
-            diagnostics.add("原生硬件适配器", "OK", "_core 已加载；Python 仍负责主流程")
+            diagnostics.add(
+                "原生硬件适配器", "ERROR", "真实采集核心不可用，不会启用模拟采集",
+                "请构建/部署包含 V4L2 RGB 与 OpenNI2 Depth 的 _core")
     except Exception as exc:
-        diagnostics.add("原生硬件适配器", "WARN", str(exc))
+        diagnostics.add("原生硬件适配器", "ERROR", f"真实采集核心检查失败：{exc}")
 
     packages = (
         ("numpy", "NumPy", True), ("cv2", "OpenCV Python", True),

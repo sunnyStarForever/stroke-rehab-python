@@ -7,7 +7,6 @@ import os
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("STROKE_REHAB_FORCE_STUB", "1")
 
 from PyQt5.QtWidgets import QApplication
 

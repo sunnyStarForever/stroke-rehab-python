@@ -8,7 +8,10 @@ Full mode data flow:
     → DepthSample → JointProject3D → EMA filter → Smoother
     → Preview + Recording + Scoring
 
-Stub mode: mock capture thread + synthetic pose.
+Real-data policy:
+  Synthetic/mock camera, depth and skeleton data are disabled.  If native
+  capture support or real devices are unavailable, start() fails instead of
+  substituting fake frames.
 """
 
 from __future__ import annotations
@@ -33,17 +36,14 @@ except ImportError:
 from . import PipelineConfig, logger
 
 _STUB_MODE = False
+_REAL_CAPTURE_READY = False
 _engine = None
 try:
-    if _os.environ.get("STROKE_REHAB_FORCE_STUB", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }:
-        raise ImportError("stub mode forced by STROKE_REHAB_FORCE_STUB")
     from . import _core as _engine
 except ImportError:
-    _STUB_MODE = True
+    _engine = None
 else:
-    _STUB_MODE = not all(
+    _REAL_CAPTURE_READY = all(
         hasattr(_engine, name)
         for name in ("RgbCaptureV4L2", "DepthCaptureOpenNI", "DeviceConfig")
     )
@@ -82,11 +82,12 @@ class RecordingOptions:
 
 
 class SensorPipeline:
-    """Python-owned pipeline orchestrator with mock and real-hardware modes."""
+    """Python-owned pipeline orchestrator for real RGB-D hardware only."""
 
     def __init__(self, config: Optional[PipelineConfig] = None):
         self._config = config or PipelineConfig()
-        self._stub_mode = _STUB_MODE
+        self._stub_mode = False
+        self._real_capture_ready = _REAL_CAPTURE_READY
         self._pair_queue: queue.Queue = queue.Queue(
             maxsize=max(1, int(self._config.pose.max_pair_queue))
         )
@@ -200,11 +201,12 @@ class SensorPipeline:
     @property
     def preview(self): return self._preview
     @property
-    def stub_mode(self): return self._stub_mode
+    def stub_mode(self): return False
     @property
     def camera_status(self):
+        mode = "FULL" if self._real_capture_ready else "REAL_UNAVAILABLE"
         return {"status": self._camera_status, "error": self._camera_error,
-                "rgb_fps": self._rgb_fps, "mode": "STUB" if self._stub_mode else "FULL"}
+                "rgb_fps": self._rgb_fps, "mode": mode}
     @property
     def emg_status(self): return self._emg.runtime_status()
 
@@ -224,14 +226,19 @@ class SensorPipeline:
             self._emit_status(
                 "ERROR: previous camera shutdown was incomplete; restart the application")
             return False
-        if (not self._stub_mode and
-                (self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30)):
+        if not self._real_capture_ready:
+            self._camera_status = "configuration_error"
+            self._camera_error = (
+                "真实 RGB-D 采集核心不可用：未加载包含 RgbCaptureV4L2/"
+                "DepthCaptureOpenNI 的 _core 扩展")
+            self._emit_status(f"ERROR: {self._camera_error}")
+            return False
+        if self._config.device.rgb_fps != 30 or self._config.device.depth_fps != 30:
             self._camera_status = "configuration_error"
             self._camera_error = "真实 RGB 与 Depth 采集必须同时配置为 30 FPS"
             self._emit_status(f"ERROR: {self._camera_error}")
             return False
-        mode_label = "STUB" if self._stub_mode else "FULL"
-        self._emit_status(f"Pipeline starting ({mode_label} mode)...")
+        self._emit_status("Pipeline starting (FULL real-data mode)...")
         self._start_done.clear()
         self._drain_pair_queue()
         self._reset_performance_counters()
@@ -257,17 +264,14 @@ class SensorPipeline:
         self._worker_thread = threading.Thread(
             target=self._worker_loop, name="pipeline-worker", daemon=True)
         self._worker_thread.start()
-        if self._stub_mode:
-            self._start_mock_capture()
-        else:
-            if not self._start_real_capture():
-                self._accept_frames.clear()
-                self._running.clear()
-                if self._worker_thread and self._worker_thread.is_alive():
-                    self._worker_thread.join(timeout=1.0)
-                self._pair_recorder.stop()
-                self._start_done.set()
-                return False
+        if not self._start_real_capture():
+            self._accept_frames.clear()
+            self._running.clear()
+            if self._worker_thread and self._worker_thread.is_alive():
+                self._worker_thread.join(timeout=1.0)
+            self._pair_recorder.stop()
+            self._start_done.set()
+            return False
         emg_ok = self._emg.start()
         strict_real = (
             self._config.emg.enabled
@@ -579,7 +583,7 @@ class SensorPipeline:
                     "record_write_ms": self._last_record_write_ms,
                     "queue_length": self._pair_queue.qsize(),
                     "dropped_pairs": self._dropped, "processed": self._processed,
-                    "stub_mode": self._stub_mode, "real_data": not self._stub_mode,
+                    "stub_mode": False, "real_data": True,
                     "target_fps": 30.0,
                     "rgb_30fps_ok": 27.0 <= self._rgb_fps <= 33.5,
                     "depth_30fps_ok": 27.0 <= self._depth_fps <= 33.5,
@@ -645,35 +649,6 @@ class SensorPipeline:
                     "clock_states": capture_perf["clock_states"],
                 })
             return stats
-
-    # ── Stub capture ──────────────────────────────────────────────
-
-    def _start_mock_capture(self):
-        self._emit_status("Pipeline: mock capture (no real camera)")
-        threading.Thread(target=self._mock_capture_loop, name="mock-capture", daemon=True).start()
-
-    def _mock_capture_loop(self):
-        interval = 1.0 / max(1, self._config.device.rgb_fps)
-        frame_id = 0
-        while self._running.is_set():
-            timestamp_ns = time.monotonic_ns()
-            if (self._config.async_video_recording
-                    and self._recording and not self._recording_paused):
-                bgr_image, _untrusted_depth = self._synthetic_images()
-                self._video_recorder.submit(RecordingFrame(
-                    bgr_image=bgr_image,
-                    depth_image=None,
-                    sync_ts_ns=timestamp_ns,
-                    rgb_frame_id=frame_id,
-                    depth_frame_id=frame_id,
-                    align_mode="stub-untrusted",
-                ))
-            self._enqueue_pair({"ts": timestamp_ns, "mock": True})
-            self._rgb_count += 1; self._depth_count += 1
-            self._rgb_since_last += 1; self._depth_since_last += 1
-            self._sync_since_last += 1
-            frame_id += 1
-            time.sleep(interval)
 
     # ── ONNX pose model init ──────────────────────────────────────
 
@@ -948,18 +923,14 @@ class SensorPipeline:
             except queue.Empty: continue
 
             self._processed += 1; self._worker_since_last += 1; self._pair_id += 1
-            emg_status, emg_rms, emg_fatigue, emg_features = self._tick_emg(
+            emg_status, emg_rms, emg_fatigue = self._tick_emg(
                 int(pair.get("ts", 0))
             )
             depth_is_hardware = not bool(pair.get("mock"))
 
             if pair.get("mock"):
-                depth_unit_to_meter = 0.001
-                pose_2d, pose_3d, bbox = self._synthetic_pose_full()
-                rgb_image, depth_image = self._synthetic_images()
-                bgr_image = rgb_image
-                depth_raw = depth_image
-                pose_ms = 0.0; yolo_ms = 0.0
+                self._emit_status("ERROR: mock RGB-D frame rejected; real data is required")
+                continue
             else:
                 depth_unit_to_meter = float(pair.get("depth_unit_to_meter", 0.001))
                 bgr_image = pair.get("bgr_image")
@@ -976,8 +947,7 @@ class SensorPipeline:
                     self._infer_pose_full(
                         bgr_image, depth_image, pose_interval, depth_unit_to_meter)
 
-            # Stub/synthetic depth remains useful for exercising the RGB/UI
-            # loop, but it must never reach any depth-dependent consumer.
+            # Only real hardware depth may reach depth-dependent consumers.
             if not depth_is_hardware:
                 depth_raw = None
                 depth_image = None
@@ -1077,7 +1047,6 @@ class SensorPipeline:
                 depth_frames=video_stats.depth_frames,
                 emg_status=emg_status, emg_rms=emg_rms,
                 emg_fatigue=emg_fatigue,
-                emg_features=emg_features,
                 rgb_image=rgb_image, depth_image=depth_image,
                 depth_is_hardware=depth_is_hardware)
 
@@ -1305,25 +1274,11 @@ class SensorPipeline:
             else self._emg.latest_feature()
         )
         if frame is None:
-            return self._format_emg_status(status), [], [], []
-        features = [
-            {
-                "channel": float(channel.channel),
-                "rms": float(channel.rms),
-                "mav": float(getattr(channel, "mav", 0.0)),
-                "iemg": float(getattr(channel, "iemg", 0.0)),
-                "wl": float(getattr(channel, "waveform_length", 0.0)),
-                "zc": float(getattr(channel, "zero_crossings", 0.0)),
-                "zcr": float(channel.zcr),
-                "fatigue": float(channel.fatigue_index),
-            }
-            for channel in frame.channels
-        ]
+            return self._format_emg_status(status), [], []
         return (
             self._format_emg_status(status),
             [channel.rms for channel in frame.channels],
             [channel.fatigue_index for channel in frame.channels],
-            features,
         )
 
     @staticmethod
@@ -1347,7 +1302,7 @@ class SensorPipeline:
             return
         self._recorder.record(
             timestamp_ns=ts, frame_id=self._pair_id, pair_id=self._pair_id,
-            dt_seconds=0.033, bbox_mode="full" if not self._stub_mode else "mock",
+            dt_seconds=0.033, bbox_mode="full",
             joints_3d=joints,
             joints_2d=self._last_rehab2d,
             raw_joints_3d=self._last_raw_j3d,
@@ -1355,48 +1310,6 @@ class SensorPipeline:
             depth_debug=self._last_depth_debug,
             ema_debug=self._last_ema_debug,
         )
-
-    def _synthetic_images(self):
-        if np is None:
-            return None, None
-        width = max(1, int(self._config.device.rgb_width))
-        height = max(1, int(self._config.device.rgb_height))
-        rgb = np.full((height, width, 3), 30, dtype=np.uint8)
-        depth = np.fromfunction(
-            lambda y, x: ((x + y + self._pair_id) % 4000) + 500,
-            (height, width),
-            dtype=int,
-        ).astype(np.uint16)
-        try:
-            import cv2
-            cv2.putText(
-                rgb,
-                f"RGB fallback frame_id={self._pair_id}",
-                (20, height // 2),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-        except Exception:
-            pass
-        return rgb, depth
-
-    def _synthetic_pose_full(self):
-        t = time.monotonic()
-        j2d, j3d = [], []
-        layout = [(0,-100),(0,-120),(0,-140),(0,-160),(0,-180),(0,-200),
-                  (-30,-140),(-80,-120),(-130,-100),(-180,-80),
-                  (30,-140),(80,-120),(130,-100),(180,-80),
-                  (-20,0),(-20,80),(-20,160),(-30,240),
-                  (20,0),(20,80),(20,160),(30,240)]
-        for dx, dy in layout:
-            x = 320 + dx + (5 * (t % 1)); y = 240 + dy; z = 2.0
-            j2d.append((x, y, 0.9, True))
-            j3d.append((x/320-1, -(y/240-1), z, 0.9, True))
-        bbox = (100.0, 50.0, 440.0, 430.0, True, "mock")
-        return j2d, j3d, bbox
 
     # ── Performance ───────────────────────────────────────────────
 

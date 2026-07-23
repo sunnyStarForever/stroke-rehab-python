@@ -1,21 +1,22 @@
 """
-Stub config types for desktop development.
-Mirrors the C++ Config.h structs as pure Python dataclasses.
+Pure Python configuration types and a callback logger.
+Mirrors the C++ Config.h structs as dataclasses; this module does not provide
+camera, depth or skeleton simulation.
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
 
-__engine_version__ = "0.1.0-stub"
+__engine_version__ = "0.1.0-config"
 
-# Re-exported for convenience — actual value is set by __init__.py
-_STUB_MODE = True
+# Re-exported for legacy compatibility; runtime simulation is disabled.
+_STUB_MODE = False
 
 
 # ============================================================
-# Logger stub
+# Callback logger
 # ============================================================
-class _StubLogger:
+class _CallbackLogger:
     """Callback-based logger matching the C++ Logger API."""
 
     def __init__(self):
@@ -42,7 +43,7 @@ class _StubLogger:
         self._log("PERF", msg)
 
 
-logger = _StubLogger()
+logger = _CallbackLogger()
 
 
 # ============================================================

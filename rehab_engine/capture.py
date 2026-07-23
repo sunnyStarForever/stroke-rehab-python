@@ -329,9 +329,8 @@ class NativeRgbDepthBackend:
             self._rgb.set_on_status(self._status_callback)
 
         # Do not accept callbacks until the native depth driver has explicitly
-        # attested that a real hardware stream is active.  This also prevents
-        # a legacy module from leaking synthetic startup frames before it is
-        # rejected below.
+        # attested that a real hardware stream is active.  This prevents any
+        # legacy pre-hardware frame from reaching the synchronized stream.
         self._running = False
         rgb_ok = self._rgb.start(native_config, self._on_rgb)
         depth_started = self._depth.start(native_config, self._on_depth)

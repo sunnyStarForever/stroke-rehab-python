@@ -15,7 +15,7 @@ build_win.bat
 .venv\Scripts\python.exe main.py
 ```
 
-Windows 默认使用模拟相机数据，但会加载真实 Python ONNX 模型、评分逻辑和完整 UI。也可单独执行：
+Windows 开发机不再默认使用模拟相机数据；未连接真实 RGB-D 设备或未加载真实采集核心时，采集不会启动。仍可单独执行非硬件 UI/模型检查：
 
 ```bat
 .venv\Scripts\python.exe verify_runtime.py --models --ui

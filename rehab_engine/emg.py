@@ -62,10 +62,6 @@ class EmgChannelFeature:
     state: EmgMuscleState = EmgMuscleState.REST
     valid: bool = True
     envelope_mean: float = 0.0
-    mav: float = 0.0
-    iemg: float = 0.0
-    waveform_length: float = 0.0
-    zero_crossings: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -74,7 +70,6 @@ class EmgFeatureFrame:
     seq: int
     sample_rate_hz: int
     channels: Tuple[EmgChannelFeature, ...]
-    window_size: int = 0
 
     @property
     def valid(self) -> bool:
@@ -139,13 +134,6 @@ class EmgFeatureProcessor:
             rms = math.sqrt(mean_square)
             standard_deviation = math.sqrt(variance)
             mean_magnitude = abs(mean)
-            magnitudes = [abs(value) for value in values]
-            mav = sum(magnitudes) / samples
-            iemg = sum(magnitudes)
-            waveform_length = sum(
-                abs(current - previous)
-                for previous, current in zip(values, values[1:])
-            )
             cv = standard_deviation / mean_magnitude if mean_magnitude > 1.0e-12 else 0.0
             zero_crossings = sum(
                 1
@@ -163,23 +151,10 @@ class EmgFeatureProcessor:
             else:
                 state = EmgMuscleState.SMOOTH_FLEX
             features.append(
-                EmgChannelFeature(
-                    channel=channel,
-                    rms=rms,
-                    zcr=zcr,
-                    cv=cv,
-                    fatigue_index=fatigue,
-                    state=state,
-                    envelope_mean=mav,
-                    mav=mav,
-                    iemg=iemg,
-                    waveform_length=waveform_length,
-                    zero_crossings=float(zero_crossings),
-                )
+                EmgChannelFeature(channel, rms, zcr, cv, fatigue, state)
             )
         return EmgFeatureFrame(
-            chunk.host_ts_ns, chunk.seq, chunk.sample_rate_hz,
-            tuple(features), window_size=samples,
+            chunk.host_ts_ns, chunk.seq, chunk.sample_rate_hz, tuple(features)
         )
 
 
@@ -545,24 +520,18 @@ class EmgRpmsgProtocol:
                 return None
             if valid:
                 channels.append(
-                EmgChannelFeature(
-                    channel=index,
-                    rms=rms,
-                    zcr=float(zcr),
-                    cv=cv,
-                    fatigue_index=fatigue,
-                    state=EmgMuscleState(state_value),
-                    valid=True,
-                    envelope_mean=envelope,
-                    mav=envelope,
-                    iemg=envelope * max(1, int(window_size)),
-                    zero_crossings=float(zcr) * max(0, int(window_size) - 1),
+                    EmgChannelFeature(
+                        channel=index,
+                        rms=rms,
+                        zcr=float(zcr),
+                        cv=cv,
+                        fatigue_index=fatigue,
+                        state=EmgMuscleState(state_value),
+                        valid=True,
+                        envelope_mean=envelope,
+                    )
                 )
-                )
-        frame = EmgFeatureFrame(
-            host_ts_ns, seq, sample_rate_hz, tuple(channels),
-            window_size=int(window_size),
-        )
+        frame = EmgFeatureFrame(host_ts_ns, seq, sample_rate_hz, tuple(channels))
         return frame if frame.valid else None
 
     @classmethod
