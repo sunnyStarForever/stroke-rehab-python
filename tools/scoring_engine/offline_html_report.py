@@ -31,7 +31,28 @@ def setup_chinese_font(verbose=True):
     也兼容 Linux / macOS 常见中文字体。
     """
 
-    candidate_fonts = [
+    candidate_font_files = [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyhbd.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+    ]
+
+    candidate_fonts = []
+    for font_file in candidate_font_files:
+        path = Path(font_file)
+        if not path.exists():
+            continue
+        try:
+            fm.fontManager.addfont(str(path))
+            candidate_fonts.append(fm.FontProperties(fname=str(path)).get_name())
+        except Exception:
+            pass
+
+    candidate_fonts.extend([
         "Microsoft YaHei",
         "SimHei",
         "SimSun",
@@ -45,7 +66,7 @@ def setup_chinese_font(verbose=True):
         "Arial Unicode MS",
         "PingFang SC",
         "Heiti SC",
-    ]
+    ])
 
     available_font_names = set()
 
@@ -133,6 +154,27 @@ ROM_LABELS = {
     "elbow_flexion_mean": "肘屈伸角均值",
     "trunk_sagittal_lean": "躯干前后倾",
     "trunk_frontal_lean": "躯干左右倾",
+}
+
+EMG_STATE_LABELS = {
+    "REST": "放松/静息",
+    "SMOOTH_FLEX": "平稳发力",
+    "TREMOR": "震颤/不稳定",
+    "FATIGUE": "疲劳倾向",
+}
+
+EMG_FEATURE_LABELS = {
+    "rms": "肌电强度（RMS）",
+    "zcr": "过零率（收缩切换活跃度，ZCR）",
+    "cv": "波动系数（稳定性，CV）",
+    "fatigue_index": "疲劳指数",
+}
+
+EMG_RAW_FEATURE_LABELS = {
+    "mav": "平均绝对肌电值（MAV）",
+    "iemg": "积分肌电值（IEMG）",
+    "wl": "波形长度（WL）",
+    "zc": "过零次数（ZC）",
 }
 
 
@@ -240,7 +282,7 @@ def _img_tag(path, title=None, embed=True):
     if embed:
         src = _image_to_base64(path)
     else:
-        src = path.as_posix()
+        src = path.resolve().as_uri()
 
     if src is None:
         return ""
@@ -250,7 +292,7 @@ def _img_tag(path, title=None, embed=True):
     return f"""
     <div class="figure-card">
         {title_html}
-        <img src="{src}" alt="{html.escape(title or path.name)}"/>
+        <img src="{src}" alt="{html.escape(title or path.name)}" width="980"/>
     </div>
     """
 
@@ -370,7 +412,7 @@ def _plot_radar(values, labels, title, save_path):
     plt.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     return save_path
@@ -409,7 +451,7 @@ def _plot_high_low_radar(high_row, low_row, dim_cols, save_path):
     plt.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     return save_path
@@ -451,7 +493,7 @@ def _plot_score_trend(quality_df, save_path):
     plt.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     return save_path
@@ -484,7 +526,7 @@ def _plot_segment_timeline(segments_df, n_frames, save_path):
     plt.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     return save_path
@@ -516,7 +558,7 @@ def _plot_rom_summary_bar(rom_summary_df, save_path, top_n=10):
     plt.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     return save_path
@@ -555,7 +597,7 @@ def _plot_similarity_by_cycle(result, save_path):
     plt.tight_layout()
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     return save_path
@@ -876,9 +918,218 @@ def _load_emg_summary(output_dir):
     return None
 
 
-def _render_emg_section(output_dir):
+def _emg_feature_path(output_dir):
+    output_dir = Path(output_dir)
+    for path in (output_dir / "emg_features.csv", output_dir.parent / "emg_features.csv"):
+        if path.exists():
+            return path
+    return None
+
+
+def _emg_raw_path(output_dir):
+    output_dir = Path(output_dir)
+    for path in (output_dir / "emg_raw.csv", output_dir.parent / "emg_raw.csv"):
+        if path.exists():
+            return path
+    return None
+
+
+def _load_emg_feature_df(output_dir):
+    path = _emg_feature_path(output_dir)
+    if path is None:
+        return None, None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None, path
+    if df.empty:
+        return None, path
+    for col in ("timestamp_ns", "seq", "ch", "rms", "zcr", "cv", "fatigue_index"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    valid_ts = df["timestamp_ns"].dropna() if "timestamp_ns" in df.columns else pd.Series(dtype=float)
+    if not valid_ts.empty:
+        t0 = valid_ts.min()
+        df["time_s"] = (df["timestamp_ns"] - t0) / 1_000_000_000.0
+    else:
+        df["time_s"] = np.arange(len(df), dtype=float)
+    return df.dropna(subset=["time_s"]), path
+
+
+def _load_emg_raw_df(output_dir):
+    path = _emg_raw_path(output_dir)
+    if path is None:
+        return None, None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None, path
+    if df.empty:
+        return None, path
+    for col in ("timestamp_ns", "packet_seq", "sample_index", "ch0", "ch1"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    valid_ts = df["timestamp_ns"].dropna() if "timestamp_ns" in df.columns else pd.Series(dtype=float)
+    if not valid_ts.empty:
+        t0 = valid_ts.min()
+        df["time_s"] = (df["timestamp_ns"] - t0) / 1_000_000_000.0
+    else:
+        df["time_s"] = np.arange(len(df), dtype=float)
+    return df.dropna(subset=["time_s"]), path
+
+
+def _estimate_rate_from_time(df):
+    if df is None or df.empty or "time_s" not in df.columns:
+        return 0.0
+    times = df["time_s"].dropna().to_numpy(dtype=float)
+    if len(times) < 2:
+        return 0.0
+    duration = float(times[-1] - times[0])
+    if duration <= 0:
+        return 0.0
+    if "seq" in df.columns:
+        seq_count = int(df["seq"].dropna().nunique())
+        if seq_count > 1:
+            return (seq_count - 1) / duration
+    return (len(times) - 1) / duration
+
+
+def _thin_df(df, max_points=900):
+    if df is None or len(df) <= max_points:
+        return df
+    step = max(1, int(np.ceil(len(df) / max_points)))
+    return df.iloc[::step].copy()
+
+
+def _plot_emg_feature_trends(feature_df, save_path):
+    if feature_df is None or feature_df.empty:
+        return None
+    required = [col for col in EMG_FEATURE_LABELS if col in feature_df.columns]
+    if not required or "ch" not in feature_df.columns:
+        return None
+
+    fig, axes = plt.subplots(len(required), 1, figsize=(9.2, 2.15 * len(required)), sharex=True)
+    if len(required) == 1:
+        axes = [axes]
+    colors = {0: "#2563eb", 1: "#16a34a"}
+
+    for ax, col in zip(axes, required):
+        plotted = False
+        for channel in (0, 1):
+            ch_df = feature_df[feature_df["ch"] == channel]
+            if ch_df.empty:
+                continue
+            ch_df = _thin_df(ch_df.sort_values("time_s"))
+            ax.plot(
+                ch_df["time_s"].to_numpy(dtype=float),
+                ch_df[col].to_numpy(dtype=float),
+                linewidth=1.8,
+                color=colors[channel],
+                label=f"CH{channel + 1}",
+            )
+            plotted = True
+        ax.set_ylabel(EMG_FEATURE_LABELS.get(col, col), fontsize=9)
+        ax.grid(alpha=0.25)
+        if plotted:
+            ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("训练时间（秒）")
+    fig.suptitle("肌电特征随时间变化", fontsize=13, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
+def _windowed_raw_features(raw_df, window_size=160, hop_size=80):
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+    channels = [col for col in ("ch0", "ch1") if col in raw_df.columns]
+    if not channels:
+        return pd.DataFrame()
+    rows = []
+    ordered = raw_df.sort_values("time_s").reset_index(drop=True)
+    for start in range(0, max(0, len(ordered) - window_size + 1), hop_size):
+        window = ordered.iloc[start:start + window_size]
+        if window.empty:
+            continue
+        time_s = float(window["time_s"].iloc[len(window) // 2])
+        for ch_idx, col in enumerate(channels):
+            values = pd.to_numeric(window[col], errors="coerce").dropna().to_numpy(dtype=float)
+            if len(values) < 2:
+                continue
+            centered = values - np.mean(values)
+            diff = np.diff(centered)
+            rows.append({
+                "time_s": time_s,
+                "ch": ch_idx,
+                "mav": float(np.mean(np.abs(centered))),
+                "iemg": float(np.sum(np.abs(centered))),
+                "wl": float(np.sum(np.abs(diff))),
+                "zc": float(np.sum(centered[:-1] * centered[1:] < 0)),
+            })
+    return pd.DataFrame(rows)
+
+
+def _plot_emg_raw_time_features(raw_df, save_path):
+    features = _windowed_raw_features(raw_df)
+    if features.empty:
+        return None
+    cols = [col for col in ("mav", "iemg", "wl", "zc") if col in features.columns]
+    fig, axes = plt.subplots(len(cols), 1, figsize=(9.2, 2.05 * len(cols)), sharex=True)
+    if len(cols) == 1:
+        axes = [axes]
+    colors = {0: "#7c3aed", 1: "#0891b2"}
+    for ax, col in zip(axes, cols):
+        for channel in (0, 1):
+            ch_df = features[features["ch"] == channel]
+            if ch_df.empty:
+                continue
+            ch_df = _thin_df(ch_df.sort_values("time_s"))
+            ax.plot(
+                ch_df["time_s"].to_numpy(dtype=float),
+                ch_df[col].to_numpy(dtype=float),
+                linewidth=1.7,
+                color=colors[channel],
+                label=f"CH{channel + 1}",
+            )
+        ax.set_ylabel(EMG_RAW_FEATURE_LABELS.get(col, col), fontsize=9)
+        ax.grid(alpha=0.25)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("训练时间（秒）")
+    fig.suptitle("原始肌电滑动窗口分析", fontsize=13, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
+def _generate_emg_figures(output_dir):
+    output_dir = Path(output_dir)
+    try:
+        setup_chinese_font(verbose=False)
+    except Exception:
+        pass
+    fig_dir = _ensure_dir(output_dir / "figures" / "html_extra")
+    figures = {}
+    feature_df, _ = _load_emg_feature_df(output_dir)
+    raw_df, _ = _load_emg_raw_df(output_dir)
+    feature_plot = _plot_emg_feature_trends(feature_df, fig_dir / "emg_feature_trends.png")
+    raw_plot = _plot_emg_raw_time_features(raw_df, fig_dir / "emg_raw_time_features.png")
+    if feature_plot:
+        figures["feature_trends"] = feature_plot
+    if raw_plot:
+        figures["raw_time_features"] = raw_plot
+    return figures, feature_df, raw_df
+
+
+def _render_emg_section(output_dir, embed_images=True):
     """生成报告中的肌电状态分析区域，保证无肌电文件时也不报错。"""
     summary = _load_emg_summary(output_dir)
+    emg_figures, feature_df, raw_df = _generate_emg_figures(output_dir)
     if not summary:
         return """
         <div class="section">
@@ -894,6 +1145,8 @@ def _render_emg_section(output_dir):
     tremor_ratio = float(summary.get("tremor_ratio", 0.0) or 0.0)
     avg_fatigue = float(summary.get("avg_fatigue_index", 0.0) or 0.0)
     dominant_state = str(summary.get("dominant_state", "REST"))
+    feature_rate = _estimate_rate_from_time(feature_df)
+    raw_rate = _estimate_rate_from_time(raw_df)
 
     suggestions = []
     if fatigue_ratio >= 0.25:
@@ -906,14 +1159,18 @@ def _render_emg_section(output_dir):
         suggestions.append("肌电参与度和疲劳指标处于可接受范围，可结合动作评分继续观察。")
 
     cards = [
-        ("主动肌平均 RMS", f"{active_rms:.1f}"),
-        ("拮抗肌平均 RMS", f"{antagonist_rms:.1f}"),
-        ("发力占比 active_ratio", f"{active_ratio:.1%}"),
-        ("疲劳占比 fatigue_ratio", f"{fatigue_ratio:.1%}"),
-        ("震颤/异常占比 tremor_ratio", f"{tremor_ratio:.1%}"),
+        ("主动肌平均强度（RMS）", f"{active_rms:.1f}"),
+        ("拮抗肌平均强度（RMS）", f"{antagonist_rms:.1f}"),
+        ("主动发力占比", f"{active_ratio:.1%}"),
+        ("疲劳倾向占比", f"{fatigue_ratio:.1%}"),
+        ("震颤/不稳定占比", f"{tremor_ratio:.1%}"),
         ("平均疲劳指数", f"{avg_fatigue:.3f}"),
-        ("主导状态", html.escape(dominant_state)),
+        ("主导状态", html.escape(EMG_STATE_LABELS.get(dominant_state, dominant_state))),
     ]
+    if feature_rate > 0:
+        cards.append(("肌电特征帧率", f"{feature_rate:.1f} Hz"))
+    if raw_rate > 0:
+        cards.append(("原始肌电采样率", f"{raw_rate:.1f} Hz"))
     cards_html = "".join(
         f"""
         <div class="metric-card">
@@ -924,11 +1181,32 @@ def _render_emg_section(output_dir):
         for title, value in cards
     )
     suggestion_html = "<br/>".join(html.escape(item) for item in suggestions)
+    figure_html = ""
+    if emg_figures.get("feature_trends"):
+        figure_html += _img_tag(
+            emg_figures["feature_trends"],
+            title="肌电特征曲线：强度、过零率、稳定性与疲劳指数",
+            embed=embed_images,
+        )
+    if emg_figures.get("raw_time_features"):
+        figure_html += _img_tag(
+            emg_figures["raw_time_features"],
+            title="原始肌电窗口特征：平均绝对值、积分值、波形长度与过零次数",
+            embed=embed_images,
+        )
+    if not figure_html:
+        figure_html = '<div class="empty-box">未找到可绘制的肌电曲线数据；报告仅展示摘要指标。</div>'
     return f"""
     <div class="section">
         <h2>8. 肌电状态分析</h2>
         <div class="cards">{cards_html}</div>
         <div class="analysis-box">{suggestion_html}</div>
+        <div class="figure-grid">{figure_html}</div>
+        <div class="analysis-box">
+            指标说明：肌电强度（RMS）反映肌肉收缩强弱；平均绝对肌电值用于观察整体发力水平；
+            积分肌电值反映一个时间窗内的累计肌肉活动量；波形长度用于观察信号复杂度和发力变化；
+            过零次数/过零率可辅助判断肌肉激活切换是否频繁。以上结果用于康复训练观察，不替代临床诊断。
+        </div>
         <p class="empty-box">数据来源：{html.escape(str(summary.get("_source", "-")))}</p>
     </div>
     """
@@ -992,7 +1270,7 @@ def _render_html(
         rom_imgs_html += _img_tag(path, title=f"ROM 曲线：{path.stem}", embed=embed_images)
 
     generated_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    emg_html = _render_emg_section(output_dir)
+    emg_html = _render_emg_section(output_dir, embed_images=embed_images)
 
     css = """
     <style>

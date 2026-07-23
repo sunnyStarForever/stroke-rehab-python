@@ -23,7 +23,7 @@ from qfluentwidgets import (
     TextBrowser, ListWidget, ScrollArea, InfoBar, InfoBarPosition,
 )
 from ..theme import COLORS, PAGE_STYLE, pill_style
-from rehab_engine.reporting import generate_session_report
+from rehab_engine.reporting import generate_session_report, _session_emg_summary
 from ..report_images import adapt_report_images
 
 
@@ -325,6 +325,7 @@ class ReportsPage(QWidget):
         target = sum(int(item.get("target_reps", 0) or 0) for item in actions)
         completion = (actual / target * 100.0) if target > 0 else 0.0
         elapsed = int(meta.get("elapsed_seconds", 0) or 0)
+        emg = _session_emg_summary(actions, session)
         return {
             "session": session,
             "start": start_time or meta.get("start_time", ""),
@@ -335,6 +336,10 @@ class ReportsPage(QWidget):
             "target": target,
             "elapsed": elapsed,
             "finished": bool(meta.get("finished", False)),
+            "emg_available": bool(emg.get("available")),
+            "emg_avg_rms": float(emg.get("avg_rms", 0.0) or 0.0),
+            "emg_active_ratio": float(emg.get("active_ratio", 0.0) or 0.0),
+            "emg_fatigue_ratio": float(emg.get("fatigue_ratio", 0.0) or 0.0),
         }
 
     def _trend_html(self) -> str:
@@ -348,22 +353,45 @@ class ReportsPage(QWidget):
         avg_score = sum(item["score"] for item in recent) / len(recent)
         avg_completion = sum(item["completion"] for item in recent) / len(recent)
         total_minutes = sum(item["elapsed"] for item in recent) // 60
+        emg_recent = [item for item in recent if item.get("emg_available")]
+        avg_emg_active = (
+            sum(item["emg_active_ratio"] for item in emg_recent) / len(emg_recent) * 100.0
+            if emg_recent else 0.0
+        )
+        avg_emg_fatigue = (
+            sum(item["emg_fatigue_ratio"] for item in emg_recent) / len(emg_recent) * 100.0
+            if emg_recent else 0.0
+        )
         rows = []
         cards = []
+        emg_cards = []
         for item in snapshots:
             score = max(0, min(100, item["score"]))
             completion = max(0, min(100, item["completion"]))
             date = item["start"][:16].replace("T", " ")
+            emg_text = (
+                f"{item['emg_avg_rms']:.1f} / {item['emg_fatigue_ratio'] * 100.0:.1f}%"
+                if item.get("emg_available") else "—"
+            )
             rows.append(
                 f"<tr><td>{date}</td><td>{item['label']}</td>"
                 f"<td>{item['elapsed']//60} 分钟</td><td>{item['actual']}/{item['target']}</td>"
-                f"<td>{score:.1f}</td><td>{completion:.0f}%</td></tr>"
+                f"<td>{score:.1f}</td><td>{completion:.0f}%</td><td>{emg_text}</td></tr>"
             )
             cards.append(
                 f"<div class='session'><div><b>{date}</b><span>{item['label']}</span></div>"
                 f"<div class='bar'><i style='width:{score:.0f}%'></i></div>"
                 f"<em>{score:.1f}</em></div>"
             )
+            if item.get("emg_available"):
+                active = max(0, min(100, item["emg_active_ratio"] * 100.0))
+                fatigue = max(0, min(100, item["emg_fatigue_ratio"] * 100.0))
+                emg_cards.append(
+                    f"<div class='session'><div><b>{date}</b><span>{item['label']}</span></div>"
+                    f"<div class='dualbar'><i style='width:{active:.0f}%'></i>"
+                    f"<b style='width:{fatigue:.0f}%'></b></div>"
+                    f"<em>{item['emg_avg_rms']:.1f}</em></div>"
+                )
         return f"""<html><head><meta charset="utf-8"><style>
 body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:#F8FAFD;color:#344054;padding:28px;}}
 h1{{color:#172033;font-size:28px;margin:0 0 8px;}} h2{{color:#172033;font-size:18px;margin-top:28px;}}
@@ -374,6 +402,9 @@ h1{{color:#172033;font-size:28px;margin:0 0 8px;}} h2{{color:#172033;font-size:1
 .session{{display:grid;grid-template-columns:220px 1fr 70px;gap:12px;align-items:center;margin:12px 0;}}
 .session span{{display:block;color:#667085;font-size:12px;margin-top:3px;}}
 .bar{{height:10px;background:#E9EEF5;border-radius:999px;overflow:hidden;}} .bar i{{display:block;height:100%;background:#2563EB;}}
+.dualbar{{height:12px;background:#E9EEF5;border-radius:999px;overflow:hidden;position:relative;}}
+.dualbar i{{display:block;height:100%;background:#2563EB;}}
+.dualbar b{{display:block;height:100%;background:#F97316;opacity:.75;margin-top:-12px;}}
 table{{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden;}}
 th,td{{text-align:left;border-bottom:1px solid #E4EAF2;padding:10px;font-size:13px;}} th{{color:#667085;background:#F4F7FB;}}
 </style></head><body>
@@ -383,9 +414,12 @@ th,td{{text-align:left;border-bottom:1px solid #E4EAF2;padding:10px;font-size:13
 <div class="metric"><span>近 6 次平均评分</span><b>{avg_score:.1f}</b></div>
 <div class="metric"><span>近 6 次平均完成率</span><b>{avg_completion:.0f}%</b></div>
 <div class="metric"><span>近 6 次训练总时长</span><b>{total_minutes}</b><span>分钟</span></div>
+<div class="metric"><span>近 6 次主动发力占比</span><b>{avg_emg_active:.0f}%</b></div>
+<div class="metric"><span>近 6 次疲劳倾向占比</span><b>{avg_emg_fatigue:.0f}%</b></div>
 </div>
 <div class="panel"><h2>评分走势</h2>{''.join(cards)}</div>
-<div class="panel"><h2>训练明细</h2><table><tr><th>时间</th><th>训练</th><th>时长</th><th>完成</th><th>评分</th><th>完成率</th></tr>{''.join(rows)}</table></div>
+<div class="panel"><h2>肌电参与趋势</h2>{''.join(emg_cards) if emg_cards else '<p class="hint">最近记录中暂未找到肌电数据。</p>'}<p class="hint">蓝色条表示主动发力占比，橙色条表示疲劳倾向占比，右侧数值为平均肌电强度（RMS）。</p></div>
+<div class="panel"><h2>训练明细</h2><table><tr><th>时间</th><th>训练</th><th>时长</th><th>完成</th><th>评分</th><th>完成率</th><th>肌电强度/疲劳</th></tr>{''.join(rows)}</table></div>
 </body></html>"""
 
     def shutdown(self):

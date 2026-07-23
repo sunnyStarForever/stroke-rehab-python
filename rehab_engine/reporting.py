@@ -7,7 +7,7 @@ import html
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 def _read_session_meta(session_dir: Path) -> Dict:
@@ -30,6 +30,60 @@ def _read_course_summary(session_dir: Path) -> Dict:
         return value if isinstance(value, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _find_action_emg_summary(action: Dict, session: Path) -> Optional[Dict]:
+    candidates: List[Path] = []
+    action_dir = action.get("action_dir") if isinstance(action, dict) else ""
+    if action_dir:
+        candidates.append(Path(str(action_dir)))
+    action_id = str(action.get("action_id") or "") if isinstance(action, dict) else ""
+    if action_id:
+        candidates.extend((session / "actions").glob(f"*_{action_id}_*"))
+    for directory in candidates:
+        summary_path = directory / "emg_summary.json"
+        if not summary_path.exists():
+            continue
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(summary, dict):
+            summary["_action_dir"] = str(directory)
+            return summary
+    return None
+
+
+def _session_emg_summary(actions: List[Dict], session: Path) -> Dict:
+    summaries = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        summary = _find_action_emg_summary(action, session)
+        if summary:
+            summary["_action_name"] = str(action.get("name_cn") or action.get("action_id") or "动作")
+            summary["_action_id"] = str(action.get("action_id") or "")
+            summaries.append(summary)
+    if not summaries:
+        return {"available": False, "summaries": []}
+    rows = max(1, len(summaries))
+    return {
+        "available": True,
+        "summaries": summaries,
+        "avg_rms": sum(_safe_float(item.get("avg_rms")) for item in summaries) / rows,
+        "max_rms": max(_safe_float(item.get("max_rms")) for item in summaries),
+        "active_ratio": sum(_safe_float(item.get("active_ratio")) for item in summaries) / rows,
+        "fatigue_ratio": sum(_safe_float(item.get("fatigue_ratio")) for item in summaries) / rows,
+        "tremor_ratio": sum(_safe_float(item.get("tremor_ratio")) for item in summaries) / rows,
+        "feature_rows": sum(int(_safe_float(item.get("feature_rows"))) for item in summaries),
+    }
 
 
 def analyze_skeleton_csv(csv_path: str) -> Dict[str, float]:
@@ -126,6 +180,7 @@ def generate_session_report(session_dir: str, csv_path: str) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     actions = course_summary.get("actions", [])
     actions = actions if isinstance(actions, list) else []
+    emg_summary = _session_emg_summary(actions, session)
     completed_actions = sum(
         1 for action in actions
         if isinstance(action, dict) and int(action.get("actual_reps", 0) or 0) > 0
@@ -163,6 +218,38 @@ def generate_session_report(session_dir: str, csv_path: str) -> str:
             + "".join(action_rows) + "</table></div>"
         )
 
+    emg_section = (
+        '<div class="card"><h2>肌电协同观察</h2>'
+        '<p class="muted">本次训练没有找到肌电记录文件，因此报告仅展示骨架和动作评分数据。</p></div>'
+    )
+    if emg_summary.get("available"):
+        active_ratio = _safe_float(emg_summary.get("active_ratio")) * 100.0
+        fatigue_ratio = _safe_float(emg_summary.get("fatigue_ratio")) * 100.0
+        tremor_ratio = _safe_float(emg_summary.get("tremor_ratio")) * 100.0
+        emg_rows = []
+        for item in emg_summary.get("summaries", []):
+            emg_rows.append(
+                f"<tr><td>{html.escape(item.get('_action_name', '动作'))}<br>"
+                f"<span class=\"muted\">{html.escape(item.get('_action_id', ''))}</span></td>"
+                f"<td>{_safe_float(item.get('active_muscle_avg_rms')):.1f}</td>"
+                f"<td>{_safe_float(item.get('antagonist_muscle_avg_rms')):.1f}</td>"
+                f"<td>{_safe_float(item.get('fatigue_ratio')) * 100.0:.1f}%</td>"
+                f"<td>{_safe_float(item.get('tremor_ratio')) * 100.0:.1f}%</td></tr>"
+            )
+        emg_section = f"""
+<div class="card"><h2>肌电协同观察</h2>
+<p class="muted">该部分基于动作目录中的真实肌电记录统计，用于辅助观察主动发力、疲劳倾向和发力稳定性。</p>
+<div class="grid">
+ <div class="metric"><div class="label">平均肌电强度（RMS）</div><div class="value">{_safe_float(emg_summary.get('avg_rms')):.1f}</div></div>
+ <div class="metric"><div class="label">主动发力占比</div><div class="value good">{active_ratio:.1f}%</div></div>
+ <div class="metric"><div class="label">疲劳倾向占比</div><div class="value">{fatigue_ratio:.1f}%</div></div>
+ <div class="metric"><div class="label">震颤/不稳定占比</div><div class="value">{tremor_ratio:.1f}%</div></div>
+</div>
+<table><tr><th>动作</th><th>主动肌平均强度</th><th>拮抗肌平均强度</th><th>疲劳倾向</th><th>震颤/不稳定</th></tr>
+{''.join(emg_rows)}</table>
+<p class="muted">详细肌电曲线请进入各动作报告查看。</p></div>
+"""
+
     document = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><style>
 body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:#F4F7FB;color:#344054;margin:0;padding:34px;}}
@@ -196,6 +283,7 @@ img{{max-width:100%;height:auto;}}
 <tr><td>运行模式</td><td>{engine_mode}</td></tr><tr><td>估算骨骼帧率</td><td>{stats['estimated_fps']:.1f} fps</td></tr>
 <tr><td>是否完整结束</td><td>{'是' if meta.get('finished') else '否'}</td></tr></table></div>
 {action_section}
+{emg_section}
 <div class="card"><h2>课程汇总</h2><table>
 <tr><td>已产生数据的动作</td><td>{completed_actions} / {len(actions)}</td></tr>
 <tr><td>已评分动作平均分</td><td>{course_average:.1f}</td></tr></table></div>

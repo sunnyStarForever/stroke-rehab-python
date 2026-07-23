@@ -45,6 +45,27 @@ class ReportImageSizingTests(unittest.TestCase):
             self.assertEqual(_size(adapted), (300, 150))
             self.assertEqual(adapted.count('width="'), 1)
 
+    def test_inline_style_size_is_removed_before_qt_width_is_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _png(root / "trend.png", 900, 450)
+            adapted = adapt_report_images(
+                '<img src="trend.png" width=1800 style="width:1800px;height:900px;border-radius:8px">',
+                360,
+                root,
+            )
+            self.assertEqual(_size(adapted), (360, 180))
+            self.assertIn("border-radius:8px", adapted)
+            self.assertNotIn("width:1800px", adapted)
+
+    def test_file_uri_image_dimensions_are_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = root / "trend.png"
+            _png(image, 640, 320)
+            adapted = adapt_report_images(f'<img src="{image.resolve().as_uri()}">', 320)
+            self.assertEqual(_size(adapted), (320, 160))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

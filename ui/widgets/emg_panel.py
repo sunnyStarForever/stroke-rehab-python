@@ -81,11 +81,11 @@ class EmgFeatureWaveform(QWidget):
     """Stacked feature waveform painter for one EMG channel."""
 
     FEATURES = [
-        ("rms", "RMS", COLORS["primary"]),
-        ("zcr", "ZCR", COLORS["warning"]),
-        ("cv", "CV", COLORS["cyan"]),
-        ("fatigue", "Fatigue", COLORS["danger"]),
-        ("envelope", "Envelope", COLORS["success"]),
+        ("rms", "肌电强度（RMS）", COLORS["primary"]),
+        ("zcr", "过零率（ZCR）", COLORS["warning"]),
+        ("cv", "波动系数（CV）", COLORS["cyan"]),
+        ("fatigue", "疲劳指数", COLORS["danger"]),
+        ("envelope", "包络均值", COLORS["success"]),
     ]
 
     def __init__(self, channel_name: str, parent=None):
@@ -123,14 +123,14 @@ class EmgFeatureWaveform(QWidget):
         painter.setBrush(QColor("#F8FAFD"))
         painter.drawRoundedRect(rect, 12, 12)
 
-        painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        painter.setFont(QFont("Microsoft YaHei", 11, QFont.Bold))
         painter.setPen(QColor(COLORS["ink"]))
         painter.drawText(rect.adjusted(12, 8, -12, 0), Qt.AlignTop | Qt.AlignLeft,
                          f"{self._channel_name}  ·  状态 {self._state}")
 
         plot = QRectF(rect).adjusted(12, 36, -12, -10)
         band_h = plot.height() / max(1, len(self.FEATURES))
-        painter.setFont(QFont("Segoe UI", 9))
+        painter.setFont(QFont("Microsoft YaHei", 9))
 
         for index, (key, label, color) in enumerate(self.FEATURES):
             top = plot.top() + index * band_h
@@ -181,7 +181,8 @@ class EmgFeatureDialog(QDialog):
         title_box = QVBoxLayout()
         title = QLabel("肌电特征实时波形")
         title.setObjectName("sectionTitle")
-        hint = CaptionLabel("左右分别显示 CH1 / CH2；每个通道展示 RMS、ZCR、CV、Fatigue 与 Envelope 趋势")
+        hint = CaptionLabel(
+            "左右分别显示 CH1 / CH2；每个通道展示肌电强度、过零率、波动系数、疲劳指数与包络均值趋势")
         hint.setStyleSheet(f"color:{COLORS['muted']};")
         title_box.addWidget(title)
         title_box.addWidget(hint)
@@ -258,8 +259,9 @@ class EmgPanel(SimpleCardWidget):
         title.setObjectName("sectionTitle")
         header.addWidget(title)
         header.addStretch()
-        self._btn_features = PushButton("特征波形")
+        self._btn_features = PushButton("查看肌电曲线")
         self._btn_features.setFixedHeight(28)
+        self._btn_features.setToolTip("弹出大窗口查看 CH1/CH2 的肌电特征实时曲线")
         self._btn_features.clicked.connect(self._open_feature_dialog)
         header.addWidget(self._btn_features)
         self._status_dot = QLabel("未连接")
@@ -273,7 +275,12 @@ class EmgPanel(SimpleCardWidget):
         layout.addWidget(self._status_label)
 
         self._waveform = EmgWaveform(self)
+        self._waveform.setToolTip("小波形展示最近一段时间 CH1/CH2 的肌电强度（RMS）变化，用于快速观察当前发力是否稳定。")
         layout.addWidget(self._waveform)
+        waveform_hint = CaptionLabel("小波形：最近肌电强度（RMS）变化，蓝色为 CH1，绿色为 CH2")
+        waveform_hint.setStyleSheet(f"color:{COLORS['muted']};")
+        waveform_hint.setWordWrap(True)
+        layout.addWidget(waveform_hint)
 
         self._ch_bars = []
         for ch_name in ["CH1", "CH2"]:

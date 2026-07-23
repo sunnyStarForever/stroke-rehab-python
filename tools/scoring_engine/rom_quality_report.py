@@ -965,7 +965,7 @@ def plot_rom_curves_with_segments(
 
         if save_dir is not None:
             save_path = save_dir / f"rom_{angle_name}.png"
-            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            plt.savefig(save_path, dpi=140, bbox_inches="tight")
             saved_paths.append(str(save_path))
 
         if show:
@@ -1031,7 +1031,7 @@ def plot_posture_lean_with_segments(
     if save_path is not None:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.savefig(save_path, dpi=140, bbox_inches="tight")
 
     if show:
         plt.show()
@@ -1178,7 +1178,7 @@ def plot_spatial_envelope_2d(
     if save_path is not None:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.savefig(save_path, dpi=140, bbox_inches="tight")
 
     if show:
         plt.show()
@@ -1230,7 +1230,7 @@ def plot_joint_trajectory_3d(
     if save_path is not None:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.savefig(save_path, dpi=140, bbox_inches="tight")
 
     if show:
         plt.show()
